@@ -14,7 +14,7 @@ It runs within each agent’s existing subscription (or free tier), so there are
 curl -fsSL https://cokacdir.cokac.com/manage.sh | bash && cokacctl
 ```
 
-**Windows (Run PowerShell as Administrator):**
+**Windows (run PowerShell as Administrator.):**
 
 ```powershell
 irm https://cokacdir.cokac.com/manage.ps1 | iex; cokacctl
