@@ -17,10 +17,21 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Sha256, Digest};
 
 use crate::services::claude::debug_log_to;
 
 fn dbg(msg: &str) { debug_log_to("session_archive.log", msg); }
+
+/// Short (12-hex-char) SHA-256 of the input, used for /loop verification
+/// forensic logs so consecutive-iteration transcripts can be compared at a
+/// glance. Not a security hash.
+fn short_sha(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let r = h.finalize();
+    hex::encode(&r[..6])
+}
 
 /// Root document written to disk.
 #[derive(Debug, Serialize, Deserialize)]
@@ -166,6 +177,11 @@ pub fn archive_sessions_dir() -> Option<PathBuf> {
 pub fn build_verification_transcript(session_id: &str) -> Result<String, String> {
     const PER_BLOCK_LIMIT: usize = 2000;
     const TOTAL_LIMIT: usize = 60000;
+    // Anchor the original user request at the top of the transcript even on
+    // long sessions so the verifier always knows what was asked. This is a
+    // small share of TOTAL_LIMIT — the rest is reserved for the most recent
+    // turns, which is what the verifier actually needs to judge completion.
+    const HEAD_BUDGET: usize = 6000;
 
     if !is_valid_session_id(session_id) {
         return Err(format!("Invalid session_id: {:?}", session_id));
@@ -175,14 +191,21 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
     let path = archive_dir.join(format!("{}.json", session_id));
     let raw = std::fs::read_to_string(&path)
         .map_err(|e| format!("Archive not found at {}: {}", path.display(), e))?;
+    let archive_mtime = std::fs::metadata(&path).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    dbg(&format!(
+        "[loop-verify transcript] archive_read sid={} path={} raw_len={} raw_sha={} archive_mtime_epoch={}",
+        session_id, path.display(), raw.len(), short_sha(&raw), archive_mtime));
     let archive: FullSession = serde_json::from_str(&raw)
         .map_err(|e| format!("Archive parse error: {}", e))?;
 
-    let mut out = String::new();
-    for m in &archive.messages {
-        if m.role == "system" { continue; }
-        if m.content.is_empty() { continue; }
-
+    // Render a single message into a chunk. Honors PER_BLOCK_LIMIT per content
+    // block but NOT TOTAL_LIMIT — callers compose selected chunks within the
+    // global budget.
+    let render_msg = |m: &Message| -> String {
         let header = match m.role.as_str() {
             "user" => "USER".to_string(),
             "assistant" => "ASSISTANT".to_string(),
@@ -190,22 +213,21 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
             "developer" => "DEVELOPER".to_string(),
             other => other.to_uppercase(),
         };
-        out.push_str(&format!("\n[{}]\n", header));
-
+        let mut s = format!("\n[{}]\n", header);
         for b in &m.content {
             match b.kind.as_str() {
                 "text" => {
                     if let Some(t) = &b.text {
-                        out.push_str(&truncate_utf8_boundary(t, PER_BLOCK_LIMIT));
-                        out.push('\n');
+                        s.push_str(&truncate_utf8_boundary(t, PER_BLOCK_LIMIT));
+                        s.push('\n');
                     }
                 }
                 "thinking" => {
                     if let Some(t) = &b.text {
                         if !t.is_empty() {
-                            out.push_str("(thinking) ");
-                            out.push_str(&truncate_utf8_boundary(t, PER_BLOCK_LIMIT));
-                            out.push('\n');
+                            s.push_str("(thinking) ");
+                            s.push_str(&truncate_utf8_boundary(t, PER_BLOCK_LIMIT));
+                            s.push('\n');
                         }
                     }
                 }
@@ -214,7 +236,7 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
                     let input = b.tool_input.as_ref()
                         .map(|v| serde_json::to_string(v).unwrap_or_default())
                         .unwrap_or_default();
-                    out.push_str(&format!("(tool_use:{}) {}\n",
+                    s.push_str(&format!("(tool_use:{}) {}\n",
                         name, truncate_utf8_boundary(&input, PER_BLOCK_LIMIT)));
                 }
                 "tool_result" => {
@@ -225,22 +247,110 @@ pub fn build_verification_transcript(session_id: &str) -> Result<String, String>
                         })
                         .unwrap_or_default();
                     let err_tag = if b.is_error == Some(true) { " ERROR" } else { "" };
-                    out.push_str(&format!("(tool_result{}) {}\n",
+                    s.push_str(&format!("(tool_result{}) {}\n",
                         err_tag, truncate_utf8_boundary(&output, PER_BLOCK_LIMIT)));
                 }
-                "patch" => out.push_str("(patch applied)\n"),
+                "patch" => s.push_str("(patch applied)\n"),
                 _ => {}
             }
         }
+        s
+    };
 
-        if out.len() > TOTAL_LIMIT {
-            let mut end = TOTAL_LIMIT;
-            while end > 0 && !out.is_char_boundary(end) { end -= 1; }
-            out.truncate(end);
-            out.push_str("\n[...transcript truncated...]\n");
+    // Indices of all visible messages (non-system, non-empty).
+    let visible_idx: Vec<usize> = archive.messages.iter().enumerate()
+        .filter(|(_, m)| m.role != "system" && !m.content.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+
+    // The first user message is treated as the original request — pin it at
+    // the top. If no user message exists yet, head is empty.
+    let head_idx: Option<usize> = visible_idx.iter().copied()
+        .find(|i| archive.messages.get(*i).map(|m| m.role == "user").unwrap_or(false));
+
+    let head_rendered: Option<String> = head_idx
+        .and_then(|i| archive.messages.get(i))
+        .map(|m| {
+            let rendered = render_msg(m);
+            if rendered.len() > HEAD_BUDGET {
+                let mut end = HEAD_BUDGET;
+                while end > 0 && !rendered.is_char_boundary(end) { end -= 1; }
+                format!("{}\n[...head truncated...]\n", &rendered[..end])
+            } else {
+                rendered
+            }
+        });
+
+    // Fill the tail from the END of the conversation backwards, stopping when
+    // the next chunk would exceed the remaining budget. This guarantees the
+    // most recent turn is always included — the core fix for the "stale
+    // transcript" bug where the old forward-fill ignored every message past
+    // the 60 KB front slice.
+    let head_len = head_rendered.as_ref().map(|s| s.len()).unwrap_or(0);
+    let separator = "\n[...earlier transcript truncated — middle turns omitted...]\n";
+    let tail_budget = TOTAL_LIMIT.saturating_sub(head_len).saturating_sub(separator.len());
+
+    let mut tail_chunks_rev: Vec<String> = Vec::new();
+    let mut tail_acc: usize = 0;
+    let mut dropped_middle = false;
+    let mut is_newest = true;
+    for &i in visible_idx.iter().rev() {
+        if Some(i) == head_idx {
+            // Reached the head from the tail side — every visible message
+            // between head and tail is already included, no middle dropped.
             break;
         }
+        let Some(m) = archive.messages.get(i) else { continue };
+        let mut chunk = render_msg(m);
+        // Guard: if the single newest turn alone exceeds the tail budget,
+        // truncate it instead of dropping it. Losing the newest turn entirely
+        // would defeat the purpose of this function.
+        if is_newest && chunk.len() > tail_budget {
+            let marker = "\n[...turn truncated...]\n";
+            let cap = tail_budget.saturating_sub(marker.len());
+            let mut end = cap;
+            while end > 0 && !chunk.is_char_boundary(end) { end -= 1; }
+            chunk.truncate(end);
+            chunk.push_str(marker);
+            dropped_middle = true;
+        }
+        is_newest = false;
+        if tail_acc + chunk.len() > tail_budget {
+            // Budget exhausted before we reached the head (or before
+            // exhausting visible_idx when there is no head). Some middle
+            // turns will be omitted, so emit the separator.
+            dropped_middle = true;
+            break;
+        }
+        tail_acc += chunk.len();
+        tail_chunks_rev.push(chunk);
     }
+
+    // Reverse back to chronological order.
+    tail_chunks_rev.reverse();
+    let tail_joined: String = tail_chunks_rev.concat();
+
+    let mut out = String::new();
+    if let Some(h) = head_rendered.as_ref() {
+        out.push_str(h);
+        if dropped_middle { out.push_str(separator); }
+    } else if dropped_middle {
+        out.push_str(separator);
+    }
+    out.push_str(&tail_joined);
+
+    // Forensic log: per-iteration transcript fingerprint. After the fix the
+    // `sha` should change whenever a new turn lands; if it still doesn't, the
+    // archive itself isn't advancing (check the archive REGENERATED line).
+    let num_msgs = visible_idx.len();
+    let tail_start = out.len().saturating_sub(500);
+    let mut tail_off = tail_start;
+    while tail_off < out.len() && !out.is_char_boundary(tail_off) { tail_off += 1; }
+    let tail = &out[tail_off..];
+    dbg(&format!(
+        "[loop-verify transcript] built sid={} len={} sha={} non_system_msgs={} head={} dropped_middle={} tail_msgs={} tail_500={:?}",
+        session_id, out.len(), short_sha(&out), num_msgs,
+        head_rendered.is_some(), dropped_middle, tail_chunks_rev.len(), tail));
 
     Ok(out)
 }
@@ -281,12 +391,27 @@ pub fn archive_and_save_session(
 
     // Skip if up-to-date. On uncertain mtime (permission error, etc.),
     // fall through and regenerate rather than silently refusing to update.
+    // Track pre-regenerate size so the forensic log below can show a delta.
+    let prev_target_size = target.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    let src_epoch = source_path.metadata().ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let tgt_epoch = target.metadata().ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs()).unwrap_or(0);
     if target.exists() {
         let src_m = source_path.metadata().ok().and_then(|m| m.modified().ok());
         let tgt_m = target.metadata().ok().and_then(|m| m.modified().ok());
         if let (Some(s), Some(t)) = (src_m, tgt_m) {
             if s <= t {
-                dbg("[archive] skipped: target is up-to-date");
+                dbg(&format!(
+                    "[loop-verify archive] SKIPPED sid={} src_mtime={} tgt_mtime={} tgt_size={} — \
+                     target is up-to-date (rollout has NOT grown since last refresh). \
+                     If this fires on consecutive /loop iterations with no turn in between, \
+                     the verifier will read the SAME transcript.",
+                    session_id, src_epoch, tgt_epoch, prev_target_size));
                 return;
             }
         }
@@ -330,8 +455,12 @@ pub fn archive_and_save_session(
             match fs::write(&tmp, &json) {
                 Ok(()) => {
                     let r = fs::rename(&tmp, &target);
-                    dbg(&format!("[archive] wrote {} ({} bytes, {} messages) rename={:?}",
-                        target.display(), json.len(), session.messages.len(), r));
+                    let new_size = json.len() as u64;
+                    let delta: i64 = new_size as i64 - prev_target_size as i64;
+                    dbg(&format!(
+                        "[loop-verify archive] REGENERATED sid={} path={} new_size={} prev_size={} delta={:+} messages={} src_mtime={} rename={:?}",
+                        session_id, target.display(), new_size, prev_target_size,
+                        delta, session.messages.len(), src_epoch, r));
                     if r.is_err() { let _ = fs::remove_file(&tmp); }
                 }
                 Err(e) => {

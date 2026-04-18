@@ -3,8 +3,19 @@ use std::io::{BufRead, BufReader, Write};
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 use serde_json::Value;
+use sha2::{Sha256, Digest};
 
 use crate::services::claude::{debug_log_to, StreamMessage, CancelToken, kill_child_tree};
+
+/// Short (12-hex-char) SHA-256 of the input, used for /loop verification
+/// forensic logs so consecutive-iteration outputs can be compared at a
+/// glance. Not a security hash.
+fn short_sha(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    let r = h.finalize();
+    hex::encode(&r[..6])
+}
 
 /// Cached path to the codex binary.
 static CODEX_PATH: OnceLock<Option<String>> = OnceLock::new();
@@ -111,6 +122,11 @@ pub fn verify_completion_codex(session_id: &str, working_dir: &str) -> Result<cr
     // 1. Load the archive (full fidelity, deduplicated, provider-agnostic).
     let transcript = crate::services::session_archive::build_verification_transcript(session_id)?;
     codex_debug_log(&format!("  transcript: {} chars", transcript.len()));
+    // Forensic log: pair this sha with the transcript sha in session_archive.log
+    // — if they differ between consecutive iterations the input is fresh.
+    codex_debug_log(&format!(
+        "[loop-verify input] sid={} transcript_len={} transcript_sha={}",
+        session_id, transcript.len(), short_sha(&transcript)));
 
     let codex_bin = get_codex_path()
         .ok_or_else(|| {
@@ -249,6 +265,17 @@ pub fn verify_completion_codex(session_id: &str, working_dir: &str) -> Result<cr
 
     codex_debug_log(&format!("  complete={}, feedback={:?}",
         complete, feedback.as_ref().map(|s| crate::services::claude::safe_preview(s, 200))));
+    // Forensic log: the full verifier reply plus its sha. Compare consecutive
+    // iterations — identical `output_sha` across iterations with a *changing*
+    // `transcript_sha` proves the verifier's output is converging to the same
+    // text despite fresh input (the structural /loop "near-identical prompt"
+    // pathology). Identical shas for BOTH would mean the archive is stale.
+    codex_debug_log(&format!(
+        "[loop-verify output] sid={} complete={} pending={} output_len={} output_sha={} feedback_sha={} output_full={:?}",
+        session_id, complete, pending, response_text.len(),
+        short_sha(&response_text),
+        feedback.as_deref().map(short_sha).unwrap_or_default(),
+        response_text));
     codex_debug_log("=== verify_completion_codex END ===");
 
     Ok(crate::services::claude::VerifyResult { complete, feedback })
