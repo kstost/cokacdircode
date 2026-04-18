@@ -1,6 +1,6 @@
 # COKACDIR
 
-**Your coding agent, already in use — on Telegram.**
+**Your coding agent, already in use — on Telegram and Discord.**
 
 cokacdir is **not** an AI agent — it does not include an LLM or reasoning engine. Instead, it delegates tasks to the coding agent you are already using (Claude Code, Codex CLI, Gemini CLI, OpenCode) and lets you control it from Telegram. Just send a message to the bot, and the agent will handle code execution, file editing, shell commands, and real-time streaming of results — from your phone or any device with Telegram installed.
 
