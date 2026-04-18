@@ -3,6 +3,9 @@
 **/*.rs.bk
 Cargo.lock
 
+/dist/
+/dist_beta/
+
 
 # Builder tools (downloaded automatically)
 /builder/tools/
