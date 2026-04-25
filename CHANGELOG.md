@@ -1,5 +1,11 @@
 # Changelog — cokacdir
 
+## 0.4.99 — 2026-04-25
+
+- **Telegram Flood Control responses are now honored.** When the Telegram server returns `RetryAfter` on a high-frequency spinner edit, the bot now pushes the per-chat next-call timestamp forward by the server-mandated duration so that subsequent `shared_rate_limit_wait` calls naturally wait out the full cooldown instead of firing again after the normal `polling_time_ms` gap. Previously, ignoring `RetryAfter` could cause the cooldown to escalate over repeated violations (production logs showed bans accumulating to ~14000s). Applied to the five spinner-edit sites that fire every polling cycle: shell command spinner, AI streaming spinner (text and bot-to-bot polling loops), schedule spinner, and the verify spinner. The shared rate-limit serialization itself is unchanged.
+
+---
+
 ## 0.4.98 — 2026-04-25
 
 - **Gemini CLI `--skip-trust` auto-detection.** The bridge now probes `gemini --version` once on first use and adds `--skip-trust` to the gemini-cli invocation only when the installed version supports it (stable ≥ 0.39.1, preview ≥ 0.40.0-preview.3, or nightly built on/after 2026-04-23 — PR google-gemini/gemini-cli#25814). Older versions silently keep the previous behavior so they don't error out on an unknown flag. The decision is propagated from the parent cokacdir process to the `--bridge gemini` subprocess via the internal `COKAC_GEMINI_SKIP_TRUST` env var, which is stripped before spawning gemini-cli itself.

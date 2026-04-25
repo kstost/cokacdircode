@@ -44,11 +44,26 @@ fn tg_debug<T, E: std::fmt::Display>(name: &str, result: &Result<T, E>) {
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
 }
 
-/// Wrap a Telegram API call to log its result in debug mode
+/// Wrap a Telegram API call to log its result in debug mode.
+///
+/// Two forms:
+/// - `tg!(name, future_result)` — log only.
+/// - `tg!(name, state, chat_id, future_result)` — log + honor any
+///   server-mandated `RetryAfter` by pushing `api_timestamps[chat_id]`
+///   forward via `honor_telegram_retry_after`. Use this form for calls in
+///   high-frequency polling loops (e.g. spinner edits) so a single Flood
+///   Control hit propagates to subsequent `shared_rate_limit_wait` calls
+///   instead of being ignored.
 macro_rules! tg {
     ($name:expr, $fut:expr) => {{
         let r = $fut;
         tg_debug($name, &r);
+        r
+    }};
+    ($name:expr, $state:expr, $chat:expr, $fut:expr) => {{
+        let r = $fut;
+        tg_debug($name, &r);
+        honor_telegram_retry_after($state, $chat, &r).await;
         r
     }};
 }
@@ -5628,7 +5643,7 @@ async fn handle_shell_command(
 
                     if display_text != last_edit_text {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &display_text)
+                        let _ = tg!("edit_message", &state_owned, chat_id, bot_owned.edit_message_text(chat_id, placeholder_msg_id, &display_text)
                             .parse_mode(ParseMode::Html).await);
                         last_edit_text = display_text;
                     } else {
@@ -7419,7 +7434,7 @@ async fn handle_text_message(
                         if display_text != last_edit_text {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             let html_text = markdown_to_telegram_html(&display_text);
-                            if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                            if let Err(e) = tg!("edit_message", &state_owned, chat_id, bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
                                 .parse_mode(ParseMode::Html).await)
                             {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
@@ -7639,7 +7654,7 @@ async fn handle_text_message(
                                         if frame != last_text {
                                             shared_rate_limit_wait(&state_anim, chat_id).await;
                                             if stop_flag.load(Ordering::Relaxed) { break; }
-                                            let _ = tg!("edit_message", bot_anim.edit_message_text(chat_id, msg_id, frame).await);
+                                            let _ = tg!("edit_message", &state_anim, chat_id, bot_anim.edit_message_text(chat_id, msg_id, frame).await);
                                             last_text = frame.to_string();
                                         }
                                     }
@@ -8288,6 +8303,32 @@ async fn shared_rate_limit_wait(state: &SharedState, chat_id: ChatId) {
         target
     }; // Mutex released here
     tokio::time::sleep_until(sleep_until).await;
+}
+
+/// Honor a Telegram-server-mandated `RetryAfter` by pushing the next safe
+/// call time for `chat_id` forward by the requested duration. Subsequent
+/// `shared_rate_limit_wait` calls for the same chat will then naturally
+/// wait the full server-mandated cooldown before allowing another call.
+///
+/// Telegram explicitly instructs clients to respect `RetryAfter`; ignoring
+/// it causes the cooldown to escalate (production logs have shown bans
+/// accumulating to ~14000s after repeated violations).
+async fn honor_telegram_retry_after<T>(
+    state: &SharedState,
+    chat_id: ChatId,
+    result: &Result<T, teloxide::RequestError>,
+) {
+    if let Err(teloxide::RequestError::RetryAfter(seconds)) = result {
+        let until = tokio::time::Instant::now() + seconds.duration();
+        let mut data = state.lock().await;
+        let entry = data
+            .api_timestamps
+            .entry(chat_id)
+            .or_insert(until);
+        if *entry < until {
+            *entry = until;
+        }
+    }
 }
 
 /// Send a message that may exceed Telegram's 4096 character limit
@@ -9625,7 +9666,7 @@ async fn execute_schedule(
                     if display_text != last_edit_text {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         let html_text = markdown_to_telegram_html(&display_text);
-                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                        let _ = tg!("edit_message", &state_owned, chat_id, bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
                             .parse_mode(ParseMode::Html).await);
                         last_edit_text = display_text;
                     } else {
@@ -10414,7 +10455,7 @@ async fn process_bot_message(
                             msg_debug(&format!("[botmsg_poll:{}] spinner update spin_idx={}", bmsg_id_for_log, spin_idx));
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             let html_text = markdown_to_telegram_html(&display_text);
-                            let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                            let _ = tg!("edit_message", &state_owned, chat_id, bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
                                 .parse_mode(ParseMode::Html).await);
                             last_edit_text = display_text;
                         } else {
