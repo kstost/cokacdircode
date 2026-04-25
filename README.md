@@ -106,4 +106,4 @@ This includes, but is not limited to:
 
 The user assumes full responsibility for all consequences arising from the use of this software, whether such use was intended, authorized, or foreseeable.
 
-**ALL RISKS ASSOCIATED WITH USE ARE BORNE BY THE USER.**
+**ALL RISKS ASSOCIATED WITH USE ARE BORNE BY THE USER**
