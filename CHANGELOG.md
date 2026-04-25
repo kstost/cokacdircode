@@ -1,6 +1,6 @@
 # Changelog — cokacdir
 
-## Unreleased
+## 0.4.97 — 2026-04-25
 
 - **`/queue` OFF behavior changed: reject → redirect.** Previously, sending a message while the AI was busy with `/queue` OFF returned "AI request in progress" and dropped the message. Now, that same message cancels the in-progress task and is processed immediately on the same session — natural mid-task redirects ("아니 그거 말고 X 해줘") just work. Plain text, `;text`, `/query <text>`, and captioned file uploads trigger redirect; slash commands (`/help`, `/start`, …) and shell commands (`!cmd`) keep the existing rejection so an unrelated command never kills a long-running task. If a second redirect arrives while the first is still cancelling, the latest one wins (replaces the pending target). `/queue` ON (the default) is unchanged — messages still queue FIFO. `/stop`/`/stopall` semantics are unchanged. Resolves [#34](https://github.com/kstost/cokacdir/issues/34).
 
