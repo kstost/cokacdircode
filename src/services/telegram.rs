@@ -2609,16 +2609,18 @@ async fn handle_message(
                 if !text.is_empty() {
                     // Block if an AI request is already in progress
                     // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
-                    let (ai_busy, queue_enabled, queue_result) = {
+                    // queue_result:    ON mode queue push outcome (Some(id,text) queued, None full)
+                    // redirect_result: OFF mode redirect outcome (Some(id,text,was_replacement))
+                    let (ai_busy, queue_enabled, queue_result, redirect_result): (bool, bool, Option<(String, String)>, Option<(String, String, bool)>) = {
                         let mut data = state.lock().await;
                         let busy = data.cancel_tokens.contains_key(&chat_id);
                         let qkey = chat_id.0.to_string();
                         let qmode = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
                         msg_debug(&format!("[queue:media] chat_id={}, busy={}, queue_mode={}", chat_id.0, busy, qmode));
-                        let qr = if busy && qmode {
+                        let (qr, rr) = if busy && qmode {
                             let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
                             let queue_full = cur_len >= MAX_QUEUE_SIZE;
-                            if queue_full {
+                            let qr = if queue_full {
                                 msg_debug(&format!("[queue:media] chat_id={}, queue FULL ({}/{})", chat_id.0, cur_len, MAX_QUEUE_SIZE));
                                 None // queue full
                             } else {
@@ -2636,14 +2638,32 @@ async fn handle_message(
                                 });
                                 msg_debug(&format!("[queue:media] chat_id={}, QUEUED id={}, pos={}, text={:?}, uploads={}", chat_id.0, qid, q.len(), truncate_str(text, 60), uploads.len()));
                                 Some((qid, text.to_string()))
-                            }
+                            };
+                            (qr, None)
+                        } else if busy && !qmode {
+                            // OFF mode: caption with text is always redirect-eligible
+                            let uploads = data.sessions.get_mut(&chat_id)
+                                .map(|s| std::mem::take(&mut s.pending_uploads))
+                                .unwrap_or_default();
+                            let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, text.to_string(), user_name.clone(), uploads);
+                            msg_debug(&format!("[queue:media] chat_id={}, REDIRECT id={}, replaced={}, text={:?}", chat_id.0, qid, replaced, truncate_str(text, 60)));
+                            (None, Some((qid, text.to_string(), replaced)))
                         } else {
-                            None
+                            (None, None)
                         };
-                        (busy, qmode, qr)
+                        (busy, qmode, qr, rr)
                     };
                     if ai_busy {
-                        if queue_enabled {
+                        if let Some((_qid, qtxt, replaced)) = redirect_result {
+                            shared_rate_limit_wait(&state, chat_id).await;
+                            let preview = truncate_str(&qtxt, 30);
+                            let msg = if replaced {
+                                format!("🔄 Redirect target updated: \"{preview}\"")
+                            } else {
+                                format!("🔄 Cancelling current task, will process: \"{preview}\"")
+                            };
+                            tg!("send_message", bot.send_message(chat_id, &msg).await)?;
+                        } else if queue_enabled {
                             shared_rate_limit_wait(&state, chat_id).await;
                             if let Some((qid, qtxt)) = queue_result {
                                 let preview = truncate_str(&qtxt, 30);
@@ -2881,16 +2901,17 @@ async fn handle_message(
         msg_debug(&format!("[queue:text] chat_id={}, text={:?}, queue_text={:?}", chat_id.0, truncate_str(&text, 60), queue_text.map(|s| truncate_str(s, 60))));
 
         // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
-        // Returns: Option<(can_queue, queue_on, queue_result)>
-        //   queue_result: Some((id, text)) if queued, None if full/non-queueable
-        let busy_info: Option<(bool, bool, Option<(String, String)>)> = {
+        // Returns: Option<(can_queue, queue_on, queue_result, redirect_result)>
+        //   queue_result:    Some((id, text)) if queued (ON mode), None if full/non-queueable
+        //   redirect_result: Some((id, text, was_replacement)) if OFF mode redirect triggered
+        let busy_info: Option<(bool, bool, Option<(String, String)>, Option<(String, String, bool)>)> = {
             let mut data = state.lock().await;
             if data.cancel_tokens.contains_key(&chat_id) {
                 let qkey = chat_id.0.to_string();
                 let queue_enabled = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
                 msg_debug(&format!("[queue:text] chat_id={}, AI busy, queue_mode={}, queueable={}", chat_id.0, queue_enabled, queue_text.is_some()));
-                let qr = if queue_enabled {
-                    if let Some(qt) = queue_text {
+                let (qr, rr) = if queue_enabled {
+                    let qr = if let Some(qt) = queue_text {
                         let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
                         let queue_full = cur_len >= MAX_QUEUE_SIZE;
                         if queue_full {
@@ -2915,19 +2936,42 @@ async fn handle_message(
                     } else {
                         msg_debug(&format!("[queue:text] chat_id={}, non-queueable command, rejecting", chat_id.0));
                         None // non-queueable
-                    }
+                    };
+                    (qr, None)
                 } else {
-                    None
+                    // OFF mode: redirect-eligible messages cancel the current task and become
+                    // the next dispatch target (latest-wins). Slash/shell commands stay rejected.
+                    let rr = if let Some(qt) = queue_text {
+                        let uploads = data.sessions.get_mut(&chat_id)
+                            .map(|s| std::mem::take(&mut s.pending_uploads))
+                            .unwrap_or_default();
+                        let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, qt.to_string(), user_name.clone(), uploads);
+                        msg_debug(&format!("[queue:text] chat_id={}, REDIRECT id={}, replaced={}, text={:?}", chat_id.0, qid, replaced, truncate_str(qt, 60)));
+                        Some((qid, qt.to_string(), replaced))
+                    } else {
+                        msg_debug(&format!("[queue:text] chat_id={}, OFF mode + non-redirectable command, rejecting", chat_id.0));
+                        None
+                    };
+                    (None, rr)
                 };
-                Some((queue_enabled && queue_text.is_some(), queue_enabled, qr))
+                Some((queue_enabled && queue_text.is_some(), queue_enabled, qr, rr))
             } else {
                 msg_debug(&format!("[queue:text] chat_id={}, AI not busy, proceeding normally", chat_id.0));
                 None // not busy
             }
         };
 
-        if let Some((can_queue, queue_on, queue_result)) = busy_info {
-            if can_queue {
+        if let Some((can_queue, queue_on, queue_result, redirect_result)) = busy_info {
+            if let Some((_qid, qtxt, replaced)) = redirect_result {
+                shared_rate_limit_wait(&state, chat_id).await;
+                let preview = truncate_str(&qtxt, 30);
+                let msg = if replaced {
+                    format!("🔄 Redirect target updated: \"{preview}\"")
+                } else {
+                    format!("🔄 Cancelling current task, will process: \"{preview}\"")
+                };
+                tg!("send_message", bot.send_message(chat_id, &msg).await)?;
+            } else if can_queue {
                 shared_rate_limit_wait(&state, chat_id).await;
                 if let Some((qid, qtxt)) = queue_result {
                     let preview = truncate_str(&qtxt, 30);
@@ -4803,6 +4847,64 @@ async fn handle_session_command(
     Ok(())
 }
 
+/// Atomically cancel the current AI task for `chat_id` and replace any queued items
+/// with a single redirect message (latest-wins semantics). Used when /queue is OFF
+/// and a redirect-eligible message arrives while the AI is busy.
+///
+/// Caller must hold the state lock and pass `&mut SharedData`. The cancelled task's
+/// post-cancellation cleanup will trigger `process_next_queued_message`, which then
+/// dispatches the redirect target.
+///
+/// Returns `(queue_id, was_replacement)` where `was_replacement` is true when a
+/// pending redirect was overwritten by the new one (rapid successive redirects).
+fn enqueue_redirect_locked(
+    data: &mut SharedData,
+    chat_id: ChatId,
+    text: String,
+    user_display_name: String,
+    pending_uploads: Vec<String>,
+) -> (String, bool) {
+    // Step 1: cancel the in-progress task (mirror /stop behavior).
+    // If a previous /stop or redirect already cancelled it, this is idempotent.
+    if let Some(token) = data.cancel_tokens.get(&chat_id).cloned() {
+        if !token.cancelled.load(Ordering::Relaxed) {
+            token.cancelled.store(true, Ordering::Relaxed);
+            if let Ok(guard) = token.child_pid.lock() {
+                if let Some(pid) = *guard {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                    }
+                    #[cfg(windows)]
+                    {
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/PID", &pid.to_string(), "/T", "/F"])
+                            .output();
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 2: clear loop state so a verification loop doesn't continue
+    data.loop_states.remove(&chat_id);
+    data.loop_feedback.remove(&chat_id);
+
+    // Step 3: latest-wins push. If a previous redirect is still pending, drop it.
+    let queue = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
+    let was_replacement = !queue.is_empty();
+    queue.clear();
+    let qid = generate_queue_id();
+    queue.push_back(QueuedMessage {
+        id: qid.clone(),
+        text,
+        user_display_name,
+        pending_uploads,
+    });
+
+    (qid, was_replacement)
+}
+
 /// Handle /stop command - cancel in-progress AI request
 async fn handle_stop_command(
     bot: &Bot,
@@ -6622,13 +6724,13 @@ fn process_next_queued_message<'a>(
                 msg_debug(&format!("[queue:next] chat_id={}, cancel_token exists (another task active), skipping", chat_id.0));
                 return;
             }
+            // NOTE: We do NOT skip when queue mode is OFF. In OFF mode, the queue is used
+            // as a single-slot buffer for redirect targets (latest-wins). If something is
+            // pending here, it was placed by enqueue_redirect_locked and must be dispatched.
             let qkey = chat_id.0.to_string();
             let queue_enabled = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-            if !queue_enabled {
-                msg_debug(&format!("[queue:next] chat_id={}, queue mode OFF, skipping", chat_id.0));
-                return;
-            }
             let queue_len_before = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
+            msg_debug(&format!("[queue:next] chat_id={}, queue_mode={}, queue_len={}", chat_id.0, queue_enabled, queue_len_before));
             let msg = data.message_queues.get_mut(&chat_id).and_then(|q| q.pop_front());
             // Restore pending_uploads captured at queue time so handle_text_message picks them up
             if let Some(ref m) = msg {
@@ -6687,7 +6789,11 @@ async fn handle_text_message(
 
     // Register cancel token early (prevents duplicate requests while waiting for group lock)
     let cancel_token = Arc::new(CancelToken::new());
-    let busy_notify: Option<(bool, Option<String>)> = {
+    // busy_notify: (queue_enabled, queued_id, redirect_info)
+    //   queue_enabled: ON/OFF mode
+    //   queued_id:     ON mode push id (Some=queued, None=full)
+    //   redirect_info: OFF mode redirect (Some(id, was_replacement))
+    let busy_notify: Option<(bool, Option<String>, Option<(String, bool)>)> = {
         let mut data = state.lock().await;
         // For queued messages: check if placeholder was cancelled (e.g., /stop during dequeue window)
         if from_queue {
@@ -6715,14 +6821,14 @@ async fn handle_text_message(
                 return Ok(());
             }
         }
-        // For non-queued messages: if another task is active, queue or notify
+        // For non-queued messages: if another task is active, queue (ON) or redirect (OFF)
         if !from_queue && data.cancel_tokens.contains_key(&chat_id) {
             msg_debug(&format!("[handle_text_message] chat_id={}, cancel_token exists (busy)", chat_id.0));
             let qkey = chat_id.0.to_string();
             let qmode = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-            let qid = if qmode {
+            let (qid, redirect) = if qmode {
                 let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
-                if cur_len < MAX_QUEUE_SIZE {
+                let qid = if cur_len < MAX_QUEUE_SIZE {
                     let uploads = data.sessions.get_mut(&chat_id)
                         .map(|s| std::mem::take(&mut s.pending_uploads))
                         .unwrap_or_default();
@@ -6740,19 +6846,35 @@ async fn handle_text_message(
                 } else {
                     msg_debug(&format!("[handle_text_message] chat_id={}, queue FULL", chat_id.0));
                     None
-                }
+                };
+                (qid, None)
             } else {
-                None
+                // OFF mode: messages reaching handle_text_message are user-prompt-style (slash
+                // commands are routed elsewhere in handle_message), so redirect them.
+                let uploads = data.sessions.get_mut(&chat_id)
+                    .map(|s| std::mem::take(&mut s.pending_uploads))
+                    .unwrap_or_default();
+                let (rid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, user_text.to_string(), user_display_name.to_string(), uploads);
+                msg_debug(&format!("[handle_text_message] chat_id={}, REDIRECT id={}, replaced={}", chat_id.0, rid, replaced));
+                (None, Some((rid, replaced)))
             };
-            Some((qmode, qid))
+            Some((qmode, qid, redirect))
         } else {
             data.cancel_tokens.insert(chat_id, cancel_token.clone());
             None
         }
     };
-    if let Some((queue_enabled, queued_id)) = busy_notify {
+    if let Some((queue_enabled, queued_id, redirect_info)) = busy_notify {
         shared_rate_limit_wait(state, chat_id).await;
-        if queue_enabled {
+        if let Some((_rid, replaced)) = redirect_info {
+            let preview = truncate_str(user_text, 30);
+            let msg = if replaced {
+                format!("🔄 Redirect target updated: \"{preview}\"")
+            } else {
+                format!("🔄 Cancelling current task, will process: \"{preview}\"")
+            };
+            tg!("send_message", bot.send_message(chat_id, &msg).await)?;
+        } else if queue_enabled {
             if let Some(qid) = queued_id {
                 let preview = truncate_str(user_text, 30);
                 tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
