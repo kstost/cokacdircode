@@ -704,6 +704,12 @@ fn handle_ccserver(tokens: Vec<String>) {
     let mark = |available: bool| if available { "✓" } else { "✗" };
     println!("  ▸ Providers    : claude {}  codex {}  gemini {}  opencode {}", mark(has_claude), mark(has_codex), mark(has_gemini), mark(has_opencode));
 
+    if has_gemini {
+        let skip_trust = gemini::gemini_supports_skip_trust();
+        let ver = gemini::gemini_version().map(|s| s.as_str()).unwrap_or("unknown");
+        println!("  ▸ Gemini       : v{} ({}--skip-trust)", ver, if skip_trust { "+" } else { "−" });
+    }
+
     if !has_claude && !has_codex && !has_gemini && !has_opencode {
         eprintln!();
         eprintln!("  Error: No AI provider available.");

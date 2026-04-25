@@ -1,5 +1,13 @@
 # Changelog — cokacdir
 
+## 0.4.98 — 2026-04-25
+
+- **Gemini CLI `--skip-trust` auto-detection.** The bridge now probes `gemini --version` once on first use and adds `--skip-trust` to the gemini-cli invocation only when the installed version supports it (stable ≥ 0.39.1, preview ≥ 0.40.0-preview.3, or nightly built on/after 2026-04-23 — PR google-gemini/gemini-cli#25814). Older versions silently keep the previous behavior so they don't error out on an unknown flag. The decision is propagated from the parent cokacdir process to the `--bridge gemini` subprocess via the internal `COKAC_GEMINI_SKIP_TRUST` env var, which is stripped before spawning gemini-cli itself.
+- Bot server startup now prints the detected Gemini CLI version and `--skip-trust` capability (e.g. `▸ Gemini : v0.40.0 (+--skip-trust)`).
+- `/model` help now lists `codex:gpt-5.5` as the latest frontier coding model; `gpt-5.4` remains available and is relabeled "Frontier agentic coding model".
+
+---
+
 ## 0.4.97 — 2026-04-25
 
 - **`/queue` OFF behavior changed: reject → redirect.** Previously, sending a message while the AI was busy with `/queue` OFF returned "AI request in progress" and dropped the message. Now, that same message cancels the in-progress task and is processed immediately on the same session — natural mid-task redirects ("아니 그거 말고 X 해줘") just work. Plain text, `;text`, `/query <text>`, and captioned file uploads trigger redirect; slash commands (`/help`, `/start`, …) and shell commands (`!cmd`) keep the existing rejection so an unrelated command never kills a long-running task. If a second redirect arrives while the first is still cancelling, the latest one wins (replaces the pending target). `/queue` ON (the default) is unchanged — messages still queue FIFO. `/stop`/`/stopall` semantics are unchanged. Resolves [#34](https://github.com/kstost/cokacdir/issues/34).

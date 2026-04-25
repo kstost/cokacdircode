@@ -31,15 +31,15 @@ fn log_preview(s: &str, max: usize) -> &str {
 // Gemini availability check (is `gemini` CLI installed?)
 // ============================================================
 
-static GEMINI_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static GEMINI_BIN: OnceLock<Option<String>> = OnceLock::new();
 
-fn check_gemini_available() -> bool {
-    gemini_debug("[check_gemini_available] START");
+fn detect_gemini_bin() -> Option<String> {
+    gemini_debug("[detect_gemini_bin] START");
 
     if let Ok(val) = std::env::var("COKAC_GEMINI_PATH") {
         if !val.is_empty() && std::path::Path::new(&val).exists() {
-            gemini_debug(&format!("[check_gemini_available] found via COKAC_GEMINI_PATH={}", val));
-            return true;
+            gemini_debug(&format!("[detect_gemini_bin] found via COKAC_GEMINI_PATH={}", val));
+            return Some(val);
         }
     }
 
@@ -49,8 +49,8 @@ fn check_gemini_available() -> bool {
             if output.status.success() {
                 let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !p.is_empty() && std::path::Path::new(&p).exists() {
-                    gemini_debug(&format!("[check_gemini_available] found via which: {}", p));
-                    return true;
+                    gemini_debug(&format!("[detect_gemini_bin] found via which: {}", p));
+                    return Some(p);
                 }
             }
         }
@@ -58,8 +58,8 @@ fn check_gemini_available() -> bool {
             if output.status.success() {
                 let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !p.is_empty() && std::path::Path::new(&p).exists() {
-                    gemini_debug(&format!("[check_gemini_available] found via bash -lc which: {}", p));
-                    return true;
+                    gemini_debug(&format!("[detect_gemini_bin] found via bash -lc which: {}", p));
+                    return Some(p);
                 }
             }
         }
@@ -68,24 +68,106 @@ fn check_gemini_available() -> bool {
     #[cfg(windows)]
     {
         if let Some(path) = crate::services::claude::search_path_wide("gemini", Some(".cmd")) {
-            gemini_debug(&format!("[check_gemini_available] found via search_path_wide .cmd: {}", path));
-            return true;
+            gemini_debug(&format!("[detect_gemini_bin] found via search_path_wide .cmd: {}", path));
+            return Some(path);
         }
         if let Some(path) = crate::services::claude::search_path_wide("gemini", Some(".exe")) {
-            gemini_debug(&format!("[check_gemini_available] found via search_path_wide .exe: {}", path));
-            return true;
+            gemini_debug(&format!("[detect_gemini_bin] found via search_path_wide .exe: {}", path));
+            return Some(path);
         }
     }
 
-    gemini_debug("[check_gemini_available] NOT FOUND");
-    false
+    gemini_debug("[detect_gemini_bin] NOT FOUND");
+    None
+}
+
+fn gemini_bin() -> Option<&'static String> {
+    GEMINI_BIN.get_or_init(detect_gemini_bin).as_ref()
 }
 
 /// Check if Gemini CLI is available
 pub fn is_gemini_available() -> bool {
-    let result = *GEMINI_AVAILABLE.get_or_init(check_gemini_available);
+    let result = gemini_bin().is_some();
     gemini_debug(&format!("[is_gemini_available] result={}", result));
     result
+}
+
+// ============================================================
+// Gemini version detection + --skip-trust capability gate
+// ============================================================
+
+static GEMINI_VERSION: OnceLock<Option<String>> = OnceLock::new();
+static GEMINI_SUPPORTS_SKIP_TRUST: OnceLock<bool> = OnceLock::new();
+
+fn detect_gemini_version() -> Option<String> {
+    let bin = gemini_bin()?;
+    gemini_debug(&format!("[detect_gemini_version] running {} --version", bin));
+    let output = Command::new(bin).arg("--version").output().ok()?;
+    if !output.status.success() {
+        gemini_debug(&format!("[detect_gemini_version] non-zero exit: {:?}", output.status));
+        return None;
+    }
+    let v = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    gemini_debug(&format!("[detect_gemini_version] version={:?}", v));
+    if v.is_empty() { None } else { Some(v) }
+}
+
+/// Returns the cached Gemini CLI version string (e.g. "0.39.1", "0.40.0-preview.3")
+/// or None if Gemini is unavailable / version probe failed.
+pub fn gemini_version() -> Option<&'static String> {
+    GEMINI_VERSION.get_or_init(detect_gemini_version).as_ref()
+}
+
+/// Decide whether the given version string supports the `--skip-trust` flag.
+/// Introduced in stable v0.39.1 and preview v0.40.0-preview.3 (PR #25814,
+/// merged 2026-04-23). Anything older lacks the flag and would error out.
+fn version_supports_skip_trust(v: &str) -> bool {
+    let v = v.trim().trim_start_matches('v');
+    let (core, pre) = match v.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (v, None),
+    };
+    let parts: Vec<u32> = core.split('.').filter_map(|p| p.parse().ok()).collect();
+    if parts.len() < 3 { return false; }
+    let (major, minor, patch) = (parts[0], parts[1], parts[2]);
+
+    if major > 0 { return true; }
+    if minor > 40 { return true; }
+    if minor == 40 {
+        return match pre {
+            None => true,
+            Some(p) if p.starts_with("preview.") => {
+                p.trim_start_matches("preview.").split('.').next()
+                    .and_then(|n| n.parse::<u32>().ok())
+                    .map(|n| n >= 3)
+                    .unwrap_or(false)
+            }
+            Some(p) if p.starts_with("nightly.") => {
+                // 0.40.0-nightly.YYYYMMDD.gHASH — supported only for nightlies
+                // dated on/after the merge (2026-04-23).
+                p.trim_start_matches("nightly.").split('.').next()
+                    .and_then(|d| d.parse::<u32>().ok())
+                    .map(|d| d >= 20260423)
+                    .unwrap_or(false)
+            }
+            _ => false,
+        };
+    }
+    if minor == 39 && pre.is_none() && patch >= 1 { return true; }
+    false
+}
+
+fn probe_gemini_supports_skip_trust() -> bool {
+    let Some(v) = gemini_version() else { return false; };
+    let result = version_supports_skip_trust(v);
+    gemini_debug(&format!("[probe_gemini_supports_skip_trust] version={} → supported={}", v, result));
+    result
+}
+
+/// Returns true if the installed Gemini CLI accepts `--skip-trust`.
+/// Cached after the first call.
+pub fn gemini_supports_skip_trust() -> bool {
+    *GEMINI_SUPPORTS_SKIP_TRUST.get_or_init(probe_gemini_supports_skip_trust)
 }
 
 /// Check if a model string refers to the Gemini backend
@@ -235,6 +317,12 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if gemini_supports_skip_trust() {
+        cmd.env("COKAC_GEMINI_SKIP_TRUST", "1");
+    } else {
+        cmd.env_remove("COKAC_GEMINI_SKIP_TRUST");
+    }
 
     (cmd, effective_sp)
 }

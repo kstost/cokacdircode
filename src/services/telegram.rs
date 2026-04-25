@@ -6563,7 +6563,8 @@ async fn handle_model_command(
         if has_codex {
             msg.push_str("\n<b>Codex:</b>\n");
             msg.push_str("<code>/model codex</code> — default\n");
-            msg.push_str("<code>/model codex:gpt-5.4</code> — Latest frontier agentic coding model\n");
+            msg.push_str("<code>/model codex:gpt-5.5</code> — Latest frontier agentic coding model\n");
+            msg.push_str("<code>/model codex:gpt-5.4</code> — Frontier agentic coding model\n");
             msg.push_str("<code>/model codex:gpt-5.3-codex</code> — Frontier Codex-optimized agentic coding model\n");
             msg.push_str("<code>/model codex:gpt-5.3-codex-spark</code> — Ultra-fast coding model\n");
             msg.push_str("<code>/model codex:gpt-5.2-codex</code> — Frontier agentic coding model\n");
