@@ -1649,6 +1649,11 @@ struct SharedData {
     loop_states: HashMap<ChatId, LoopState>,
     /// Pending loop feedback to re-inject (separate from message_queues to bypass queue mode check)
     loop_feedback: HashMap<ChatId, (String, String)>,  // (feedback_text, user_display_name)
+    /// Monotonic counter incremented on each /clear. Polling tasks capture it at spawn
+    /// and skip session writeback if it changes — covers the case where /clear lands on
+    /// a brand-new session whose session_id is None on both spawn and post-completion
+    /// (so the sid comparison alone cannot detect the clear).
+    clear_epoch: HashMap<ChatId, u64>,
 }
 
 type SharedState = Arc<Mutex<SharedData>>;
@@ -2325,6 +2330,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         api_base_url: api_base_url.to_string(),
         loop_states: HashMap::new(),
         loop_feedback: HashMap::new(),
+        clear_epoch: HashMap::new(),
     }));
 
     println!("  ✓ Bot connected — Listening for messages");
@@ -3375,6 +3381,11 @@ async fn handle_start_command(
     };
     original_provider_str = provider_str;
 
+    // Tracks whether the user's input was a path-like value (vs. a session
+    // identifier). Same-path no-op only applies when path-intent is true —
+    // session identifiers may resolve to a path matching current cwd while
+    // intending to switch to a different session there.
+    let mut is_path_intent = false;
     let canonical_path = if path_str.is_empty() {
         // Create random workspace directory
         let Some(home) = dirs::home_dir() else {
@@ -3405,6 +3416,7 @@ async fn handle_start_command(
         || path_str.starts_with("../") || path_str.starts_with("..\\")
         || (path_str.len() >= 3 && path_str.as_bytes()[1] == b':' && (path_str.as_bytes()[2] == b'\\' || path_str.as_bytes()[2] == b'/'))
     {
+        is_path_intent = true;
         // Path mode: expand ~ and validate
         let expanded = if path_str.starts_with("~/") || path_str.starts_with("~\\") || path_str == "~" {
             if let Some(home) = dirs::home_dir() {
@@ -3518,14 +3530,23 @@ async fn handle_start_command(
                     msg_debug(&format!("[handle_start_command] cross-provider: setting model to {:?}", resolved_prov_str));
                     data.settings.models.insert(chat_id.0.to_string(), resolved_prov_str.to_string());
                     save_bot_settings(token, &data.settings);
+                    // Mirror /model provider-switch cleanup: cancel in-flight task and drop
+                    // queued messages / loop state. Their captured pending_uploads point at the
+                    // old workspace's files, and verify-loop feedback was authored against the
+                    // old provider's session — both would be misapplied under the new provider.
+                    cancel_in_progress_task_locked(&data, chat_id);
+                    let dropped_queue = data.message_queues.remove(&chat_id).map(|q| q.len()).unwrap_or(0);
+                    data.loop_states.remove(&chat_id);
+                    data.loop_feedback.remove(&chat_id);
                     if let Some(session) = data.sessions.get_mut(&chat_id) {
-                        msg_debug(&format!("[handle_start_command] cross-provider: clearing old session (len={}, sid={:?}, path={:?})",
-                            session.history.len(), session.session_id, session.current_path));
+                        msg_debug(&format!("[handle_start_command] cross-provider: clearing old session (len={}, uploads={}, queue={}, sid={:?}, path={:?})",
+                            session.history.len(), session.pending_uploads.len(), dropped_queue, session.session_id, session.current_path));
                         session.session_id = None;
                         session.current_path = None;
                         session.history.clear();
+                        session.pending_uploads.clear();
                     } else {
-                        msg_debug("[handle_start_command] cross-provider: no existing session to clear");
+                        msg_debug(&format!("[handle_start_command] cross-provider: no existing session to clear (queue={})", dropped_queue));
                     }
                 }
                 cp
@@ -3534,6 +3555,7 @@ async fn handle_start_command(
                 msg_debug(&format!("[handle_start_command] all session resolves failed, trying as plain path: {:?}", path_str));
                 let path = Path::new(path_str);
                 if path.exists() && path.is_dir() {
+                    is_path_intent = true;
                     let resolved = path.canonicalize()
                         .map(crate::utils::format::strip_unc_prefix)
                         .map(|p| p.display().to_string())
@@ -3550,6 +3572,40 @@ async fn handle_start_command(
             }
         }
     };
+
+    // Same-path no-op: if the user typed a path-like input that resolved to the
+    // session's existing current_path, treat it as a confirmation and skip the
+    // rest. Without this guard, the trailing block (3598+) would clear
+    // pending_uploads, null session_id, and overwrite in-memory history with
+    // the on-disk version — destroying the user's in-progress state for a
+    // no-op intent.
+    //
+    // Only path-intent invocations qualify (modes B and final-fallback D).
+    // Session-identifier inputs (mode C) intentionally proceed even at the
+    // same path because the user may be switching to a different session
+    // whose cwd happens to match the current one.
+    //
+    // Cross-provider fallback (handled inside the C branch) sets
+    // current_path = None before reaching here, so the comparison naturally
+    // fails for that case and execution proceeds.
+    if is_path_intent {
+        let same_path = {
+            let data = state.lock().await;
+            data.sessions.get(&chat_id)
+                .and_then(|s| s.current_path.clone())
+                .as_deref() == Some(canonical_path.as_str())
+        };
+        if same_path {
+            msg_debug(&format!("[handle_start_command] same-path no-op: {}", canonical_path));
+            shared_rate_limit_wait(state, chat_id).await;
+            let display = crate::utils::format::to_shell_path(&canonical_path);
+            tg!("send_message", bot.send_message(chat_id,
+                format!("Already at <code>{}</code>.", html_escape(&display)))
+                .parse_mode(ParseMode::Html)
+                .await)?;
+            return Ok(());
+        }
+    }
 
     // Try to load existing session for this path
     msg_debug(&format!("[handle_start_command] canonical_path={:?}, provider={}", canonical_path, provider_str));
@@ -3581,6 +3637,28 @@ async fn handle_start_command(
 
     {
         let mut data = state.lock().await;
+        // Session-change cleanup: if /start switches to a different workspace path OR
+        // a different session_id at the same path, drop the in-flight task, queued
+        // messages, and loop state. They were authored against the old session and
+        // would be misapplied — the queued pending_uploads point at the old session's
+        // uploads, verify-loop feedback was authored against the old session, and
+        // an in-flight task's writeback would resurrect the old session_id and history
+        // into the just-loaded new session (corrupting the on-disk session file).
+        // Idempotent with the cross-provider cleanup above (which leaves
+        // current_path = None, so path_changed is always true on re-entry).
+        let old_path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
+        let old_sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+        let new_sid = existing.as_ref().and_then(|(sd, _)| {
+            if sd.session_id.is_empty() { None } else { Some(sd.session_id.clone()) }
+        });
+        let path_changed = old_path.as_deref() != Some(canonical_path.as_str());
+        let sid_changed = old_sid != new_sid;
+        if path_changed || sid_changed {
+            cancel_in_progress_task_locked(&data, chat_id);
+            data.message_queues.remove(&chat_id);
+            data.loop_states.remove(&chat_id);
+            data.loop_feedback.remove(&chat_id);
+        }
         let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
             session_id: None,
             current_path: None,
@@ -3588,6 +3666,13 @@ async fn handle_start_command(
             pending_uploads: Vec::new(),
         });
         session.session_id = None; // Clear stale session_id from previous workspace
+        // Drop uploads only when the workspace path changed — upload paths point at
+        // the old workspace's files. When only session_id changes at the same path
+        // (mode C, session-identifier swap), uploads still reference valid files in
+        // the current workspace and remain relevant to the user's next message.
+        if path_changed {
+            session.pending_uploads.clear();
+        }
 
         if let Some((session_data, _)) = &existing {
             if !session_data.session_id.is_empty() {
@@ -4644,6 +4729,24 @@ async fn handle_workspace_resume(
 
     {
         let mut data = state.lock().await;
+        // Session-change cleanup: if this resume switches to a different workspace path
+        // OR a different session_id at the same path, drop the in-flight task, queued
+        // messages, and loop state authored against the old session — they would be
+        // misapplied here, and an in-flight task's writeback would otherwise overwrite
+        // the just-loaded session_id/history with the old task's data.
+        let old_path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
+        let old_sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+        let new_sid = existing.as_ref().and_then(|(sd, _)| {
+            if sd.session_id.is_empty() { None } else { Some(sd.session_id.clone()) }
+        });
+        let path_changed = old_path.as_deref() != Some(canonical_path.as_str());
+        let sid_changed = old_sid != new_sid;
+        if path_changed || sid_changed {
+            cancel_in_progress_task_locked(&data, chat_id);
+            data.message_queues.remove(&chat_id);
+            data.loop_states.remove(&chat_id);
+            data.loop_feedback.remove(&chat_id);
+        }
         let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
             session_id: None,
             current_path: None,
@@ -4651,6 +4754,12 @@ async fn handle_workspace_resume(
             pending_uploads: Vec::new(),
         });
         session.session_id = None; // Clear stale session_id from previous workspace
+        // Drop uploads only when the workspace path changed — upload paths point at
+        // the old workspace's files. Re-resuming the same workspace (same path) keeps
+        // uploads since they reference valid files the user just sent.
+        if path_changed {
+            session.pending_uploads.clear();
+        }
 
         if let Some((session_data, _)) = &existing {
             if !session_data.session_id.is_empty() {
@@ -4711,6 +4820,22 @@ async fn handle_clear_command(
         let old_sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
         let old_hist_len = data.sessions.get(&chat_id).map(|s| s.history.len()).unwrap_or(0);
         msg_debug(&format!("[handle_clear] clearing: path={:?}, session_id={:?}, history_len={}", path, old_sid, old_hist_len));
+        // Cancel any in-flight AI task. Without this, its completion handler would write
+        // back the response into the just-cleared session, partially resurrecting what the
+        // user explicitly cleared. The polling guard's sid comparison (captured_sid vs
+        // sid_now=None) is the second layer that prevents writeback even if /clear lands
+        // mid-completion. Drop queued messages and loop state for the same reason — they
+        // were authored against the pre-clear context.
+        cancel_in_progress_task_locked(&data, chat_id);
+        let dropped_queue = data.message_queues.remove(&chat_id).map(|q| q.len()).unwrap_or(0);
+        if dropped_queue > 0 {
+            msg_debug(&format!("[handle_clear] dropped {} queued message(s)", dropped_queue));
+        }
+        // Bump clear_epoch so any in-flight task's polling guard detects the clear
+        // even when session_id is None on both spawn and post-completion (brand-new
+        // workspace + first message + /clear).
+        let entry = data.clear_epoch.entry(chat_id).or_insert(0);
+        *entry = entry.wrapping_add(1);
         if let Some(session) = data.sessions.get_mut(&chat_id) {
             session.session_id = None;
             session.history.clear();
@@ -4862,25 +4987,10 @@ async fn handle_session_command(
     Ok(())
 }
 
-/// Atomically cancel the current AI task for `chat_id` and replace any queued items
-/// with a single redirect message (latest-wins semantics). Used when /queue is OFF
-/// and a redirect-eligible message arrives while the AI is busy.
-///
-/// Caller must hold the state lock and pass `&mut SharedData`. The cancelled task's
-/// post-cancellation cleanup will trigger `process_next_queued_message`, which then
-/// dispatches the redirect target.
-///
-/// Returns `(queue_id, was_replacement)` where `was_replacement` is true when a
-/// pending redirect was overwritten by the new one (rapid successive redirects).
-fn enqueue_redirect_locked(
-    data: &mut SharedData,
-    chat_id: ChatId,
-    text: String,
-    user_display_name: String,
-    pending_uploads: Vec<String>,
-) -> (String, bool) {
-    // Step 1: cancel the in-progress task (mirror /stop behavior).
-    // If a previous /stop or redirect already cancelled it, this is idempotent.
+/// Cancel the in-progress AI task for `chat_id` (idempotent): set the cancel flag and
+/// kill the child process so the blocking reader thread exits at EOF. No-op if no token
+/// exists or it was already cancelled. Caller must hold the state lock.
+fn cancel_in_progress_task_locked(data: &SharedData, chat_id: ChatId) {
     if let Some(token) = data.cancel_tokens.get(&chat_id).cloned() {
         if !token.cancelled.load(Ordering::Relaxed) {
             token.cancelled.store(true, Ordering::Relaxed);
@@ -4900,6 +5010,28 @@ fn enqueue_redirect_locked(
             }
         }
     }
+}
+
+/// Atomically cancel the current AI task for `chat_id` and replace any queued items
+/// with a single redirect message (latest-wins semantics). Used when /queue is OFF
+/// and a redirect-eligible message arrives while the AI is busy.
+///
+/// Caller must hold the state lock and pass `&mut SharedData`. The cancelled task's
+/// post-cancellation cleanup will trigger `process_next_queued_message`, which then
+/// dispatches the redirect target.
+///
+/// Returns `(queue_id, was_replacement)` where `was_replacement` is true when a
+/// pending redirect was overwritten by the new one (rapid successive redirects).
+fn enqueue_redirect_locked(
+    data: &mut SharedData,
+    chat_id: ChatId,
+    text: String,
+    user_display_name: String,
+    pending_uploads: Vec<String>,
+) -> (String, bool) {
+    // Step 1: cancel the in-progress task (mirror /stop behavior).
+    // If a previous /stop or redirect already cancelled it, this is idempotent.
+    cancel_in_progress_task_locked(data, chat_id);
 
     // Step 2: clear loop state so a verification loop doesn't continue
     data.loop_states.remove(&chat_id);
@@ -5176,15 +5308,18 @@ async fn handle_down_command(
     text: &str,
     state: &SharedState,
 ) -> ResponseResult<()> {
-    let file_path = text.strip_prefix("/down").unwrap_or("").trim();
-    msg_debug(&format!("[handle_down] chat_id={}, file_path={:?}", chat_id.0, file_path));
+    let raw_file_path = text.strip_prefix("/down").unwrap_or("").trim();
+    msg_debug(&format!("[handle_down] chat_id={}, file_path={:?}", chat_id.0, raw_file_path));
 
-    if file_path.is_empty() {
+    if raw_file_path.is_empty() {
         shared_rate_limit_wait(state, chat_id).await;
         tg!("send_message", bot.send_message(chat_id, "Usage: /down <filepath>\nExample: /down /home/kst/file.txt")
             .await)?;
         return Ok(());
     }
+
+    let expanded = crate::utils::path::expand_tilde(raw_file_path);
+    let file_path = expanded.as_str();
 
     // Resolve relative path using current session path
     let resolved_path = if Path::new(file_path).is_absolute() {
@@ -6637,29 +6772,86 @@ async fn handle_model_command(
     // Set model
     match resolve_model_name(arg) {
         Ok(model_id) => {
-            {
+            let (provider_changed, had_state, old_path, queue_cleared) = {
                 let mut data = state.lock().await;
-                // If provider changed, clear session_id to avoid cross-provider resume
+                // If provider changed, clear session_id to avoid cross-provider resume.
+                // Use detect_provider so the comparison reflects the *effective* provider
+                // (CLI-availability fallback when model is unset) — matches the polling
+                // guard's spawn-time capture and avoids missing user-visible transitions
+                // like None→codex (Claude unavailable) → /model claude.
                 let old_model = get_model(&data.settings, chat_id);
-                let old_provider = provider_from_model(old_model.as_deref());
-                let new_provider = provider_from_model(Some(&model_id));
+                let old_provider = detect_provider(old_model.as_deref());
+                let new_provider = detect_provider(Some(&model_id));
                 let provider_changed = old_provider != new_provider;
                 msg_debug(&format!("[handle_model_command] old_model={:?}, old_provider={}, new_provider={}, provider_changed={}",
                     old_model, old_provider, new_provider, provider_changed));
-                if provider_changed {
+                let (had_state, old_path, queue_cleared) = if provider_changed {
+                    // Cancel any in-flight AI task on the old provider. Without this, its
+                    // completion handler would later write the old provider's session_id and
+                    // response into the (now-cleared) session, contradicting the "history has
+                    // been reset" notice and leaving a stale cross-provider session_id behind.
+                    cancel_in_progress_task_locked(&data, chat_id);
+                    // Drop queued user messages: they targeted the old workspace context, and their
+                    // captured pending_uploads point at the old workspace's files. Restoring them
+                    // into the new (auto-created) workspace would prepend stale upload references
+                    // to the next prompt, contradicting the "uploads have been reset" notice.
+                    let dropped_queue = data.message_queues.remove(&chat_id).map(|q| q.len()).unwrap_or(0);
+                    // Cancel any verification loop. Its feedback was authored against the old
+                    // provider's session and would be misapplied under the new provider.
+                    data.loop_states.remove(&chat_id);
+                    data.loop_feedback.remove(&chat_id);
                     if let Some(session) = data.sessions.get_mut(&chat_id) {
-                        msg_debug(&format!("[handle_model_command] provider changed → clearing session + history (len={}, old_sid={:?}, old_path={:?})",
-                            session.history.len(), session.session_id, session.current_path));
+                        let prev_path = session.current_path.clone();
+                        let had = session.session_id.is_some()
+                            || prev_path.is_some()
+                            || !session.history.is_empty()
+                            || !session.pending_uploads.is_empty()
+                            || dropped_queue > 0;
+                        msg_debug(&format!("[handle_model_command] provider changed → clearing session + history + uploads + queue + loop (hist_len={}, uploads={}, queue={}, old_sid={:?}, old_path={:?})",
+                            session.history.len(), session.pending_uploads.len(), dropped_queue, session.session_id, session.current_path));
                         session.session_id = None;
                         session.current_path = None;
                         session.history.clear();
+                        session.pending_uploads.clear();
+                        (had, prev_path, dropped_queue)
+                    } else {
+                        (dropped_queue > 0, None, dropped_queue)
                     }
-                }
+                } else {
+                    (false, None, 0)
+                };
                 data.settings.models.insert(chat_id.0.to_string(), model_id.clone());
                 save_bot_settings(token, &data.settings);
-            }
+                (provider_changed, had_state, old_path, queue_cleared)
+            };
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, format!("Model set to <b>{model_id}</b>."))
+            let queue_note = if queue_cleared > 0 {
+                format!("\n{} queued message(s) discarded.", queue_cleared)
+            } else {
+                String::new()
+            };
+            let model_id_escaped = html_escape(&model_id);
+            let msg = if provider_changed && had_state {
+                if let Some(prev) = old_path {
+                    let prev_display = crate::utils::format::to_shell_path(&prev);
+                    format!(
+                        "Model set to <b>{}</b>.\n\n\
+                         Provider changed — previous workspace, history, and uploads have been reset for compatibility.{}\n\
+                         Previous workspace: <code>{}</code> (preserved on disk)\n\
+                         A new workspace will be created on your next message. To resume work in the previous workspace instead, use <code>/start &lt;path&gt;</code>.",
+                        model_id_escaped, queue_note, html_escape(&prev_display)
+                    )
+                } else {
+                    format!(
+                        "Model set to <b>{}</b>.\n\n\
+                         Provider changed — conversation history and uploads have been reset for compatibility.{} A new workspace will be created on your next message.",
+                        model_id_escaped, queue_note
+                    )
+                }
+            } else {
+                format!("Model set to <b>{}</b>.", model_id_escaped)
+            };
+            tg!("send_message", bot.send_message(chat_id, msg)
                 .parse_mode(ParseMode::Html)
                 .await)?;
         }
@@ -7164,6 +7356,16 @@ async fn handle_text_message(
     let bot_display_name_for_log = bot_display_name_for_prompt.clone();
     let user_display_name_owned = user_display_name.to_string();
     let provider_str: &'static str = detect_provider(model.as_deref());
+    // Captured at spawn so the post-completion guard can detect /clear or /start
+    // session-id swaps. The provider/path comparison alone misses same-path same-provider
+    // mutations (e.g. /clear nullifies session_id; /start <session-id> swaps to a different
+    // session at the same path). clear_epoch covers the brand-new-session case where
+    // session_id is None on both sides of the comparison.
+    let captured_sid = session_id.clone();
+    let captured_clear_epoch = {
+        let data = state.lock().await;
+        data.clear_epoch.get(&chat_id).copied().unwrap_or(0)
+    };
     tokio::spawn(async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
@@ -7536,7 +7738,35 @@ async fn handle_text_message(
                 // Update session state
                 {
                     let mut data = state_owned.lock().await;
-                    if let Some(session) = data.sessions.get_mut(&chat_id) {
+                    // Guard: if /model (provider switch) or /start (workspace switch) ran during
+                    // this task, the session has been intentionally reset. Writing the old
+                    // provider's session_id and the response into the (now-cleared) session would
+                    // resurrect stale state under a new context, contradicting the user-facing
+                    // "history has been reset" notice and breaking the next message's provider
+                    // routing. Skip the session update — group chat log is still written below
+                    // so other bots see the response.
+                    //
+                    // Use detect_provider (not provider_from_model) so the comparison matches how
+                    // provider_str was captured at task spawn — otherwise, a chat with no model
+                    // set running on a CLI fallback (e.g. Codex when Claude is unavailable) would
+                    // see provider_str = "codex" but provider_now = "claude" and skip every
+                    // writeback.
+                    let model_now = data.settings.models.get(&chat_id.0.to_string()).cloned();
+                    let provider_now = detect_provider(model_now.as_deref());
+                    let path_now = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
+                    let sid_now = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+                    let epoch_now = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
+                    // sid comparison catches /clear (sid → None) and /start <session-id>
+                    // same-path swaps (sid → different value). epoch_now catches /clear on
+                    // a brand-new session where sid stays None on both sides.
+                    let session_changed = provider_now != provider_str
+                        || path_now.as_deref() != Some(current_path.as_str())
+                        || sid_now != captured_sid
+                        || epoch_now != captured_clear_epoch;
+                    if session_changed {
+                        msg_debug(&format!("[polling] session changed during task — skip session update (path: {:?} → {:?}, provider: {} → {}, sid: {:?} → {:?}, epoch: {} → {})",
+                            current_path, path_now, provider_str, provider_now, captured_sid, sid_now, captured_clear_epoch, epoch_now));
+                    } else if let Some(session) = data.sessions.get_mut(&chat_id) {
                         msg_debug(&format!("[polling] saving session: new_session_id={:?}, old_session_id={:?}, history_len={}",
                             new_session_id, session.session_id, session.history.len()));
                         if let Some(sid) = new_session_id.take() {
@@ -7720,31 +7950,57 @@ async fn handle_text_message(
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
                                 let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
                             }
-                            // Re-check: /stop may have been called during verification
+                            // Re-check: /stop may have been called during verification.
+                            // /clear or /model (provider switch) may have removed loop_states
+                            // during verification. Suppress all post-verify outcome messages
+                            // (complete / limit / incomplete) so the user's explicit cancel is
+                            // honoured uniformly. Each inner branch (complete/limit/reinject)
+                            // additionally re-checks loop_states under the lock as a race-safety
+                            // net for /clear or /model arriving between this gate and the
+                            // branch-internal write.
+                            let loop_active_post_verify = {
+                                let data = state_owned.lock().await;
+                                data.loop_states.contains_key(&chat_id)
+                            };
                             if cancel_token.cancelled.load(Ordering::Relaxed) {
                                 msg_debug("[loop] cancelled during verification — aborting loop");
                                 // loop_states already removed by /stop handler
+                            } else if !loop_active_post_verify {
+                                msg_debug("[loop] loop_states removed during verification — skip post-verify outcome");
                             } else {
                             match verify_result {
                                 Ok(Ok(result)) => {
                                     if result.complete {
                                         msg_debug("[loop] mission_complete — loop finished");
-                                        {
+                                        // Re-check loop_states under the lock: /clear or /model
+                                        // (provider switch) may have removed it between the outer
+                                        // gate and now. Honour that intent — skip the outcome
+                                        // message uniformly with the reinject branch's safety net.
+                                        let still_active = {
                                             let mut data = state_owned.lock().await;
-                                            data.loop_states.remove(&chat_id);
+                                            data.loop_states.remove(&chat_id).is_some()
+                                        };
+                                        if still_active {
+                                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                                            let _ = tg!("send_message", bot_owned.send_message(chat_id, "✅ Loop complete — task verified as done.").await);
+                                        } else {
+                                            msg_debug("[loop] loop_states removed before complete-message — skip");
                                         }
-                                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let _ = tg!("send_message", bot_owned.send_message(chat_id, "✅ Loop complete — task verified as done.").await);
                                     } else if max_iterations > 0 && remaining <= 1 {
                                         msg_debug("[loop] max iterations reached — loop stopped");
-                                        {
+                                        // Same race-safety net as the complete branch.
+                                        let still_active = {
                                             let mut data = state_owned.lock().await;
-                                            data.loop_states.remove(&chat_id);
+                                            data.loop_states.remove(&chat_id).is_some()
+                                        };
+                                        if still_active {
+                                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                                            let feedback_preview = result.feedback.as_deref().unwrap_or("(no details)");
+                                            let msg = format!("⚠️ Loop limit reached. Remaining issue:\n{}", feedback_preview);
+                                            let _ = tg!("send_message", bot_owned.send_message(chat_id, &msg).await);
+                                        } else {
+                                            msg_debug("[loop] loop_states removed before limit-message — skip");
                                         }
-                                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let feedback_preview = result.feedback.as_deref().unwrap_or("(no details)");
-                                        let msg = format!("⚠️ Loop limit reached. Remaining issue:\n{}", feedback_preview);
-                                        let _ = tg!("send_message", bot_owned.send_message(chat_id, &msg).await);
                                     } else {
                                         // Incomplete: use feedback if available, otherwise fall back to original request
                                         let reinject_text = result.feedback.unwrap_or_else(|| {
@@ -7777,6 +8033,11 @@ async fn handle_text_message(
                                             let mut data = state_owned.lock().await;
                                             if cancel_token.cancelled.load(Ordering::Relaxed) {
                                                 msg_debug("[loop] cancelled during result processing — skip reinject");
+                                            } else if !data.loop_states.contains_key(&chat_id) {
+                                                // loop_states cleared externally (e.g. /clear, /model provider switch)
+                                                // between verify start and finish — honour that intent and skip reinject
+                                                // so the loop does not silently resume.
+                                                msg_debug("[loop] loop_states removed during verification — skip reinject");
                                             } else {
                                                 if let Some(ls) = data.loop_states.get_mut(&chat_id) {
                                                     ls.remaining = new_remaining;
@@ -7918,7 +8179,28 @@ async fn handle_text_message(
             println!("  [{ts}] ■ Stopped");
 
             let mut data = state_owned.lock().await;
-            if let Some(session) = data.sessions.get_mut(&chat_id) {
+            // Same guard as the normal-completion branch: if /model or /start changed the
+            // session during this task, skip the partial-response writeback so it does not
+            // bleed into the new context. Group chat log is still written below — other bots
+            // benefit from seeing the partial response, and the shared log is not part of the
+            // (now-cleared) session it would have leaked into.
+            //
+            // detect_provider mirrors the spawn-time capture (see normal-completion guard).
+            // sid + clear_epoch mirror normal-completion: catch /clear, /start same-path swaps,
+            // and brand-new-session /clear (where sid stays None).
+            let model_now = data.settings.models.get(&chat_id.0.to_string()).cloned();
+            let provider_now = detect_provider(model_now.as_deref());
+            let path_now = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
+            let sid_now = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+            let epoch_now = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
+            let session_changed = provider_now != provider_str
+                || path_now.as_deref() != Some(current_path.as_str())
+                || sid_now != captured_sid
+                || epoch_now != captured_clear_epoch;
+            if session_changed {
+                msg_debug(&format!("[polling] session changed during stopped task — skip session writeback (path: {:?} → {:?}, provider: {} → {}, sid: {:?} → {:?}, epoch: {} → {})",
+                    current_path, path_now, provider_str, provider_now, captured_sid, sid_now, captured_clear_epoch, epoch_now));
+            } else if let Some(session) = data.sessions.get_mut(&chat_id) {
                 if let Some(sid) = new_session_id {
                     session.session_id = Some(sid);
                 }
@@ -7931,35 +8213,36 @@ async fn handle_text_message(
                     content: stopped_response,
                 });
                 save_session_to_file(session, &current_path, provider_str);
-                // Write to group chat shared log (for cross-bot context sharing)
-                msg_debug(&format!("[polling] JSONL stopped check: chat_id={}, raw_entries_count={}",
-                    chat_id.0, raw_entries.len()));
-                if chat_id.0 < 0 {
-                    let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                    let dn = if bot_display_name_for_log.is_empty() { None } else { Some(bot_display_name_for_log.clone()) };
+            }
+            // Write to group chat shared log (for cross-bot context sharing).
+            // Mirrors the normal-completion branch: written regardless of session_changed.
+            msg_debug(&format!("[polling] JSONL stopped check: chat_id={}, raw_entries_count={}",
+                chat_id.0, raw_entries.len()));
+            if chat_id.0 < 0 {
+                let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                let dn = if bot_display_name_for_log.is_empty() { None } else { Some(bot_display_name_for_log.clone()) };
+                append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                    ts: now_ts.clone(),
+                    bot: bot_username_for_log.clone(),
+                    bot_display_name: dn.clone(),
+                    role: "user".to_string(),
+                    from: Some(user_display_name_owned.clone()),
+                    text: user_text_owned,
+                    clear: false,
+                });
+                if !raw_entries.is_empty() {
+                    msg_debug(&format!("[polling] JSONL stopped: writing user+assistant entries, raw_entries_count={}", raw_entries.len()));
                     append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                        ts: now_ts.clone(),
+                        ts: now_ts,
                         bot: bot_username_for_log.clone(),
-                        bot_display_name: dn.clone(),
-                        role: "user".to_string(),
-                        from: Some(user_display_name_owned.clone()),
-                        text: user_text_owned,
+                        bot_display_name: dn,
+                        role: "assistant".to_string(),
+                        from: None,
+                        text: serialize_payload(&std::mem::take(&mut raw_entries)),
                         clear: false,
                     });
-                    if !raw_entries.is_empty() {
-                        msg_debug(&format!("[polling] JSONL stopped: writing user+assistant entries, raw_entries_count={}", raw_entries.len()));
-                        append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                            ts: now_ts,
-                            bot: bot_username_for_log.clone(),
-                            bot_display_name: dn,
-                            role: "assistant".to_string(),
-                            from: None,
-                            text: serialize_payload(&std::mem::take(&mut raw_entries)),
-                            clear: false,
-                        });
-                    } else {
-                        msg_debug(&format!("[polling] JSONL stopped: user entry written, assistant SKIPPED (raw_entries is empty)"));
-                    }
+                } else {
+                    msg_debug(&format!("[polling] JSONL stopped: user entry written, assistant SKIPPED (raw_entries is empty)"));
                 }
             }
             data.cancel_tokens.remove(&chat_id);
@@ -10198,6 +10481,13 @@ async fn process_bot_message(
     let msg_clone = msg.clone();
     let provider_str: &'static str = detect_provider(model.as_deref());
     let current_path_owned = current_path.clone();
+    // Captured at spawn so the post-completion guard catches /clear and /start
+    // same-path session-id swaps (see handle_text_message guard for rationale).
+    let captured_sid = session_id.clone();
+    let captured_clear_epoch = {
+        let data = state.lock().await;
+        data.clear_epoch.get(&chat_id).copied().unwrap_or(0)
+    };
     let prompt_owned = prompt.clone();
     let bmsg_id_for_log = msg.id.clone();
     let bot_username_for_log = bot_username.to_string();
@@ -10538,7 +10828,23 @@ async fn process_bot_message(
                 // Update session state
                 {
                     let mut data = state_owned.lock().await;
-                    if let Some(session) = data.sessions.get_mut(&chat_id) {
+                    // Same guard as text-message polling: skip session writeback if /model or
+                    // /start changed the session during this bot-to-bot task. detect_provider
+                    // mirrors the spawn-time capture (see normal text-msg guard for rationale).
+                    // sid + clear_epoch catch /clear and /start same-path swaps.
+                    let model_now = data.settings.models.get(&chat_id.0.to_string()).cloned();
+                    let provider_now = detect_provider(model_now.as_deref());
+                    let path_now = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
+                    let sid_now = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+                    let epoch_now = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
+                    let session_changed = provider_now != provider_str
+                        || path_now.as_deref() != Some(current_path_owned.as_str())
+                        || sid_now != captured_sid
+                        || epoch_now != captured_clear_epoch;
+                    if session_changed {
+                        msg_debug(&format!("[botmsg_poll:{}] session changed during task — skip session update (path: {:?} → {:?}, provider: {} → {}, sid: {:?} → {:?}, epoch: {} → {})",
+                            bmsg_id_for_log, current_path_owned, path_now, provider_str, provider_now, captured_sid, sid_now, captured_clear_epoch, epoch_now));
+                    } else if let Some(session) = data.sessions.get_mut(&chat_id) {
                         msg_debug(&format!("[botmsg_poll:{}] updating session: new_session_id={:?}, history_len_before={}",
                             bmsg_id_for_log, new_session_id, session.history.len()));
                         if let Some(sid) = new_session_id.take() {
@@ -10680,7 +10986,24 @@ async fn process_bot_message(
             msg_debug(&format!("[botmsg_poll:{}] stopped message sent, updating session", bmsg_id_for_log));
 
             let mut data = state_owned.lock().await;
-            if let Some(session) = data.sessions.get_mut(&chat_id) {
+            // Same guard: skip the partial-response writeback if the session was reset
+            // (via /model or /start) during this bot-to-bot task. Group chat log is still
+            // written below — mirrors the normal-completion branch so other bots see the
+            // partial response. detect_provider mirrors the spawn-time capture.
+            // sid + clear_epoch catch /clear and /start same-path swaps.
+            let model_now = data.settings.models.get(&chat_id.0.to_string()).cloned();
+            let provider_now = detect_provider(model_now.as_deref());
+            let path_now = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
+            let sid_now = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+            let epoch_now = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
+            let session_changed = provider_now != provider_str
+                || path_now.as_deref() != Some(current_path_owned.as_str())
+                || sid_now != captured_sid
+                || epoch_now != captured_clear_epoch;
+            if session_changed {
+                msg_debug(&format!("[botmsg_poll:{}] cancel: session changed during task — skip session writeback (path: {:?} → {:?}, provider: {} → {}, sid: {:?} → {:?}, epoch: {} → {})",
+                    bmsg_id_for_log, current_path_owned, path_now, provider_str, provider_now, captured_sid, sid_now, captured_clear_epoch, epoch_now));
+            } else if let Some(session) = data.sessions.get_mut(&chat_id) {
                 msg_debug(&format!("[botmsg_poll:{}] cancel: updating session history, new_session_id={:?}",
                     bmsg_id_for_log, new_session_id));
                 if let Some(sid) = new_session_id {
@@ -10695,38 +11018,39 @@ async fn process_bot_message(
                     content: stopped_response,
                 });
                 save_session_to_file(session, &current_path_owned, provider_str);
-                // Write to group chat shared log (bot-to-bot messages, stopped)
-                msg_debug(&format!("[botmsg_poll:{}] JSONL stopped check: chat_id={}, raw_entries_count={}",
-                    bmsg_id_for_log, chat_id.0, raw_entries.len()));
-                if chat_id.0 < 0 {
-                    let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                    let dn = if bot_display_name_for_log.is_empty() { None } else { Some(bot_display_name_for_log.clone()) };
-                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                        ts: now_ts.clone(),
-                        bot: bot_username_for_log.clone(),
-                        bot_display_name: dn.clone(),
-                        role: "user".to_string(),
-                        from: Some(format!("bot:{}", from_bot_for_log)),
-                        text: prompt_owned,
-                        clear: false,
-                    });
-                    if !raw_entries.is_empty() {
-                        msg_debug(&format!("[botmsg_poll:{}] JSONL stopped: writing user+assistant entries, raw_entries_count={}", bmsg_id_for_log, raw_entries.len()));
-                        append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                            ts: now_ts,
-                            bot: bot_username_for_log.clone(),
-                            bot_display_name: dn,
-                            role: "assistant".to_string(),
-                            from: None,
-                            text: serialize_payload(&std::mem::take(&mut raw_entries)),
-                            clear: false,
-                        });
-                    } else {
-                        msg_debug(&format!("[botmsg_poll:{}] JSONL stopped: user entry written, assistant SKIPPED (raw_entries is empty)", bmsg_id_for_log));
-                    }
-                }
             } else {
                 msg_debug(&format!("[botmsg_poll:{}] cancel: no session found for chat_id={}", bmsg_id_for_log, chat_id.0));
+            }
+            // Write to group chat shared log (bot-to-bot messages, stopped).
+            // Mirrors the normal-completion branch: written regardless of session_changed.
+            msg_debug(&format!("[botmsg_poll:{}] JSONL stopped check: chat_id={}, raw_entries_count={}",
+                bmsg_id_for_log, chat_id.0, raw_entries.len()));
+            if chat_id.0 < 0 {
+                let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+                let dn = if bot_display_name_for_log.is_empty() { None } else { Some(bot_display_name_for_log.clone()) };
+                append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                    ts: now_ts.clone(),
+                    bot: bot_username_for_log.clone(),
+                    bot_display_name: dn.clone(),
+                    role: "user".to_string(),
+                    from: Some(format!("bot:{}", from_bot_for_log)),
+                    text: prompt_owned,
+                    clear: false,
+                });
+                if !raw_entries.is_empty() {
+                    msg_debug(&format!("[botmsg_poll:{}] JSONL stopped: writing user+assistant entries, raw_entries_count={}", bmsg_id_for_log, raw_entries.len()));
+                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
+                        ts: now_ts,
+                        bot: bot_username_for_log.clone(),
+                        bot_display_name: dn,
+                        role: "assistant".to_string(),
+                        from: None,
+                        text: serialize_payload(&std::mem::take(&mut raw_entries)),
+                        clear: false,
+                    });
+                } else {
+                    msg_debug(&format!("[botmsg_poll:{}] JSONL stopped: user entry written, assistant SKIPPED (raw_entries is empty)", bmsg_id_for_log));
+                }
             }
             data.cancel_tokens.remove(&chat_id);
             let stop_msg_id = data.stop_message_ids.remove(&chat_id);
