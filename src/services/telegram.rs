@@ -1740,7 +1740,14 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
 
 /// Auto-create a workspace session under ~/.cokacdir/workspace/<random>.
 /// Returns (session_id, path) on success; None if filesystem fails.
+///
+/// Sends a Telegram notification with the new workspace path so the user
+/// knows where the AI is operating without having to type /pwd. Only sent
+/// when a new workspace is actually created — if a concurrent message
+/// already established a session, no notification is sent (the user will
+/// learn the path through that other message's flow).
 async fn auto_create_workspace_session(
+    bot: &Bot,
     state: &SharedState,
     chat_id: ChatId,
     bot_token: &str,
@@ -1771,13 +1778,13 @@ async fn auto_create_workspace_session(
         }
     };
     // Re-check under lock: another concurrent message may have already created a session
-    let (sid, path) = {
+    let (sid, path, was_new) = {
         let mut data = state.lock().await;
         if let Some(existing) = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone()) {
             msg_debug(&format!("[auto_workspace] chat_id={}, session already created by another message: {}", chat_id.0, existing));
             let _ = fs::remove_dir(&auto_path);
             let sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
-            (sid, existing)
+            (sid, existing, false)
         } else {
             let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
                 session_id: None,
@@ -1791,7 +1798,7 @@ async fn auto_create_workspace_session(
             data.settings.last_sessions.insert(chat_id.0.to_string(), auto_path.clone());
             save_bot_settings(bot_token, &data.settings);
             msg_debug(&format!("[auto_workspace] chat_id={}, new workspace session created: {}", chat_id.0, auto_path));
-            (None, auto_path)
+            (None, auto_path, true)
         }
     };
     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -1799,6 +1806,24 @@ async fn auto_create_workspace_session(
         println!("  [{ts}] ▶ Using existing session: {path}");
     } else {
         println!("  [{ts}] ▶ Auto-started session: {path}");
+    }
+    if was_new {
+        let display = crate::utils::format::to_shell_path(&path);
+        let folder_name = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        let mut notice = format!(
+            "Workspace auto-started at <code>{}</code>.",
+            html_escape(&display)
+        );
+        if is_workspace_id(folder_name) {
+            notice.push_str(&format!("\nUse /{} to resume this session.", folder_name));
+        }
+        shared_rate_limit_wait(state, chat_id).await;
+        let _ = tg!("send_message", bot.send_message(chat_id, &notice)
+            .parse_mode(ParseMode::Html)
+            .await);
     }
     Some((sid, path))
 }
@@ -5386,7 +5411,7 @@ async fn handle_file_upload(
         path
     } else {
         // Auto-create a workspace session
-        let Some((_, path)) = auto_create_workspace_session(state, chat_id, bot.token()).await else {
+        let Some((_, path)) = auto_create_workspace_session(bot, state, chat_id, bot.token()).await else {
             shared_rate_limit_wait(state, chat_id).await;
             tg!("send_message", bot.send_message(chat_id, "Failed to create workspace.")
                 .await)?;
@@ -7141,7 +7166,7 @@ async fn handle_text_message(
         Some(info) => info,
         None => {
             // Auto-create a workspace session instead of rejecting the message
-            let Some((auto_sid, auto_current)) = auto_create_workspace_session(state, chat_id, bot.token()).await else {
+            let Some((auto_sid, auto_current)) = auto_create_workspace_session(bot, state, chat_id, bot.token()).await else {
                 {
                     let mut data = state.lock().await;
                     data.cancel_tokens.remove(&chat_id);
