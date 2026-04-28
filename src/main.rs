@@ -81,6 +81,8 @@ fn print_help() {
     println!("                            Remove a schedule");
     println!("    --cron-update <SID> --at <TIME> --chat <ID> --key <HASH>");
     println!("                            Update schedule time");
+    println!("    --cron-history <SID> --chat <ID> --key <HASH>");
+    println!("                            Read run history of a schedule (JSONL records)");
     println!("    --message <TEXT> --to <BOT> --chat <ID> --key <HASH>");
     println!("                            Send message to another bot (internal use)");
     println!("    --read_chat_log <CHAT_ID> [--range <N|START-END>] [--bot <USERNAME>]");
@@ -321,6 +323,20 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
     if schedule_type == "cron" {
         output.as_object_mut().unwrap().insert("once".to_string(), serde_json::json!(once));
     }
+    // Embed a usage hint that binds this specific schedule_id to the --cron-history
+    // command. This gives the AI a direct, in-output mapping ("for THIS id, run THIS
+    // exact command"), which is stronger than the generic system-prompt instruction
+    // alone — useful for follow-up turns where the user refers to the schedule by
+    // natural-language phrases like "방금 한 거" without naming the id.
+    let bin = crate::utils::format::to_shell_path(bin_path());
+    // Quote the binary path so spaces in install locations (notably on Windows) don't
+    // break the suggested command. Matches the `\"{bin}\"` quoting used throughout the
+    // system-prompt SCHEDULE sections.
+    let hint = format!(
+        "To inspect run history of this schedule, call: \"{}\" --cron-history {} --chat {} --key {}",
+        bin, id, chat_id, hash_key
+    );
+    output.as_object_mut().unwrap().insert("hint".to_string(), serde_json::json!(hint));
     cron_debug(&format!("  Output: {}", output));
     // Write result to temp file so the bot can read it even if Bash tool misses stdout
     if let Some(home) = dirs::home_dir() {
@@ -487,6 +503,10 @@ fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
     }
 
     if telegram::delete_schedule_entry_pub(id) {
+        // Also clear the run-history file for this schedule. If we kept it around, a
+        // future schedule that happened to receive the same 8-char ID (collision-checked
+        // but theoretically reusable) would inherit the prior schedule's run history.
+        telegram::delete_schedule_history_pub(id);
         cron_debug(&format!("[handle_cron_remove] id={}, deleted successfully", id));
         println!("{}", serde_json::json!({"status":"ok","id":id}));
     } else {
@@ -494,6 +514,84 @@ fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
         eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to remove schedule: {}", id)}));
         std::process::exit(1);
     }
+}
+
+/// Read the run-history JSONL file for a schedule and emit its records as a JSON array.
+///
+/// Authorization: prefers the live schedule entry's (chat_id, bot_key) match. If the
+/// entry is gone (one-time schedule already executed and auto-deleted), falls back to
+/// the first record in the history file — both `chat_id` and `bot_key` must match.
+/// Output: `{"status":"ok","id":"...","count":N,"history":[{...}, ...]}`. An entry that
+/// exists but has never run yields `count:0, history:[]`.
+fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
+    use services::telegram;
+
+    cron_debug(&format!("[handle_cron_history] id={}, chat_id={}, hash_key={}", id, chat_id, hash_key));
+
+    let history_path = match telegram::schedule_history_path_pub(id) {
+        Some(p) => p,
+        None => {
+            cron_debug("[handle_cron_history] cannot determine home directory");
+            eprintln!("{}", serde_json::json!({"status":"error","message":"Cannot determine home directory"}));
+            std::process::exit(1);
+        }
+    };
+
+    // Authorization check 1: live schedule entry matching (chat_id, bot_key)
+    let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
+    let entry_authorized = entries.iter().any(|e| e.id == id);
+
+    // Authorization check 2 (fallback for already-deleted one-time schedules):
+    // first record in the history file must carry the same (chat_id, bot_key).
+    let mut authorized_via_history = false;
+    if !entry_authorized {
+        if let Ok(content) = std::fs::read_to_string(&history_path) {
+            if let Some(first_line) = content.lines().find(|l| !l.trim().is_empty()) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(first_line) {
+                    let cid_match = v.get("chat_id").and_then(|c| c.as_i64()) == Some(chat_id);
+                    let key_match = v.get("bot_key").and_then(|c| c.as_str()) == Some(hash_key);
+                    if cid_match && key_match {
+                        authorized_via_history = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if !entry_authorized && !authorized_via_history {
+        cron_debug(&format!("[handle_cron_history] id={}, not authorized (no entry, no matching history)", id));
+        eprintln!("{}", serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)}));
+        std::process::exit(1);
+    }
+
+    // Read history file. Missing file is valid (entry exists but never ran) → empty list.
+    let history: Vec<serde_json::Value> = if history_path.exists() {
+        match std::fs::read_to_string(&history_path) {
+            Ok(content) => content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect(),
+            Err(e) => {
+                cron_debug(&format!("[handle_cron_history] id={}, read failed: {}", id, e));
+                eprintln!("{}", serde_json::json!({"status":"error","message":format!("failed to read history file: {}", e)}));
+                std::process::exit(1);
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let output = serde_json::json!({
+        "status": "ok",
+        "id": id,
+        "count": history.len(),
+        "history": history,
+    });
+    cron_debug(&format!("[handle_cron_history] id={}, returned {} record(s)", id, history.len()));
+    println!("{}", output);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 }
 
 fn handle_cron_update(id: &str, at_value: &str, chat_id: i64, hash_key: &str) {
@@ -1421,6 +1519,35 @@ fn main() -> io::Result<()> {
                     (Some(sid), Some(cid), Some(k)) => handle_cron_remove(&sid, cid, &k),
                     _ => {
                         eprintln!("{}", serde_json::json!({"status":"error","message":"--cron-remove requires <ID> --chat <ID> --key <HASH>"}));
+                    }
+                }
+                return Ok(());
+            }
+            "--cron-history" => {
+                let mut sched_id: Option<String> = None;
+                let mut chat_id: Option<i64> = None;
+                let mut key: Option<String> = None;
+                let mut j = i + 1;
+                while j < args.len() {
+                    match args[j].as_str() {
+                        "--chat" => {
+                            if j + 1 < args.len() { chat_id = args[j + 1].parse().ok(); j += 2; }
+                            else { j += 1; }
+                        }
+                        "--key" => {
+                            if j + 1 < args.len() { key = Some(args[j + 1].clone()); j += 2; }
+                            else { j += 1; }
+                        }
+                        _ if sched_id.is_none() && !args[j].starts_with("--") => {
+                            sched_id = Some(args[j].clone()); j += 1;
+                        }
+                        _ => { j += 1; }
+                    }
+                }
+                match (sched_id, chat_id, key) {
+                    (Some(sid), Some(cid), Some(k)) => handle_cron_history(&sid, cid, &k),
+                    _ => {
+                        eprintln!("{}", serde_json::json!({"status":"error","message":"--cron-history requires <ID> --chat <ID> --key <HASH>"}));
                     }
                 }
                 return Ok(());

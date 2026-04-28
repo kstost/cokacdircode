@@ -912,6 +912,108 @@ fn delete_schedule_entry(id: &str) -> bool {
     ok
 }
 
+/// Directory for schedule run history files: ~/.cokacdir/schedule_history/
+/// Each schedule keeps one JSONL file (`<id>.log`) with one record per execution.
+fn schedule_history_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".cokacdir").join("schedule_history"))
+}
+
+/// Public access to the schedule history file path (for `--cron-history` in main.rs).
+pub fn schedule_history_path_pub(id: &str) -> Option<std::path::PathBuf> {
+    schedule_history_dir().map(|d| d.join(format!("{}.log", id)))
+}
+
+/// Append one JSONL record describing a single schedule execution.
+///
+/// Best-effort logging: any filesystem error is swallowed (with a sched_debug entry)
+/// so a failure here never affects the schedule's own user-facing completion path.
+/// Each record carries `chat_id` and `bot_key` so the `--cron-history` command can
+/// authorize the caller even after the underlying schedule entry has been deleted
+/// (one-time / `--once` schedules).
+fn append_schedule_history(
+    schedule_id: &str,
+    chat_id: i64,
+    bot_key: &str,
+    prompt: &str,
+    status: &str,            // "ok" | "cancelled" | "error"
+    response: &str,
+    error: Option<&str>,
+    workspace_path: &str,
+    duration_ms: u64,
+) {
+    let Some(dir) = schedule_history_dir() else {
+        sched_debug(&format!("[append_schedule_history] id={}, no home dir → skip", schedule_id));
+        return;
+    };
+    if let Err(e) = fs::create_dir_all(&dir) {
+        sched_debug(&format!("[append_schedule_history] id={}, create_dir_all failed: {}", schedule_id, e));
+        return;
+    }
+
+    // Cap response length to avoid unbounded growth on long-output schedules.
+    // Floor to a UTF-8 char boundary so the truncated string stays valid.
+    const MAX_RESPONSE_LEN: usize = 4096;
+    let response_capped = if response.len() <= MAX_RESPONSE_LEN {
+        response.to_string()
+    } else {
+        let mut end = MAX_RESPONSE_LEN;
+        while end > 0 && !response.is_char_boundary(end) {
+            end -= 1;
+        }
+        let mut s = response[..end].to_string();
+        s.push_str("\n…[truncated]");
+        s
+    };
+
+    let mut record = serde_json::json!({
+        "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
+        "schedule_id": schedule_id,
+        "chat_id": chat_id,
+        "bot_key": bot_key,
+        "prompt": prompt,
+        "status": status,
+        "response": response_capped,
+        "workspace_path": workspace_path,
+        "duration_ms": duration_ms,
+    });
+    if let Some(err) = error {
+        record.as_object_mut().unwrap().insert("error".to_string(), serde_json::json!(err));
+    }
+
+    let path = dir.join(format!("{}.log", schedule_id));
+    let line = format!("{}\n", record);
+    let result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    match result {
+        Ok(_) => sched_debug(&format!("[append_schedule_history] id={}, status={}, bytes={}, path={}",
+            schedule_id, status, line.len(), path.display())),
+        Err(e) => sched_debug(&format!("[append_schedule_history] id={}, write failed: {}, path={}",
+            schedule_id, e, path.display())),
+    }
+}
+
+/// Delete a schedule's run-history file. Called from `--cron-remove` so that
+/// removing a schedule also clears its accumulated history (consistent with how
+/// `delete_schedule_entry` already removes the schedule's `.result` companion).
+fn delete_schedule_history(id: &str) {
+    let Some(dir) = schedule_history_dir() else { return; };
+    let path = dir.join(format!("{}.log", id));
+    if path.exists() {
+        match fs::remove_file(&path) {
+            Ok(_) => sched_debug(&format!("[delete_schedule_history] removed: {}", path.display())),
+            Err(e) => sched_debug(&format!("[delete_schedule_history] remove failed: {}, path={}", e, path.display())),
+        }
+    }
+}
+
+/// Public wrapper for `delete_schedule_history` (used by `--cron-remove` in main.rs).
+pub fn delete_schedule_history_pub(id: &str) {
+    delete_schedule_history(id);
+}
+
 /// Parse a relative time string (e.g. "4h", "30m", "1d") into a future DateTime
 fn parse_relative_time(s: &str) -> Option<chrono::DateTime<chrono::Local>> {
     sched_debug(&format!("[parse_relative_time] input: {:?}", s));
@@ -1474,6 +1576,26 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
          \"{bin}\" --cron-update <SCHEDULE_ID> --at \"<NEW_TIME>\" --chat {chat_id} --key {bot_key}\n\
          • --at accepts the same formats as --cron\n\
          • Output: {{\"status\":\"ok\",\"id\":\"...\",\"schedule\":\"...\"}}\n\n\
+         ── SCHEDULE: HISTORY (agent-driven inspection) ──\n\
+         Schedule run records persist as JSONL on disk at:\n\
+         {history_dir}/<SCHEDULE_ID>.log\n\
+         Each line is one execution record with fields:\n\
+         {{ts, schedule_id, chat_id, bot_key, prompt, status (ok|cancelled|error), response (capped at 4KB), workspace_path, duration_ms, error?}}\n\n\
+         WHEN TO INSPECT: whenever the user refers to a recent scheduled task, \
+         including cases where the schedule id is not stated. The folder outlives \
+         one-time schedules whose entry has been auto-deleted, so records remain \
+         readable even when --cron-list no longer shows the schedule.\n\n\
+         HOW: use your normal file/search/listing tools to locate the relevant \
+         record(s) inside {history_dir}, then parse the matching JSONL line(s) to \
+         answer the user's question. No extra CLI command is required for this path.\n\n\
+         ⚠ ISOLATION: this folder is shared across every chat this bot serves. Every \
+         record you cite to the user MUST have chat_id == {chat_id}. Records with a \
+         different chat_id belong to a different conversation — silently skip them and \
+         NEVER quote them back to this user.\n\n\
+         CLI ALTERNATIVE — for a sanitized, ownership-checked JSON dump of one schedule's \
+         full run history (preferred when you already know the id):\n\
+         \"{bin}\" --cron-history <SCHEDULE_ID> --chat {chat_id} --key {bot_key}\n\
+         • Output: {{\"status\":\"ok\",\"id\":\"...\",\"count\":N,\"history\":[{{...}}, ...]}}\n\n\
          ═══════════════════════════════════════{group_chat_cowork_section}{group_chat_log_section}{bot_messaging_section}{disabled_notice}",
         role = role,
         bot_username_line = bot_username_line,
@@ -1482,12 +1604,24 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
         chat_id = chat_id,
         bot_key = bot_key,
         bin = shell_bin_path(),
+        history_dir = schedule_history_dir_for_prompt(),
         disabled_notice = disabled_notice,
         session_notice = session_notice,
         group_chat_cowork_section = group_chat_cowork_section,
         group_chat_log_section = group_chat_log_section,
         bot_messaging_section = bot_messaging_section,
     )
+}
+
+/// Resolve the schedule_history directory to a shell-friendly absolute path for
+/// embedding in the system prompt. Falls back to the literal `~/.cokacdir/...`
+/// form only when the home directory cannot be determined — the AI's file tools
+/// still resolve `~` correctly via shell expansion in that fallback case.
+fn schedule_history_dir_for_prompt() -> String {
+    match schedule_history_dir() {
+        Some(p) => crate::utils::format::to_shell_path(&p.display().to_string()),
+        None => "~/.cokacdir/schedule_history".to_string(),
+    }
 }
 
 /// Detect the full path of powershell.exe on Windows (cached).
@@ -9722,6 +9856,12 @@ async fn execute_schedule(
     let entry_clone = entry.clone();
     let workspace_path_owned = workspace_path.clone();
     let provider_str: &'static str = detect_provider(model.as_deref());
+    // Captured for schedule_history append at the end of this run.
+    // Wall-clock duration is measured from this point (just after placeholder send +
+    // pre-execution setup) to the polling loop's completion — close to the user-visible
+    // "task is running" window.
+    let history_start = std::time::Instant::now();
+    let history_bot_key = bot_key.clone();
     tokio::spawn(async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
@@ -10197,6 +10337,31 @@ async fn execute_schedule(
                 sched_debug(&format!("[sched] JSONL: user entry written, assistant SKIPPED (raw_entries is empty)"));
             }
         }
+
+        // Append a JSONL run record to ~/.cokacdir/schedule_history/<id>.log.
+        // Best-effort: any I/O failure is swallowed inside append_schedule_history so
+        // it cannot affect the user-facing completion path. Both `cancelled` and
+        // `had_error` paths fall through to here, which is why the call lives outside
+        // those branches.
+        let history_status = if cancelled {
+            "cancelled"
+        } else if had_error {
+            "error"
+        } else {
+            "ok"
+        };
+        let history_duration_ms = history_start.elapsed().as_millis() as u64;
+        append_schedule_history(
+            &schedule_id,
+            chat_id.0,
+            &history_bot_key,
+            &entry_clone.prompt,
+            history_status,
+            &full_response,
+            None,
+            &workspace_path_owned,
+            history_duration_ms,
+        );
 
         // Update schedule file (last_run / delete if once)
         sched_debug(&format!("[execute_schedule] id={}, calling update_schedule_after_run", schedule_id));
