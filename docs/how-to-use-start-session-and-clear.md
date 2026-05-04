@@ -10,7 +10,7 @@ Creates a new workspace directory at `~/.cokacdir/workspace/<random_id>` (8 rand
 
 ### /start \<path\>
 
-Starts a session at the specified filesystem path. If the directory does not exist, it will be created. Paths starting with `/`, `~`, `.`, or a Windows drive letter (e.g., `C:\`) are recognized as filesystem paths.
+Starts a session at the specified filesystem path. If the directory does not exist, it will be created. Paths are recognized when they start with any of: `/`, `~`, `~/`, `~\`, `./`, `.\`, `.`, `..`, `../`, `..\`, or a Windows drive letter followed by `:\` or `:/` (e.g., `C:\projects`, `D:/work`).
 
 ### /start \<session_id or name\>
 
@@ -99,16 +99,18 @@ Discards the current session and prepares for a fresh start. The working directo
 
 ### What Happens
 
-1. The session ID is set to `None`.
-2. All conversation history is cleared.
-3. Any pending file uploads are cleared.
-4. The session file on disk is overwritten with minimal data (path and provider only).
-5. The current working directory is **not** changed — you stay in the same path.
+1. Any in-flight AI request for this chat is cancelled.
+2. All queued messages for this chat are dropped.
+3. Active loop / verification state is cleared.
+4. The session ID is set to `None`.
+5. All conversation history is cleared.
+6. Any pending file uploads are cleared.
+7. The session file on disk is overwritten with minimal data (path and provider only).
+8. The current working directory is **not** changed — you stay in the same path.
 
 ### What Does NOT Happen
 
 - The workspace directory and its files are not deleted.
-- Any running AI request is not stopped (use `/stop` first if needed).
 - The previous session is not fully deleted from disk — it is overwritten so that `/start` in the same directory will begin a fresh session rather than restoring the old one.
 
 ### After /clear

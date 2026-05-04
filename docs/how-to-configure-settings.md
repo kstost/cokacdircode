@@ -15,7 +15,18 @@ Silent mode reduces message noise, especially in group chats.
 
 Toggles debug logging. Default: **OFF**.
 
-When enabled, detailed logs are printed for Telegram API operations, AI service calls, and the cron scheduler. This is a **global** toggle — it affects all chats.
+When enabled, detailed logs are printed for Telegram API operations, AI service calls, and the cron scheduler. The flag is per-bot (stored once for the running bot token), so it affects every chat served by that bot — but it does not cross to other bots running on the same machine.
+
+---
+
+## /usechrome
+
+Toggles the `--chrome` flag for the Claude CLI for the current chat. Default: **OFF** per chat.
+
+- **ON** (`🌐 Chrome mode: ON (--chrome)`): Claude is invoked with `--chrome`, allowing it to drive a real Chrome browser session for tasks that require web interaction.
+- **OFF** (`🌐 Chrome mode: OFF`): Claude runs without the flag.
+
+The setting only takes effect when the active model is Claude. Other providers ignore this toggle.
 
 ---
 

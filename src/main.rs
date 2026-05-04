@@ -1355,6 +1355,13 @@ fn deploy_docs() {
         ("how-to-simulate-multiple-chats-with-one-bot.md", include_str!("../docs/how-to-simulate-multiple-chats-with-one-bot.md")),
         ("how-to-install-claude-code-on-windows.md", include_str!("../docs/how-to-install-claude-code-on-windows.md")),
         ("how-to-install-codex-on-windows.md", include_str!("../docs/how-to-install-codex-on-windows.md")),
+        ("how-to-configure-environment-variables.md", include_str!("../docs/how-to-configure-environment-variables.md")),
+        ("how-to-configure-settings.md", include_str!("../docs/how-to-configure-settings.md")),
+        ("how-to-manage-tools.md", include_str!("../docs/how-to-manage-tools.md")),
+        ("how-to-setup-slack-bot.md", include_str!("../docs/how-to-setup-slack-bot.md")),
+        ("how-to-use-file-transfer.md", include_str!("../docs/how-to-use-file-transfer.md")),
+        ("how-to-use-shell-commands.md", include_str!("../docs/how-to-use-shell-commands.md")),
+        ("how-to-share-bot-with-others.md", include_str!("../docs/how-to-share-bot-with-others.md")),
     ];
     if let Some(home) = dirs::home_dir() {
         let docs_dir = home.join(".cokacdir").join("docs");

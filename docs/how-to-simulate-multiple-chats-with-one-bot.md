@@ -8,9 +8,9 @@ With a single bot token, you can create multiple independent sessions by using g
 
 2. Create a new group chat and invite the bot.
 
-3. Send `/direct` in the group chat. This enables direct mode — the bot responds to every message without requiring the `;` prefix or `@mention`.
+3. Send `/direct` in the group chat to toggle direct mode ON — the bot then responds to every message without requiring the `;` prefix or `@mention`. `/direct` is owner-only and only works inside a group chat (it errors out in DMs). Sending it again toggles direct mode back OFF.
 
-4. Send `/contextlevel 0` to disable shared context. This prevents the AI from seeing other bots' messages in its prompt, so it behaves as if it is the only bot in the conversation.
+4. Send `/contextlevel 0` to disable shared context. The default value is **12** entries; setting it to `0` prevents the AI from seeing other bots' messages in its prompt, so it behaves as if it is the only bot in the conversation. `/contextlevel` is also group-chat-only.
 
 5. Send `/start <project_path>` to begin working on your project.
 

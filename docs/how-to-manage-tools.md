@@ -39,3 +39,7 @@ Add or remove tools from the allowed list.
 ### Default Allowed Tools
 
 Bash, Read, Edit, Write, Glob, Grep, Task, TaskOutput, TaskStop, WebFetch, WebSearch, NotebookEdit, Skill, TaskCreate, TaskGet, TaskUpdate, TaskList
+
+### Provider Restriction
+
+Tool permissions only apply when the active model is **Claude**. With Codex, Gemini, or OpenCode selected, `/allowed` is rejected with `Tool permissions are not supported in this mode.` The other tool commands (`/availabletools`, `/allowedtools`) still work for inspection.

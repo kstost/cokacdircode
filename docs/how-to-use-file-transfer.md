@@ -42,6 +42,6 @@ Downloads a file from the server to your Telegram chat.
 /down ./output.csv
 ```
 
-- Accepts absolute paths or relative paths (resolved against the current working directory).
-- Only single files can be downloaded — directories are not supported.
-- If no session is active and a relative path is used, returns an error.
+- Accepts absolute paths anytime, or relative paths when a session is active (resolved against the current working directory).
+- Only single files can be downloaded. If the target path exists but is not a regular file (e.g., a directory or symlink target), the bot replies with `Not a file: <path>`. If the path does not exist, the bot replies with `File not found: <path>`.
+- If a relative path is given but no session is active, the bot replies with `No active session. Use absolute path or /start <path> first.`

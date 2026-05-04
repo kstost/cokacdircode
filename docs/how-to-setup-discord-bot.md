@@ -22,9 +22,9 @@
 1. Select **Bot** from the left menu
 2. Click **Reset Token** to generate a token (copy and save this token)
 3. **Public Bot** — turn off
-4. **Presence Intent** — turn on
-5. **Server Members Intent** — turn on
-6. **Message Content Intent** — turn on
+4. **Message Content Intent** — turn on
+
+(The bot only requests `GUILD_MESSAGES`, `DIRECT_MESSAGES`, and `MESSAGE_CONTENT` gateway intents. Presence Intent and Server Members Intent are not required.)
 
 ## 5. Generate OAuth2 URL and Invite the Bot
 
@@ -32,9 +32,10 @@
 2. Check **bot** in **OAuth2 URL Generator**
 3. Check the following in **Bot Permissions**:
    - Send Messages
-   - Manage Messages
    - Attach Files
    - Read Message History
+
+   (The bot only deletes its own messages, which does not require the Manage Messages permission.)
 4. Copy the URL from **Generated URL** at the bottom
 5. Open the URL in your browser
 6. In **Add to server**, select the server created in step 1

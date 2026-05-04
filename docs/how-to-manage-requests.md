@@ -13,7 +13,7 @@ Cancels the currently in-progress AI request for the chat.
 - The running AI process is terminated immediately.
 - A "Stopping..." message is shown while cancellation completes.
 - The message queue is **not** affected — the next queued message will begin processing automatically after cancellation.
-- If no request is in progress, nothing happens.
+- If no request is in progress, the bot replies with `No active request to stop.`
 
 ## /stopall
 
@@ -37,6 +37,8 @@ When a message is queued, the bot assigns it a short hex ID (e.g., `A394FDA`) an
 ```
 
 The match is case-insensitive. `/stop_A394FDA` also works.
+
+On a successful removal the bot replies with `Removed queued message (A394FDA).` If the ID is not found in the queue, no message is sent.
 
 ---
 
@@ -65,22 +67,54 @@ If you send a file while the AI is busy, the file upload is captured at queue ti
 
 ### /queue
 
-Toggles queue mode on or off for the current chat.
+Toggles queue mode on or off for the current chat. Queue mode is **ON by default**.
 
-- **Queue ON** (default): Messages sent while AI is busy are queued and processed in order.
-- **Queue OFF**: Messages sent while AI is busy are rejected with "AI request in progress. Use /stop to cancel."
+- **Queue ON** (default): Messages sent while AI is busy are appended to the queue (FIFO, up to 20) and processed in order after the current request completes.
+- **Queue OFF**: Messages sent while AI is busy use **redirect (latest-wins)** semantics — the in-progress task is cancelled and replaced by the new message, which becomes the next thing the AI processes.
 
-When turning queue off, any existing queued messages are cleared.
+Toggling reports the new state:
+
+```
+📋 Queue mode: ON
+Messages sent while AI is busy will be queued and processed in order.
+
+📋 Queue mode: OFF
+3 queued message(s) cleared.
+```
+
+When turning queue OFF, any messages already in the queue are cleared.
+
+#### Redirect behavior (Queue OFF)
+
+When the AI is busy and you send a new prompt with queue OFF, the bot atomically:
+
+1. Cancels the in-progress AI request (same effect as `/stop`).
+2. Clears any active loop / verification state for the chat.
+3. Replaces any pending queued message with the new one. If a previous redirect is still pending (the cancelled task hasn't fully wound down yet), it is silently overwritten.
+4. Once cancellation completes, the new message is dispatched as the next request.
+
+Confirmation messages:
+
+```
+🔄 Cancelling current task, will process: "preview..."   ← first redirect while busy
+🔄 Redirect target updated: "preview..."                 ← overwrote a still-pending redirect
+```
+
+File uploads sent alongside the redirected message are captured and attached just like in queued mode, so file context is preserved across the cancel-and-replace.
 
 ---
 
 ## How /stop and Queue Interact
+
+Behavior with Queue **ON**:
 
 | Situation | /stop | /stopall |
 |-----------|-------|----------|
 | AI busy, queue has messages | Cancels current request; next queued message starts automatically | Cancels current request and clears all queued messages |
 | AI busy, queue empty | Cancels current request | Cancels current request |
 | AI idle, queue has messages | No effect | Clears all queued messages |
+
+With Queue **OFF**, the queue stays empty under normal use because new prompts redirect (cancel + replace) instead of stacking up. `/stop` and `/stopall` behave the same as ON-mode "queue empty" rows above.
 
 ---
 
