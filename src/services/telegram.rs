@@ -9740,11 +9740,15 @@ async fn send_long_message(
             break;
         }
 
-        // Find a safe UTF-8 char boundary, then find a newline before it
+        // Find a safe UTF-8 char boundary, then find a newline before it.
+        // Only split at a newline if it produces a non-empty chunk; otherwise
+        // use the full UTF-8-safe boundary (a leading '\n' would yield an
+        // empty raw_chunk, which Telegram rejects with "text must be non-empty").
         let safe_end = floor_char_boundary(remaining, effective_limit);
-        let split_at = remaining[..safe_end]
-            .rfind('\n')
-            .unwrap_or(safe_end);
+        let split_at = match remaining[..safe_end].rfind('\n') {
+            Some(pos) if pos > 0 => pos,
+            _ => safe_end,
+        };
 
         let (raw_chunk, rest) = remaining.split_at(split_at);
 
@@ -9848,11 +9852,14 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
     let safe_end = floor_char_boundary(s, max_len);
     let truncated = &s[..safe_end];
+    // Prefer cutting at a newline, but only if it leaves non-empty content.
+    // Otherwise fall back to the full UTF-8-safe truncation.
     if let Some(pos) = truncated.rfind('\n') {
-        truncated[..pos].to_string()
-    } else {
-        truncated.to_string()
+        if pos > 0 {
+            return truncated[..pos].to_string();
+        }
     }
+    truncated.to_string()
 }
 
 /// Convert standard markdown to Telegram-compatible HTML
