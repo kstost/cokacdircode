@@ -13,14 +13,17 @@ export default function MultipleChats() {
 
       <SubSection title={String(t('Setup Steps', '설정 단계'))}>
         <StepList>
-          <StepItem number={1} title={String(t('Disable privacy mode', '프라이버시 모드 비활성화'))}>
+          <StepItem number={1} title={String(t('Allow the bot to read group messages', '봇이 그룹 메시지를 읽도록 허용'))}>
             {t(
-              <>In BotFather, send <IC>/setprivacy</IC>, select your bot, and choose <strong>Disable</strong>. This allows the bot to receive all group messages.</>,
-              <>BotFather에서 <IC>/setprivacy</IC>를 전송하고, 봇을 선택한 후 <strong>Disable</strong>을 선택하세요. 그룹 메시지를 모두 수신할 수 있게 됩니다.</>
+              <>The exact step depends on the platform. <strong>Telegram:</strong> in BotFather, send <IC>/setprivacy</IC>, select your bot, and choose <strong>Disable</strong>. <strong>Discord:</strong> turn on the <IC>MESSAGE CONTENT</IC> intent on the Discord Developer Portal. <strong>Slack:</strong> subscribe to <IC>message.channels</IC> (and <IC>message.groups</IC> for private channels) in Event Subscriptions. Without this step the bot will not see regular group messages.</>,
+              <>정확한 단계는 플랫폼마다 다릅니다. <strong>Telegram:</strong> BotFather에서 <IC>/setprivacy</IC>를 전송하고, 봇을 선택한 뒤 <strong>Disable</strong>을 선택합니다. <strong>Discord:</strong> Discord Developer Portal에서 <IC>MESSAGE CONTENT</IC> intent를 켭니다. <strong>Slack:</strong> Event Subscriptions에서 <IC>message.channels</IC>(비공개 채널은 <IC>message.groups</IC>도 함께)를 구독합니다. 이 단계 없이는 봇이 일반 그룹 메시지를 받지 못합니다.</>
             )}
           </StepItem>
-          <StepItem number={2} title={String(t('Create a group chat', '그룹 채팅 생성'))}>
-            {t('Create a new group chat and invite your bot.', '새 그룹 채팅을 만들고 봇을 초대하세요.')}
+          <StepItem number={2} title={String(t('Create a group / channel and invite the bot', '그룹/채널 생성 후 봇 초대'))}>
+            {t(
+              'Create a new group chat (Telegram), server channel (Discord), or workspace channel (Slack) and invite/install your bot.',
+              '새 그룹 채팅(Telegram), 서버 채널(Discord), 또는 워크스페이스 채널(Slack)을 만들고 봇을 초대하거나 설치하세요.'
+            )}
           </StepItem>
           <StepItem number={3} title={String(t('Enable direct mode', '다이렉트 모드 활성화'))}>
             {t(

@@ -29,8 +29,8 @@ export default function FileTransfer() {
 
         <InfoBox type="info">
           {t(
-            <>Maximum file size: <strong>20MB</strong> (Telegram Bot API limit). Duplicate filenames get a counter appended: <IC>file(1).txt</IC>, <IC>file(2).txt</IC>, etc.</>,
-            <>최대 파일 크기: <strong>20MB</strong> (Telegram Bot API 제한). 파일명이 중복되면 카운터가 추가됩니다: <IC>file(1).txt</IC>, <IC>file(2).txt</IC> 등.</>
+            <>Maximum file size depends on the chat platform: <strong>Telegram 20MB</strong> (Bot API limit), <strong>Discord 8–100MB</strong> (depends on the server's boost level), <strong>Slack up to 1GB</strong>. Duplicate filenames get a counter appended: <IC>file(1).txt</IC>, <IC>file(2).txt</IC>, etc.</>,
+            <>최대 파일 크기는 채팅 플랫폼에 따라 다릅니다: <strong>Telegram 20MB</strong> (Bot API 제한), <strong>Discord 8–100MB</strong> (서버 부스트 레벨에 따라 다름), <strong>Slack 최대 1GB</strong>. 파일명이 중복되면 카운터가 추가됩니다: <IC>file(1).txt</IC>, <IC>file(2).txt</IC> 등.</>
           )}
         </InfoBox>
 
@@ -38,6 +38,19 @@ export default function FileTransfer() {
           'If you include a caption with the file, it will be sent to the AI as instructions.',
           '파일에 캡션을 포함하면 AI에게 지시사항으로 전달됩니다.'
         )}</P>
+      </SubSection>
+
+      <SubSection title={String(t('Multiple Attachments at Once', '여러 첨부를 한 번에 전송'))}>
+        <P>{t(
+          'You can send multiple files or photos in a single message — Telegram albums, Discord multi-attachment messages, and Slack multi-file uploads are all supported. The bot processes them atomically: every file in the group is saved to the workspace, and the message caption (typically attached to the first item) is used as the AI instruction for the whole batch.',
+          '한 메시지에 여러 파일이나 사진을 함께 전송할 수 있습니다 — Telegram 앨범, Discord 다중 첨부 메시지, Slack 다중 파일 업로드 모두 지원됩니다. 봇은 이들을 한꺼번에 처리합니다: 그룹의 모든 파일이 워크스페이스에 저장되고, 메시지 캡션(보통 첫 번째 항목에 달림)이 묶음 전체에 대한 AI 지시사항으로 사용됩니다.'
+        )}</P>
+        <InfoBox type="info">
+          {t(
+            <>In group chats with prefix mode, only the leading <IC>;</IC> or <IC>@bot</IC> on the album's caption admits the whole batch — the prefix does not need to be repeated on each file.</>,
+            <>프리픽스 모드 그룹 채팅에서는 앨범 캡션의 선두 <IC>;</IC> 또는 <IC>@bot</IC>이 묶음 전체를 받아들이게 합니다 — 파일마다 프리픽스를 반복할 필요는 없습니다.</>
+          )}
+        </InfoBox>
       </SubSection>
 
       <SubSection title={String(t('Upload While AI Is Busy', 'AI 처리 중 업로드'))}>

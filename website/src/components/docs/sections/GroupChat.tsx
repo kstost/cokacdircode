@@ -11,13 +11,21 @@ export default function GroupChat() {
         '그룹 채팅에서 여러 봇을 사용하여 협업하세요. 각 봇은 자신의 세션과 작업 디렉토리를 독립적으로 갖고, 공유 채팅 로그를 통해 다른 봇이 무엇을 하고 있는지 볼 수 있습니다.'
       )}</P>
 
-      <SubSection title={String(t('⚠ Required: Disable Privacy Mode in BotFather', '⚠ 필수: BotFather에서 프라이버시 모드 비활성화'))}>
+      <SubSection title={String(t('⚠ Required: Let the Bot Read Group Messages', '⚠ 필수: 봇이 그룹 메시지를 읽도록 설정'))}>
         <InfoBox type="warning">
           {t(
-            <><strong>Before using any bot in a group chat, you MUST disable its privacy mode in BotFather.</strong> This is a one-time setup per bot, but it is mandatory — group chat features will silently fail without it.</>,
-            <><strong>그룹 채팅에서 봇을 사용하기 전에, BotFather에서 반드시 해당 봇의 프라이버시 모드를 비활성화해야 합니다.</strong> 봇마다 한 번만 하면 되지만 필수입니다 — 이 설정 없이는 그룹 채팅 기능이 조용히 실패합니다.</>
+            <><strong>Before using any bot in a group chat (or channel), you MUST allow it to read group messages on the platform side.</strong> This is a one-time setup per bot, but it is mandatory — group chat features will silently fail without it. The exact step depends on the platform.</>,
+            <><strong>그룹 채팅(또는 채널)에서 봇을 사용하기 전에, 플랫폼 측에서 봇이 그룹 메시지를 읽을 수 있도록 반드시 허용해야 합니다.</strong> 봇마다 한 번만 하면 되지만 필수입니다 — 이 설정 없이는 그룹 채팅 기능이 조용히 실패합니다. 정확한 단계는 플랫폼마다 다릅니다.</>
           )}
         </InfoBox>
+        <ul className="list-disc list-inside space-y-1.5 text-zinc-400 my-4 ml-2">
+          <li>{t(<><strong className="text-zinc-300">Telegram:</strong> disable privacy mode in BotFather (steps below).</>, <><strong className="text-zinc-300">Telegram:</strong> BotFather에서 프라이버시 모드 비활성화 (아래 단계 참고).</>)}</li>
+          <li>{t(<><strong className="text-zinc-300">Discord:</strong> turn on the <IC>MESSAGE CONTENT</IC> intent on the Discord Developer Portal — see the Discord Bot Setup guide.</>, <><strong className="text-zinc-300">Discord:</strong> Discord Developer Portal에서 <IC>MESSAGE CONTENT</IC> intent를 켭니다 — Discord Bot Setup 가이드 참고.</>)}</li>
+          <li>{t(<><strong className="text-zinc-300">Slack:</strong> subscribe to <IC>message.channels</IC> (and <IC>message.groups</IC> for private channels) in Event Subscriptions, and invite the bot to the channel — see the Slack Bot Setup guide.</>, <><strong className="text-zinc-300">Slack:</strong> Event Subscriptions에서 <IC>message.channels</IC>(비공개 채널은 <IC>message.groups</IC>도 함께)를 구독하고, 채널에 봇을 초대합니다 — Slack Bot Setup 가이드 참고.</>)}</li>
+        </ul>
+        <h3 className="text-lg font-semibold text-white mt-6 mb-3">
+          {t('Telegram: Disable Privacy Mode in BotFather', 'Telegram: BotFather에서 프라이버시 모드 비활성화')}
+        </h3>
         <P>{t(
           'By default, Telegram bots run in "privacy mode," which means the bot only receives:',
           '기본적으로 Telegram 봇은 "프라이버시 모드"로 동작하며, 이 경우 봇은 다음 메시지만 수신합니다:'
@@ -48,8 +56,8 @@ export default function GroupChat() {
 
       <SubSection title={String(t('Message Delivery', '메시지 전달'))}>
         <P>{t(
-          'In group chats, bots don\'t listen to every message by default. Use these methods to address them:',
-          '그룹 채팅에서 봇은 기본적으로 모든 메시지를 수신하지 않습니다. 다음 방법으로 봇에게 메시지를 전달하세요:'
+          'In group chats, bots don\'t listen to every message by default. Use these methods to address them — they work the same way on Telegram, Discord, and Slack:',
+          '그룹 채팅에서 봇은 기본적으로 모든 메시지를 수신하지 않습니다. 다음 방법으로 봇에게 메시지를 전달하세요 — Telegram, Discord, Slack에서 동일하게 동작합니다:'
         )}</P>
         <CommandTable
           headers={[String(t('Method', '방법')), String(t('Example', '예시')), String(t('Who Receives', '수신 대상'))]}

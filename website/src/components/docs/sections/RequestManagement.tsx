@@ -1,4 +1,4 @@
-import { SectionTitle, SubSection, P, IC, CommandTable } from '../DocComponents'
+import { SectionTitle, SubSection, P, IC, CommandTable, InfoBox } from '../DocComponents'
 import { useLanguage } from '../../LanguageContext'
 
 export default function RequestManagement() {
@@ -132,8 +132,8 @@ export default function RequestManagement() {
 
       <SubSection title={String(t('End Hook — Notification When Processing Completes', '엔드 훅 — 처리 완료 알림'))}>
         <P>{t(
-          <>The end hook is a custom message the bot sends as a separate Telegram message every time an AI request finishes. Useful as a ping when you walk away from a long-running task.</>,
-          <>엔드 훅은 AI 요청이 끝날 때마다 봇이 별도의 Telegram 메시지로 보내는 사용자 정의 알림입니다. 오래 걸리는 작업을 띄워두고 자리를 비울 때 완료 시점을 알려주는 용도로 유용합니다.</>
+          <>The end hook is a custom message the bot sends as a separate chat message every time an AI request finishes. Works on Telegram, Discord, and Slack — useful as a ping when you walk away from a long-running task.</>,
+          <>엔드 훅은 AI 요청이 끝날 때마다 봇이 별도의 채팅 메시지로 보내는 사용자 정의 알림입니다. Telegram, Discord, Slack 모두에서 동작하며, 오래 걸리는 작업을 띄워두고 자리를 비울 때 완료 시점을 알려주는 용도로 유용합니다.</>
         )}</P>
         <CommandTable
           headers={[String(t('Command', '명령어')), String(t('Description', '설명'))]}
@@ -167,6 +167,24 @@ export default function RequestManagement() {
           <>The end hook is stored <strong>per chat</strong>, so different chats can use different markers. Combine with mobile push notifications and the bot becomes a long-task pager.</>,
           <>엔드 훅은 <strong>채팅별</strong>로 저장되므로 채팅마다 다른 표식을 쓸 수 있습니다. 모바일 푸시 알림과 결합하면 봇이 장시간 작업의 호출기 역할을 해냅니다.</>
         )}</P>
+      </SubSection>
+
+      <SubSection title={String(t('Codex image_gen — Auto-Delivered Images', 'Codex image_gen — 이미지 자동 전달'))}>
+        <P>{t(
+          <>When you use <strong>Codex CLI</strong> as the AI provider and the model invokes its built-in <IC>image_gen</IC> tool, the generated images are written to <IC>~/.codex/generated_images/&lt;session_id&gt;/</IC> without surfacing any tool event. cokacdir scans that directory at the end of each turn and automatically delivers any new images the model produced — you do not need to ask the model to call <IC>--sendfile</IC> for them.</>,
+          <>AI 제공자로 <strong>Codex CLI</strong>를 사용하고 모델이 내장 <IC>image_gen</IC> 도구를 호출하면, 생성된 이미지는 도구 이벤트 없이 <IC>~/.codex/generated_images/&lt;session_id&gt;/</IC>에 저장됩니다. cokacdir은 매 턴 종료 시 이 디렉터리를 스캔하여 모델이 생성한 새 이미지를 자동으로 전달합니다 — 모델이 <IC>--sendfile</IC>을 호출하도록 요청할 필요가 없습니다.</>
+        )}</P>
+        <ul className="list-disc list-inside space-y-1.5 text-zinc-400 my-4 ml-2">
+          <li>{t('Only files created during the current turn are sent; pre-existing files in the session directory are ignored.', '현재 턴에 생성된 파일만 전송됩니다. 세션 디렉터리에 미리 존재하던 파일은 무시됩니다.')}</li>
+          <li>{t(<>Files the model already delivered via <IC>--sendfile</IC> in the same turn are skipped to avoid duplicates.</>, <>같은 턴에 모델이 이미 <IC>--sendfile</IC>로 전달한 파일은 중복 방지를 위해 건너뜁니다.</>)}</li>
+          <li>{t('Supported extensions: png, jpg, jpeg, webp, gif, bmp.', '지원 확장자: png, jpg, jpeg, webp, gif, bmp.')}</li>
+        </ul>
+        <InfoBox type="info">
+          {t(
+            'This auto-delivery is Codex-specific — Claude Code, Gemini, and OpenCode do not write to that directory and are unaffected.',
+            '이 자동 전달은 Codex 전용입니다 — Claude Code, Gemini, OpenCode는 해당 디렉터리에 쓰지 않으며 영향을 받지 않습니다.'
+          )}
+        </InfoBox>
       </SubSection>
     </div>
   )

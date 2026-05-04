@@ -35,7 +35,7 @@ export default function Settings() {
         <P>{t(<>Enables or disables debug logging. Default: <strong className="text-zinc-300">OFF</strong>.</>, <>디버그 로깅을 활성화/비활성화합니다. 기본값: <strong className="text-zinc-300">OFF</strong>.</>)}</P>
         <P>{t('When enabled, logs details for:', '활성화 시 다음 항목의 세부 로그를 기록합니다:')}</P>
         <ul className="list-disc list-inside space-y-1.5 text-zinc-400 my-4 ml-2">
-          <li>{t('Telegram API operations', '텔레그램 API 작업')}</li>
+          <li>{t('Messenger API operations (Telegram, Discord, Slack)', '메신저 API 작업 (Telegram, Discord, Slack)')}</li>
           <li>{t('AI service calls', 'AI 서비스 호출')}</li>
           <li>{t('Cron scheduler', '크론 스케줄러')}</li>
         </ul>
@@ -73,8 +73,8 @@ export default function Settings() {
         )}</P>
         <InfoBox type="warning">
           {t(
-            <><strong>⚠ Security warning:</strong> <IC>/envvars</IC> exposes <strong>all</strong> environment variables with no redaction — including API keys, tokens, and credentials. Telegram stores message history on its servers, so anything printed by this command is persisted until you delete the messages. Use it only for diagnostics, clear the response afterward, and <strong>always use it in a 1:1 chat</strong> — never in a group chat. When the owner runs <IC>/envvars</IC> in a group, the response is a normal group message that every member sees, regardless of the <IC>/public</IC> setting.</>,
-            <><strong>⚠ 보안 경고:</strong> <IC>/envvars</IC>는 API 키, 토큰, 자격 증명을 포함한 <strong>모든</strong> 환경변수를 마스킹 없이 노출합니다. Telegram은 메시지 기록을 서버에 저장하므로, 이 명령으로 출력된 내용은 메시지를 삭제할 때까지 남아 있습니다. 진단 용도로만 사용하고, 사용 후에는 응답을 삭제하며, <strong>항상 1:1 채팅에서만 사용하세요</strong> — 절대 그룹 채팅에서는 사용하지 마세요. 소유자가 그룹에서 <IC>/envvars</IC>를 실행하면, 응답은 <IC>/public</IC> 설정과 무관하게 그룹의 모든 멤버가 보는 일반 그룹 메시지가 됩니다.</>
+            <><strong>⚠ Security warning:</strong> <IC>/envvars</IC> exposes <strong>all</strong> environment variables with no redaction — including API keys, tokens, and credentials. Chat platforms (Telegram, Discord, Slack) store message history on their servers, so anything printed by this command is persisted until you delete the messages. Use it only for diagnostics, clear the response afterward, and <strong>always use it in a 1:1 chat (DM)</strong> — never in a group chat or channel. When the owner runs <IC>/envvars</IC> in a group, the response is a normal group message that every member sees, regardless of the <IC>/public</IC> setting.</>,
+            <><strong>⚠ 보안 경고:</strong> <IC>/envvars</IC>는 API 키, 토큰, 자격 증명을 포함한 <strong>모든</strong> 환경변수를 마스킹 없이 노출합니다. 채팅 플랫폼(Telegram, Discord, Slack)은 메시지 기록을 서버에 저장하므로, 이 명령으로 출력된 내용은 메시지를 삭제할 때까지 남아 있습니다. 진단 용도로만 사용하고, 사용 후에는 응답을 삭제하며, <strong>항상 1:1 채팅(DM)에서만 사용하세요</strong> — 절대 그룹 채팅이나 채널에서는 사용하지 마세요. 소유자가 그룹에서 <IC>/envvars</IC>를 실행하면, 응답은 <IC>/public</IC> 설정과 무관하게 그룹의 모든 멤버가 보는 일반 그룹 메시지가 됩니다.</>
           )}
         </InfoBox>
         <P>{t(

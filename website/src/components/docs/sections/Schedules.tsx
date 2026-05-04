@@ -6,7 +6,7 @@ export default function Schedules() {
   return (
     <div>
       <SectionTitle>{t('Schedules', '예약 작업')}</SectionTitle>
-      <P>{t('Schedule tasks for the bot to execute at specific times or on recurring intervals.', '특정 시간 또는 반복 간격으로 봇이 실행할 작업을 예약하세요.')}</P>
+      <P>{t('Schedule tasks for the bot to execute at specific times or on recurring intervals. Results are delivered back through whichever chat platform the bot is running on (Telegram, Discord, or Slack), to the same chat that created the schedule.', '특정 시간 또는 반복 간격으로 봇이 실행할 작업을 예약하세요. 결과는 봇이 동작 중인 채팅 플랫폼(Telegram, Discord, Slack)을 통해, 예약을 만든 동일한 채팅으로 전달됩니다.')}</P>
 
       <SubSection title={String(t('How to Schedule', '예약 방법'))}>
         <P>{t('Simply use natural language to describe when you want a task to run:', '자연어로 작업 실행 시점을 설명하기만 하면 됩니다:')}</P>

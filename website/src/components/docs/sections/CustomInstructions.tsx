@@ -43,8 +43,8 @@ export default function CustomInstructions() {
             <><strong className="text-zinc-300">여러 줄</strong> 텍스트를 지원합니다</>
           )}</li>
           <li>{t(
-            'Practical limit: ~4096 characters (Telegram message size)',
-            '실용적 제한: ~4096자 (텔레그램 메시지 크기)'
+            'Practical limit depends on the chat platform: Telegram ~4096, Discord ~2000, Slack ~12000 characters per message',
+            '실용적 제한은 채팅 플랫폼에 따라 다릅니다: 메시지당 Telegram ~4096자, Discord ~2000자, Slack ~12000자'
           )}</li>
         </ul>
       </SubSection>

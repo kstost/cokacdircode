@@ -144,14 +144,14 @@ cokacctl`} />
 
         <h3 className="text-lg font-semibold text-white mt-6 mb-3"><IC>COKAC_FILE_ATTACH_THRESHOLD</IC></h3>
         <P>{t(
-          <>Controls the size threshold (in bytes) at which the bot switches from sending a response as multiple Telegram messages to sending it as a single <IC>.txt</IC> file attachment.</>,
-          <>봇이 응답을 여러 Telegram 메시지로 나눠 보내는 대신 하나의 <IC>.txt</IC> 파일 첨부로 보내도록 전환하는 크기 임계값(바이트)을 제어합니다.</>
+          <>Controls the size threshold (in bytes) at which the bot switches from sending a response as multiple chat messages to sending it as a single <IC>.txt</IC> file attachment. Applies to all chat platforms (Telegram, Discord, Slack).</>,
+          <>봇이 응답을 여러 채팅 메시지로 나눠 보내는 대신 하나의 <IC>.txt</IC> 파일 첨부로 보내도록 전환하는 크기 임계값(바이트)을 제어합니다. 모든 채팅 플랫폼(Telegram, Discord, Slack)에 적용됩니다.</>
         )}</P>
         <UL>
           <li>{t(<><strong>Type:</strong> positive integer (bytes)</>, <><strong>타입:</strong> 양의 정수 (바이트)</>)}</li>
           <li>{t(
-            <><strong>Default:</strong> <IC>8192</IC> (twice Telegram's 4096-byte per-message limit)</>,
-            <><strong>기본값:</strong> <IC>8192</IC> (Telegram 메시지당 4096바이트 한계의 2배)</>
+            <><strong>Default:</strong> <IC>8192</IC> (twice Telegram's 4096-byte per-message limit; the same default is used for Discord and Slack)</>,
+            <><strong>기본값:</strong> <IC>8192</IC> (Telegram 메시지당 4096바이트 한계의 2배. Discord와 Slack에서도 동일한 기본값을 사용합니다)</>
           )}</li>
           <li>{t(
             <><strong>Behavior:</strong> Responses whose length exceeds this threshold are uploaded as a text file instead of being split into multiple chat messages. Lower the value if you prefer files sooner; raise it to keep more content inline.</>,
@@ -180,8 +180,8 @@ cokacctl`} />
             <><strong>범위:</strong> 전역 — 같은 프로세스의 모든 채팅과 모든 봇에 영향을 미칩니다.</>
           )}</li>
           <li>{t(
-            <><strong>Behavior:</strong> When debug is ON, detailed logs for Telegram API operations, AI service calls, and the cron scheduler are printed to stdout. Once enabled at startup, you can still toggle it at runtime with <IC>/debug</IC>.</>,
-            <><strong>동작:</strong> 디버그가 ON일 때, Telegram API 작업, AI 서비스 호출, 크론 스케줄러의 세부 로그가 stdout에 출력됩니다. 시작 시 활성화된 후에도 런타임에 <IC>/debug</IC>로 전환할 수 있습니다.</>
+            <><strong>Behavior:</strong> When debug is ON, detailed logs for messenger API operations (Telegram, Discord, Slack), AI service calls, and the cron scheduler are printed to stdout. Once enabled at startup, you can still toggle it at runtime with <IC>/debug</IC>.</>,
+            <><strong>동작:</strong> 디버그가 ON일 때, 메신저 API 작업(Telegram, Discord, Slack), AI 서비스 호출, 크론 스케줄러의 세부 로그가 stdout에 출력됩니다. 시작 시 활성화된 후에도 런타임에 <IC>/debug</IC>로 전환할 수 있습니다.</>
           )}</li>
         </UL>
         <CodeBlock code="COKACDIR_DEBUG=1" />
@@ -234,8 +234,8 @@ cokacctl`} />
         )}</P>
         <UL>
           <li>{t(
-            'Telegram message history is stored on Telegram\'s servers. Anything you send via /envvars is persisted there until you delete the messages.',
-            'Telegram 메시지 기록은 Telegram 서버에 저장됩니다. /envvars로 전송된 내용은 메시지를 삭제할 때까지 Telegram 서버에 남아 있습니다.'
+            'Chat platforms (Telegram, Discord, Slack) all store message history on their servers. Anything you send via /envvars is persisted there until you delete the messages.',
+            '채팅 플랫폼(Telegram, Discord, Slack)은 모두 메시지 기록을 자체 서버에 저장합니다. /envvars로 전송된 내용은 메시지를 삭제할 때까지 해당 서버에 남아 있습니다.'
           )}</li>
           <li>{t(
             'If you forward the response, screenshot it, or share your chat with anyone, the secrets are exposed.',
@@ -246,8 +246,8 @@ cokacctl`} />
             <>봇 소유자 계정이 탈취되면, 공격자는 <IC>/envvars</IC>를 실행하여 환경의 모든 비밀을 한 번의 명령으로 수집할 수 있습니다.</>
           )}</li>
           <li>{t(
-            <>Do <strong>not</strong> use <IC>/envvars</IC> in a shared group chat. The owner-only check prevents non-owners from <em>invoking</em> the command, but when you — the owner — run it, the bot's response is a normal Telegram message sent into the group, and <strong>every group member will see it</strong> regardless of your <IC>/public</IC> setting. The <IC>/public</IC> toggle controls who can issue commands to the bot, not who can read the bot's output. Always use <IC>/envvars</IC> in a 1:1 chat with the bot.</>,
-            <>공유된 그룹 채팅에서는 <IC>/envvars</IC>를 <strong>사용하지 마세요</strong>. 소유자 전용 검사는 소유자가 아닌 사람이 명령을 <em>호출</em>하는 것을 막지만, 당신(소유자)이 명령을 실행하면 봇의 응답은 그룹에 전송되는 일반 Telegram 메시지이고, <IC>/public</IC> 설정과 무관하게 <strong>그룹의 모든 멤버가 그 응답을 봅니다</strong>. <IC>/public</IC> 토글은 누가 봇에게 명령을 보낼 수 있는지를 제어할 뿐, 누가 봇의 출력을 읽을 수 있는지는 제어하지 않습니다. <IC>/envvars</IC>는 항상 봇과의 1:1 채팅에서만 사용하세요.</>
+            <>Do <strong>not</strong> use <IC>/envvars</IC> in a shared group chat or channel. The owner-only check prevents non-owners from <em>invoking</em> the command, but when you — the owner — run it, the bot's response is a normal chat message sent into the group/channel, and <strong>every member will see it</strong> regardless of your <IC>/public</IC> setting. The <IC>/public</IC> toggle controls who can issue commands to the bot, not who can read the bot's output. Always use <IC>/envvars</IC> in a 1:1 chat (DM) with the bot.</>,
+            <>공유된 그룹 채팅이나 채널에서는 <IC>/envvars</IC>를 <strong>사용하지 마세요</strong>. 소유자 전용 검사는 소유자가 아닌 사람이 명령을 <em>호출</em>하는 것을 막지만, 당신(소유자)이 명령을 실행하면 봇의 응답은 그룹/채널에 전송되는 일반 채팅 메시지이고, <IC>/public</IC> 설정과 무관하게 <strong>모든 멤버가 그 응답을 봅니다</strong>. <IC>/public</IC> 토글은 누가 봇에게 명령을 보낼 수 있는지를 제어할 뿐, 누가 봇의 출력을 읽을 수 있는지는 제어하지 않습니다. <IC>/envvars</IC>는 항상 봇과의 1:1 채팅(DM)에서만 사용하세요.</>
           )}</li>
         </UL>
         <P>{t(

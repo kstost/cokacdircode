@@ -175,6 +175,45 @@ export default function SlackBotSetup() {
           )}
         </InfoBox>
       </SubSection>
+
+      <SubSection title={String(t('9. Talking to the Bot in a Channel', '9. 채널에서 봇과 대화하기'))}>
+        <P>
+          {t(
+            <>In a Slack channel, address the bot with <IC>@your-bot</IC> followed by the request, just like other Slack apps. cokacdir normalizes the leading mention so command-style prefixes work cleanly:</>,
+            <>Slack 채널에서는 다른 Slack 앱과 마찬가지로 <IC>@your-bot</IC>으로 봇을 부르고 이어서 요청을 적습니다. cokacdir은 선두 멘션을 정규화하므로 명령형 프리픽스도 깔끔하게 동작합니다:</>
+          )}
+        </P>
+        <ul className="list-disc list-inside mt-1 space-y-1">
+          <li>{t(<><IC>@your-bot ;refactor the parser</IC> — semicolon-style request</>, <><IC>@your-bot ;refactor the parser</IC> — 세미콜론 형식 요청</>)}</li>
+          <li>{t(<><IC>@your-bot /status</IC> — slash command</>, <><IC>@your-bot /status</IC> — 슬래시 명령</>)}</li>
+          <li>{t(<><IC>@your-bot run the tests</IC> — plain natural-language request</>, <><IC>@your-bot run the tests</IC> — 일반 자연어 요청</>)}</li>
+        </ul>
+        <P>{t(
+          'In a DM (Slack 1:1 chat) you do not need to mention the bot — every message is treated as a request.',
+          'DM(Slack 1:1 채팅)에서는 봇을 멘션할 필요 없이 모든 메시지가 요청으로 처리됩니다.'
+        )}</P>
+      </SubSection>
+
+      <SubSection title={String(t('Operational Notes', '운영 노트'))}>
+        <InfoBox type="info">
+          {t(
+            <><strong>Per-channel rate limit:</strong> Slack recommends roughly one posted message per channel per second. cokacdir spaces outgoing messages to about <strong>1.1s per channel</strong> automatically — long streaming responses may therefore appear slightly more chunked on Slack than on Telegram.</>,
+            <><strong>채널별 rate limit:</strong> Slack은 채널당 초당 약 1개의 메시지 게시를 권장합니다. cokacdir은 송신을 채널당 약 <strong>1.1초</strong> 간격으로 자동 조절합니다 — 따라서 긴 스트리밍 응답이 Telegram보다 약간 더 잘게 끊겨 보일 수 있습니다.</>
+          )}
+        </InfoBox>
+        <InfoBox type="info">
+          {t(
+            <><strong>Persistent channel map:</strong> the bot remembers which Slack channels it has talked in by writing them to <IC>~/.cokacdir/bridge_maps/slack_&lt;hash&gt;.json</IC>. This lets scheduled tasks and reply hooks reach the right channel even after the bot restarts. Delete the file to forget the mapping.</>,
+            <><strong>채널 매핑 영속화:</strong> 봇은 자신이 대화했던 Slack 채널을 <IC>~/.cokacdir/bridge_maps/slack_&lt;hash&gt;.json</IC>에 기록합니다. 봇 재시작 후에도 예약 작업과 응답 훅이 올바른 채널로 도달하게 해줍니다. 매핑을 잊게 하려면 파일을 삭제하세요.</>
+          )}
+        </InfoBox>
+        <InfoBox type="info">
+          {t(
+            <><strong>Multi-file uploads:</strong> when you drop several files into one Slack message, the bot processes them atomically — every file is saved to the workspace and the message text rides on the first file as the AI instruction.</>,
+            <><strong>다중 파일 업로드:</strong> 한 Slack 메시지에 여러 파일을 함께 올리면 봇이 묶음을 한꺼번에 처리합니다 — 모든 파일이 워크스페이스에 저장되고, 메시지 본문은 첫 번째 파일에 캡션으로 실려 AI 지시사항이 됩니다.</>
+          )}
+        </InfoBox>
+      </SubSection>
     </div>
   )
 }
