@@ -7,7 +7,7 @@ use std::fs;
 
 use tokio::sync::Mutex;
 use teloxide::prelude::*;
-use teloxide::types::ParseMode;
+use teloxide::types::{ParseMode, UpdateKind};
 use sha2::{Sha256, Digest};
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
@@ -521,7 +521,13 @@ fn is_silent(settings: &BotSettings, chat_id: ChatId) -> bool {
 struct ScheduleEntry {
     id: String,
     chat_id: i64,
-    bot_key: String,
+    /// SHA-256 verifier of the owning bot_key, bound to (id, chat_id). The raw
+    /// `bot_key` is never stored on disk in the modern format — see
+    /// `live_schedule_key_verifier`. Legacy entries written before this change
+    /// still carry a plaintext `bot_key` field on disk; `read_schedule_entry`
+    /// transparently computes the verifier from those at load time, and the
+    /// next `write_schedule_entry` rewrites the file in the new format.
+    bot_key_verifier: String,
     current_path: String,
     prompt: String,
     schedule: String,         // original --at value (cron expression or absolute time)
@@ -530,6 +536,22 @@ struct ScheduleEntry {
     last_run: Option<String>, // "2026-02-23 14:00:00"
     created_at: String,
     context_summary: Option<String>, // context summary text for session-isolated schedule
+}
+
+/// Verifier hash for a live schedule entry's owning bot_key. Binding to
+/// `(schedule_id, chat_id)` ensures a verifier from one schedule cannot be
+/// reused to authenticate another. The domain separator distinguishes this
+/// from `schedule_history_key_verifier`, so verifiers from the two systems
+/// are not interchangeable even if their input keys collide.
+fn live_schedule_key_verifier(schedule_id: &str, chat_id: i64, bot_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cokacdir:live_schedule:v1\0");
+    hasher.update(schedule_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(chat_id.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bot_key.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 /// Directory for schedule files: ~/.cokacdir/schedule/
@@ -807,10 +829,28 @@ fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
             return None;
         }
     };
+    let id = v.get("id")?.as_str()?.to_string();
+    let chat_id = v.get("chat_id")?.as_i64()?;
+    // Modern files carry `bot_key_verifier`; pre-migration files still carry a
+    // plaintext `bot_key`. Compute the verifier in-memory for legacy entries so
+    // the rest of the read path is uniform; the next `write_schedule_entry`
+    // (e.g. context update or last_run after a cron fire) will rewrite the
+    // file without the plaintext field. We deliberately do NOT rewrite the
+    // file from the read path: a concurrent `delete_schedule_entry` could let
+    // such a rewrite resurrect an already-removed schedule.
+    let bot_key_verifier = if let Some(verifier) = v.get("bot_key_verifier").and_then(|x| x.as_str())
+    {
+        verifier.to_string()
+    } else if let Some(legacy_key) = v.get("bot_key").and_then(|x| x.as_str()) {
+        live_schedule_key_verifier(&id, chat_id, legacy_key)
+    } else {
+        sched_debug("[read_schedule_entry] missing both bot_key_verifier and bot_key");
+        return None;
+    };
     let entry = Some(ScheduleEntry {
-        id: v.get("id")?.as_str()?.to_string(),
-        chat_id: v.get("chat_id")?.as_i64()?,
-        bot_key: v.get("bot_key")?.as_str()?.to_string(),
+        id,
+        chat_id,
+        bot_key_verifier,
         current_path: v.get("current_path")?.as_str()?.to_string(),
         prompt: v.get("prompt")?.as_str()?.to_string(),
         schedule: v.get("schedule")?.as_str()?.to_string(),
@@ -835,10 +875,13 @@ fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
         entry.id, entry.schedule_type, entry.schedule, entry.once, entry.last_run));
     let dir = schedule_dir().ok_or("Cannot determine home directory")?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create schedule dir: {e}"))?;
+    // `bot_key_verifier` replaces the legacy plaintext `bot_key` field.
+    // Re-writing a legacy file through this path naturally drops the old
+    // plaintext field on the next atomic rename.
     let mut json = serde_json::json!({
         "id": entry.id,
         "chat_id": entry.chat_id,
-        "bot_key": entry.bot_key,
+        "bot_key_verifier": entry.bot_key_verifier,
         "current_path": entry.current_path,
         "prompt": entry.prompt,
         "schedule": entry.schedule,
@@ -864,7 +907,7 @@ fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
 
 /// List all schedule entries matching the given bot_key and optionally chat_id
 fn list_schedule_entries(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEntry> {
-    sched_debug(&format!("[list_schedule_entries] bot_key={}, chat_id={:?}", bot_key, chat_id));
+    sched_debug(&format!("[list_schedule_entries] bot_key=<redacted>, chat_id={:?}", chat_id));
     let Some(dir) = schedule_dir() else {
         sched_debug("[list_schedule_entries] no schedule dir");
         return Vec::new();
@@ -880,7 +923,12 @@ fn list_schedule_entries(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEnt
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().map(|ext| ext == "json").unwrap_or(false))
         .filter_map(|e| read_schedule_entry(&e.path()))
-        .filter(|e| e.bot_key == bot_key)
+        .filter(|e| {
+            // Recompute the expected verifier per entry — chat_id and id are
+            // baked into the verifier, so two schedules sharing a bot_key but
+            // different ids produce different verifiers.
+            e.bot_key_verifier == live_schedule_key_verifier(&e.id, e.chat_id, bot_key)
+        })
         .filter(|e| chat_id.map_or(true, |cid| e.chat_id == cid))
         .collect();
     result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
@@ -927,9 +975,9 @@ pub fn schedule_history_path_pub(id: &str) -> Option<std::path::PathBuf> {
 ///
 /// Best-effort logging: any filesystem error is swallowed (with a sched_debug entry)
 /// so a failure here never affects the schedule's own user-facing completion path.
-/// Each record carries `chat_id` and `bot_key` so the `--cron-history` command can
+/// Each record carries `chat_id` and a non-secret verifier so `--cron-history` can
 /// authorize the caller even after the underlying schedule entry has been deleted
-/// (one-time / `--once` schedules).
+/// (one-time / `--once` schedules) without exposing the bot key capability.
 fn append_schedule_history(
     schedule_id: &str,
     chat_id: i64,
@@ -969,7 +1017,7 @@ fn append_schedule_history(
         "ts": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string(),
         "schedule_id": schedule_id,
         "chat_id": chat_id,
-        "bot_key": bot_key,
+        "bot_key_verifier": schedule_history_key_verifier(schedule_id, chat_id, bot_key),
         "prompt": prompt,
         "status": status,
         "response": response_capped,
@@ -981,6 +1029,11 @@ fn append_schedule_history(
     }
 
     let path = dir.join(format!("{}.log", schedule_id));
+    let Some(_history_lock) = lock_schedule_history_file(&path) else {
+        sched_debug(&format!("[append_schedule_history] id={}, lock failed: {}", schedule_id, path.display()));
+        return;
+    };
+    redact_schedule_history_file_once_unlocked(&path);
     let line = format!("{}\n", record);
     let result = std::fs::OpenOptions::new()
         .create(true)
@@ -995,6 +1048,378 @@ fn append_schedule_history(
     }
 }
 
+fn schedule_history_key_verifier(schedule_id: &str, chat_id: i64, bot_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cokacdir:schedule_history:v1\0");
+    hasher.update(schedule_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(chat_id.to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(bot_key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn lock_schedule_history_file(path: &std::path::Path) -> Option<std::fs::File> {
+    use fs2::FileExt;
+
+    let lock_path = path.with_extension("log.lock");
+    if let Some(parent) = lock_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    if file.lock_exclusive().is_err() {
+        return None;
+    }
+    Some(file)
+}
+
+fn redact_schedule_history_file(path: &std::path::Path) {
+    let Some(_history_lock) = lock_schedule_history_file(path) else {
+        sched_debug(&format!("[redact_schedule_history_file] lock failed: {}", path.display()));
+        return;
+    };
+    redact_schedule_history_file_once_unlocked(path);
+}
+
+fn schedule_history_redaction_marker_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("log.redacted")
+}
+
+fn mark_schedule_history_redacted(path: &std::path::Path) {
+    let marker = schedule_history_redaction_marker_path(path);
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(marker, b"v1\n");
+}
+
+fn redact_schedule_history_file_once_unlocked(path: &std::path::Path) {
+    let marker = schedule_history_redaction_marker_path(path);
+    if marker.exists() {
+        return;
+    }
+
+    let ok = if path.exists() {
+        redact_schedule_history_file_unlocked(path)
+    } else {
+        true
+    };
+    if ok {
+        mark_schedule_history_redacted(path);
+    }
+}
+
+fn redact_schedule_history_file_unlocked(path: &std::path::Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+
+    let mut changed = false;
+    let mut rewritten = String::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            rewritten.push_str(line);
+            rewritten.push('\n');
+            continue;
+        }
+
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(mut record) => {
+                let legacy_key = record.get("bot_key").and_then(|v| v.as_str()).map(str::to_string);
+                let schedule_id = record.get("schedule_id").and_then(|v| v.as_str()).map(str::to_string);
+                let chat_id = record.get("chat_id").and_then(|v| v.as_i64());
+
+                if let (Some(legacy_key), Some(schedule_id), Some(chat_id)) =
+                    (legacy_key, schedule_id, chat_id)
+                {
+                    if let Some(obj) = record.as_object_mut() {
+                        obj.insert(
+                            "bot_key_verifier".to_string(),
+                            serde_json::json!(schedule_history_key_verifier(
+                                &schedule_id,
+                                chat_id,
+                                &legacy_key,
+                            )),
+                        );
+                        obj.remove("bot_key");
+                        changed = true;
+                    }
+                }
+
+                rewritten.push_str(&record.to_string());
+            }
+            Err(_) => rewritten.push_str(line),
+        }
+        rewritten.push('\n');
+    }
+
+    if changed {
+        // Atomic rewrite: write to a sibling tmp file then rename over the target,
+        // matching the Slack channel-map persist pattern. This keeps the file in
+        // either its old or new state under power-loss / partial-write conditions.
+        let tmp_path = path.with_extension("log.redact.tmp");
+        let result = fs::write(&tmp_path, rewritten).and_then(|_| fs::rename(&tmp_path, path));
+        match result {
+            Ok(_) => {
+                sched_debug(&format!(
+                    "[redact_schedule_history_file] redacted legacy bot_key fields: {}",
+                    path.display()
+                ));
+                true
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_path);
+                sched_debug(&format!(
+                    "[redact_schedule_history_file] rewrite failed: {}, path={}",
+                    e,
+                    path.display()
+                ));
+                false
+            }
+        }
+    } else {
+        true
+    }
+}
+
+pub fn redact_schedule_history_file_pub(path: &std::path::Path) {
+    redact_schedule_history_file(path);
+}
+
+pub fn schedule_history_record_authorized_pub(
+    record: &serde_json::Value,
+    schedule_id: &str,
+    chat_id: i64,
+    bot_key: &str,
+) -> bool {
+    let schedule_match = record.get("schedule_id").and_then(|v| v.as_str()) == Some(schedule_id);
+    let chat_match = record.get("chat_id").and_then(|v| v.as_i64()) == Some(chat_id);
+    if !schedule_match || !chat_match {
+        return false;
+    }
+
+    let expected = schedule_history_key_verifier(schedule_id, chat_id, bot_key);
+    if record.get("bot_key_verifier").and_then(|v| v.as_str()) == Some(expected.as_str()) {
+        return true;
+    }
+
+    // Backward compatibility for history records written before the verifier field
+    // existed. These legacy records are sanitized before being returned to callers.
+    record.get("bot_key").and_then(|v| v.as_str()) == Some(bot_key)
+}
+
+pub fn sanitize_schedule_history_record_pub(record: &mut serde_json::Value) {
+    if let Some(obj) = record.as_object_mut() {
+        obj.remove("bot_key");
+        obj.remove("bot_key_verifier");
+    }
+}
+
+#[cfg(test)]
+mod schedule_history_tests {
+    use super::{
+        redact_schedule_history_file_pub, sanitize_schedule_history_record_pub,
+        schedule_history_key_verifier, schedule_history_record_authorized_pub,
+        schedule_history_redaction_marker_path,
+    };
+
+    #[test]
+    fn authorizes_history_with_verifier_or_legacy_key() {
+        let verifier = schedule_history_key_verifier("sched-1", -42, "secret-key");
+        let modern = serde_json::json!({
+            "schedule_id": "sched-1",
+            "chat_id": -42,
+            "bot_key_verifier": verifier,
+        });
+        assert!(schedule_history_record_authorized_pub(
+            &modern,
+            "sched-1",
+            -42,
+            "secret-key"
+        ));
+        assert!(!schedule_history_record_authorized_pub(
+            &modern,
+            "sched-1",
+            -42,
+            "wrong-key"
+        ));
+
+        let legacy = serde_json::json!({
+            "schedule_id": "sched-1",
+            "chat_id": -42,
+            "bot_key": "secret-key",
+        });
+        assert!(schedule_history_record_authorized_pub(
+            &legacy,
+            "sched-1",
+            -42,
+            "secret-key"
+        ));
+    }
+
+    #[test]
+    fn sanitizes_history_records_before_output() {
+        let mut record = serde_json::json!({
+            "schedule_id": "sched-1",
+            "chat_id": -42,
+            "bot_key": "secret-key",
+            "bot_key_verifier": "verifier",
+            "status": "ok",
+        });
+
+        sanitize_schedule_history_record_pub(&mut record);
+
+        assert!(record.get("bot_key").is_none());
+        assert!(record.get("bot_key_verifier").is_none());
+        assert_eq!(record.get("status").and_then(|v| v.as_str()), Some("ok"));
+    }
+
+    #[test]
+    fn redacts_legacy_schedule_history_file_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sched-1.log");
+        std::fs::write(
+            &path,
+            r#"{"schedule_id":"sched-1","chat_id":-42,"bot_key":"secret-key","status":"ok"}"#,
+        )
+        .unwrap();
+
+        redact_schedule_history_file_pub(&path);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("bot_key\":\"secret-key"));
+        assert!(content.contains("bot_key_verifier"));
+        assert!(schedule_history_redaction_marker_path(&path).exists());
+    }
+}
+
+#[cfg(test)]
+mod live_schedule_tests {
+    use super::{
+        live_schedule_key_verifier, read_schedule_entry, schedule_history_key_verifier,
+        write_schedule_entry_pub, ScheduleEntryData,
+    };
+
+    fn data_with_bot_key(bot_key: &str) -> ScheduleEntryData {
+        ScheduleEntryData {
+            id: "sched-guard".to_string(),
+            chat_id: 1,
+            bot_key: bot_key.to_string(),
+            current_path: "/tmp".to_string(),
+            prompt: "p".to_string(),
+            schedule: "* * * * *".to_string(),
+            schedule_type: "cron".to_string(),
+            once: Some(false),
+            last_run: None,
+            created_at: "2026-01-01 00:00:00".to_string(),
+            context_summary: None,
+        }
+    }
+
+    #[test]
+    fn write_schedule_entry_pub_rejects_empty_bot_key() {
+        // Empty bot_key would compute a verifier the owning bot cannot match,
+        // silently orphaning the schedule. Guard catches the
+        // list-then-modify-then-write footgun before it touches disk.
+        let result = write_schedule_entry_pub(&data_with_bot_key(""));
+        assert!(result.is_err(), "empty bot_key must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("orphan"),
+            "error must explain why empty bot_key is rejected: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn live_verifier_distinct_from_history_verifier() {
+        // Domain separation guarantees a verifier minted for live ownership
+        // cannot be reused to authorize a history record (or vice versa) even
+        // when (id, chat_id, bot_key) collide.
+        let live = live_schedule_key_verifier("sched-1", -42, "secret");
+        let hist = schedule_history_key_verifier("sched-1", -42, "secret");
+        assert_ne!(live, hist);
+    }
+
+    #[test]
+    fn live_verifier_binds_to_id_and_chat_id() {
+        // Changing any input changes the verifier — this is what keeps the
+        // verifier from one schedule from authorizing access to another.
+        let base = live_schedule_key_verifier("a", 1, "k");
+        assert_ne!(base, live_schedule_key_verifier("b", 1, "k"));
+        assert_ne!(base, live_schedule_key_verifier("a", 2, "k"));
+        assert_ne!(base, live_schedule_key_verifier("a", 1, "k2"));
+        assert_eq!(base, live_schedule_key_verifier("a", 1, "k"));
+    }
+
+    #[test]
+    fn read_schedule_entry_migrates_legacy_bot_key_in_memory() {
+        // Pre-migration files store the raw bot_key. The reader must still
+        // surface a usable ScheduleEntry whose verifier matches what the
+        // current `live_schedule_key_verifier(id, chat_id, raw_key)` produces,
+        // so list filters keep working until the file is re-written.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sched-legacy.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "id": "sched-legacy",
+                "chat_id": 99,
+                "bot_key": "legacy-raw-key",
+                "current_path": "/tmp",
+                "prompt": "p",
+                "schedule": "* * * * *",
+                "schedule_type": "cron",
+                "created_at": "2026-01-01 00:00:00"
+            }"#,
+        )
+        .unwrap();
+
+        let entry = read_schedule_entry(&path).expect("legacy entry should parse");
+        assert_eq!(
+            entry.bot_key_verifier,
+            live_schedule_key_verifier("sched-legacy", 99, "legacy-raw-key")
+        );
+        // Read must NOT rewrite the file — that would race with concurrent
+        // delete and could resurrect a removed schedule. The plaintext stays
+        // on disk until the next legitimate write.
+        let content_after = std::fs::read_to_string(&path).unwrap();
+        assert!(content_after.contains("\"bot_key\""));
+    }
+
+    #[test]
+    fn read_schedule_entry_prefers_verifier_when_both_present() {
+        // Hybrid files (verifier added but legacy field not yet stripped) must
+        // trust the verifier — recomputing from the legacy key would silently
+        // mask a tampered/rotated verifier.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sched-hybrid.json");
+        let real_verifier = live_schedule_key_verifier("sched-hybrid", 1, "actual-key");
+        let body = format!(
+            r#"{{
+                "id": "sched-hybrid",
+                "chat_id": 1,
+                "bot_key": "stale-key",
+                "bot_key_verifier": "{}",
+                "current_path": "/tmp",
+                "prompt": "p",
+                "schedule": "* * * * *",
+                "schedule_type": "cron",
+                "created_at": "2026-01-01 00:00:00"
+            }}"#,
+            real_verifier
+        );
+        std::fs::write(&path, body).unwrap();
+        let entry = read_schedule_entry(&path).expect("hybrid entry should parse");
+        assert_eq!(entry.bot_key_verifier, real_verifier);
+    }
+}
+
 /// Delete a schedule's run-history file. Called from `--cron-remove` so that
 /// removing a schedule also clears its accumulated history (consistent with how
 /// `delete_schedule_entry` already removes the schedule's `.result` companion).
@@ -1006,6 +1431,16 @@ fn delete_schedule_history(id: &str) {
             Ok(_) => sched_debug(&format!("[delete_schedule_history] removed: {}", path.display())),
             Err(e) => sched_debug(&format!("[delete_schedule_history] remove failed: {}, path={}", e, path.display())),
         }
+    }
+    let marker = schedule_history_redaction_marker_path(&path);
+    if marker.exists() {
+        let _ = fs::remove_file(marker);
+    }
+    // Lock sentinel created by lock_schedule_history_file. Removing it keeps the
+    // schedule_history dir tidy when a schedule (and its history) goes away.
+    let lock_path = path.with_extension("log.lock");
+    if lock_path.exists() {
+        let _ = fs::remove_file(lock_path);
     }
 }
 
@@ -1133,7 +1568,19 @@ fn cron_field_matches(field: &str, val: u32, range_start: u32) -> bool {
 
 // === Public API for CLI commands (main.rs) ===
 
-/// Public data struct mirroring ScheduleEntry for cross-module use
+/// Public data struct mirroring ScheduleEntry for cross-module use.
+///
+/// `bot_key` is the **raw bot_key** supplied by the caller and is asymmetric
+/// across the conversion boundary: callers populate it with the raw key on
+/// the way in (`From<&ScheduleEntryData> for ScheduleEntry` derives the
+/// verifier from it), while on the way out (`From<&ScheduleEntry>`), no raw
+/// key is recoverable from disk and the field is left empty.
+///
+/// **Round-trip caveat**: a list-then-modify-then-write sequence will lose
+/// ownership unless the caller re-populates `bot_key` with the raw key
+/// before calling `write_schedule_entry_pub`. The latter rejects empty
+/// `bot_key` to make the failure explicit instead of silently orphaning
+/// the entry.
 #[derive(Clone)]
 pub struct ScheduleEntryData {
     pub id: String,
@@ -1154,7 +1601,11 @@ impl From<&ScheduleEntry> for ScheduleEntryData {
         Self {
             id: e.id.clone(),
             chat_id: e.chat_id,
-            bot_key: e.bot_key.clone(),
+            // The raw bot_key is not stored on disk; surfacing the verifier
+            // here would mislead callers that pass this back through
+            // `From<&ScheduleEntryData>` (they'd hash the verifier). Leaving
+            // it empty makes the asymmetry explicit.
+            bot_key: String::new(),
             current_path: e.current_path.clone(),
             prompt: e.prompt.clone(),
             schedule: e.schedule.clone(),
@@ -1172,7 +1623,7 @@ impl From<&ScheduleEntryData> for ScheduleEntry {
         Self {
             id: d.id.clone(),
             chat_id: d.chat_id,
-            bot_key: d.bot_key.clone(),
+            bot_key_verifier: live_schedule_key_verifier(&d.id, d.chat_id, &d.bot_key),
             current_path: d.current_path.clone(),
             prompt: d.prompt.clone(),
             schedule: d.schedule.clone(),
@@ -1190,6 +1641,20 @@ pub fn parse_relative_time_pub(s: &str) -> Option<chrono::DateTime<chrono::Local
 }
 
 pub fn write_schedule_entry_pub(data: &ScheduleEntryData) -> Result<(), String> {
+    // Refuse to persist an entry derived from an empty raw bot_key: the
+    // resulting `bot_key_verifier` would not match any real owner and the
+    // schedule would be silently orphaned (invisible to the bot that should
+    // own it). `list_schedule_entries_pub` returns ScheduleEntryData with an
+    // empty bot_key, so any list-then-modify-then-write code path must
+    // re-supply the raw key before calling this function.
+    if data.bot_key.is_empty() {
+        return Err(
+            "write_schedule_entry_pub: empty bot_key would orphan the entry; \
+             callers performing read-modify-write must reset bot_key from the \
+             owning bot's key before write"
+                .to_string(),
+        );
+    }
     let entry = ScheduleEntry::from(data);
     write_schedule_entry(&entry)
 }
@@ -1580,7 +2045,7 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
          Schedule run records persist as JSONL on disk at:\n\
          {history_dir}/<SCHEDULE_ID>.log\n\
          Each line is one execution record with fields:\n\
-         {{ts, schedule_id, chat_id, bot_key, prompt, status (ok|cancelled|error), response (capped at 4KB), workspace_path, duration_ms, error?}}\n\n\
+         {{ts, schedule_id, chat_id, prompt, status (ok|cancelled|error), response (capped at 4KB), workspace_path, duration_ms, error?}}\n\n\
          WHEN TO INSPECT: whenever the user refers to a recent scheduled task, \
          including cases where the schedule id is not stated. The folder outlives \
          one-time schedules whose entry has been auto-deleted, so records remain \
@@ -2582,43 +3047,47 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     }
 
     // Run polling loop with automatic reconnection on network failure.
-    // teloxide::repl may panic or exit silently when the network drops
-    // (especially on Windows). We wrap it in tokio::spawn to catch panics
-    // and retry with exponential backoff.
-    let token_for_repl = token.to_string();
-    let username_for_repl = bot_username;
+    // We process raw `getUpdates` batches so album members (same
+    // `media_group_id`) sharing one batch are grouped atomically — Telegram
+    // delivers an album as a contiguous run of Updates within one
+    // `getUpdates` response, so the batch boundary is a deterministic
+    // end-of-album signal. The `limit=100` request is far above Telegram's
+    // 10-photo album cap, so any album fits in a single response unless
+    // there's a backlog of >90 unrelated updates ahead of it (rare; on
+    // restart we already flush pending updates above). Albums split across
+    // two batches in such backlog conditions are processed as separate
+    // shorter dispatches — no timing heuristic involved.
+    //
+    // Outer reconnect loop: catches panics inside the polling task and
+    // retries with exponential backoff, mirroring the prior `repl` wrapper.
+    let token_for_loop = token.to_string();
+    let username_for_loop = bot_username;
     let mut reconnect_backoff_secs = 5u64;
 
     loop {
-        let repl_start = std::time::Instant::now();
+        let loop_start = std::time::Instant::now();
         let bot_clone = bot.clone();
         let state_clone = state.clone();
-        let token_clone = token_for_repl.clone();
-        let username_clone = username_for_repl.clone();
+        let token_clone = token_for_loop.clone();
+        let username_clone = username_for_loop.clone();
 
-        let repl_result = tokio::spawn(async move {
-            teloxide::repl(bot_clone, move |bot: Bot, msg: Message| {
-                let state = state_clone.clone();
-                let token = token_clone.clone();
-                let bot_username = username_clone.clone();
-                async move {
-                    handle_message(bot, msg, state, &token, &bot_username).await
-                }
-            })
-            .await;
+        let task_result = tokio::spawn(async move {
+            polling_loop(bot_clone, state_clone, token_clone, username_clone).await;
         })
         .await;
 
-        match repl_result {
+        match task_result {
             Ok(()) => {
-                // Normal exit — Ctrl+C or graceful shutdown
-                msg_debug("[run_bot] repl exited normally (shutdown)");
+                // polling_loop only returns on irrecoverable shutdown (it
+                // currently has no such path; loops forever). If we ever
+                // arrive here, treat as graceful shutdown.
+                msg_debug("[run_bot] polling task exited normally (shutdown)");
                 break;
             }
             Err(e) => {
-                // Task panicked — likely network disconnection
-                let ran_for = repl_start.elapsed();
-                msg_debug(&format!("[run_bot] repl crashed after {:.1?}: {}", ran_for, e));
+                // Task panicked — likely network disconnection or runtime issue
+                let ran_for = loop_start.elapsed();
+                msg_debug(&format!("[run_bot] polling task crashed after {:.1?}: {}", ran_for, e));
                 println!("  ⚠ Bot disconnected — reconnecting in {}s...", reconnect_backoff_secs);
                 tokio::time::sleep(tokio::time::Duration::from_secs(reconnect_backoff_secs)).await;
 
@@ -2635,6 +3104,444 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     }
 
     scheduler_handle.abort();
+}
+
+/// Long-poll `getUpdates` and dispatch each batch via `process_batch`. Runs
+/// forever; transient errors (network blips) sleep + retry inline so the
+/// outer panic-recovery wrapper only fires for truly fatal conditions.
+async fn polling_loop(bot: Bot, state: SharedState, token: String, bot_username: String) {
+    let mut offset: i32 = 0;
+    let mut transient_backoff_ms: u64 = 500;
+    loop {
+        let result = bot.get_updates()
+            .offset(offset)
+            .timeout(30)
+            .limit(100)
+            .await;
+        match result {
+            Ok(updates) => {
+                transient_backoff_ms = 500;
+                if let Some(last) = updates.last() {
+                    // Match the conversion in the flush logic above so we
+                    // stay compatible with teloxide's UpdateId type.
+                    offset = last.id.0.saturating_add(1).min(i32::MAX as u32) as i32;
+                }
+                if updates.is_empty() {
+                    continue;
+                }
+                msg_debug(&format!("[polling_loop] batch: {} update(s)", updates.len()));
+                process_batch(&bot, updates, &state, &token, &bot_username).await;
+            }
+            Err(e) => {
+                msg_debug(&format!("[polling_loop] getUpdates error (sleeping {}ms): {}", transient_backoff_ms, e));
+                tokio::time::sleep(tokio::time::Duration::from_millis(transient_backoff_ms)).await;
+                // Cap at 10s; outer reconnect handles longer outages via panic path.
+                transient_backoff_ms = (transient_backoff_ms * 2).min(10_000);
+            }
+        }
+    }
+}
+
+/// Group album members by `(chat_id, media_group_id)` within this batch and
+/// dispatch each unit while preserving overall arrival order. Albums of size
+/// ≥2 go to `handle_album_batch` for atomic processing; singletons (no
+/// media_group_id, or 1-photo album fragments from a split batch) fall
+/// through to the existing `handle_message` path.
+async fn process_batch(
+    bot: &Bot,
+    updates: Vec<Update>,
+    state: &SharedState,
+    token: &str,
+    bot_username: &str,
+) {
+    // Insertion-ordered list of dispatch units. We resolve each unit only
+    // after grouping, so an album that spans interleaved updates still
+    // appears at the position of its first photo.
+    enum Unit {
+        Single(Message),
+        Album(usize), // index into `albums`
+    }
+    let mut units: Vec<Unit> = Vec::new();
+    let mut albums: Vec<Vec<Message>> = Vec::new();
+    let mut album_index: HashMap<(ChatId, String), usize> = HashMap::new();
+
+    for upd in updates {
+        let UpdateKind::Message(msg) = upd.kind else {
+            // Bot only handles fresh messages today; ignore edited messages,
+            // callback queries, channel posts, etc. (matches prior `repl`
+            // behaviour, which used `Update::filter_message`.)
+            continue;
+        };
+        let chat_id = msg.chat.id;
+        if let Some(gid) = msg.media_group_id() {
+            let key = (chat_id, gid.to_string());
+            match album_index.get(&key) {
+                Some(&idx) => albums[idx].push(msg),
+                None => {
+                    let idx = albums.len();
+                    albums.push(vec![msg]);
+                    album_index.insert(key, idx);
+                    units.push(Unit::Album(idx));
+                }
+            }
+        } else {
+            units.push(Unit::Single(msg));
+        }
+    }
+
+    for unit in units {
+        match unit {
+            Unit::Single(msg) => {
+                let bot_c = bot.clone();
+                let state_c = state.clone();
+                let token_c = token.to_string();
+                let username_c = bot_username.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_message(bot_c, msg, state_c, &token_c, &username_c).await {
+                        msg_debug(&format!("[process_batch] handle_message error: {}", e));
+                    }
+                });
+            }
+            Unit::Album(idx) => {
+                let msgs = std::mem::take(&mut albums[idx]);
+                if msgs.len() < 2 {
+                    // 1-photo "album" — the message has a `media_group_id`
+                    // but no sibling within this batch. Process it through
+                    // the regular single-message path; if it's a fragment
+                    // of a larger album that got split across batches it
+                    // will be saved as an orphan upload and picked up by
+                    // the next text message.
+                    if let Some(msg) = msgs.into_iter().next() {
+                        let bot_c = bot.clone();
+                        let state_c = state.clone();
+                        let token_c = token.to_string();
+                        let username_c = bot_username.to_string();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_message(bot_c, msg, state_c, &token_c, &username_c).await {
+                                msg_debug(&format!("[process_batch] handle_message(album-fragment) error: {}", e));
+                            }
+                        });
+                    }
+                } else {
+                    msg_debug(&format!("[process_batch] atomic album: {} photo(s) in one batch", msgs.len()));
+                    let bot_c = bot.clone();
+                    let state_c = state.clone();
+                    let token_c = token.to_string();
+                    let username_c = bot_username.to_string();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_album_batch(bot_c, msgs, state_c, &token_c, &username_c).await {
+                            msg_debug(&format!("[process_batch] handle_album_batch error: {}", e));
+                        }
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Extract the AI-bound text from a media caption, applying the same prefix
+/// rules used by `handle_message` for direct text messages. Returns `None`
+/// when the caption is empty or, in prefix-required group chats, doesn't
+/// address this bot.
+fn extract_caption_text(
+    caption: &str,
+    require_prefix: bool,
+    bot_username: &str,
+) -> Option<String> {
+    if require_prefix {
+        let extracted = if !bot_username.is_empty() && caption.starts_with('@') {
+            let prefix = format!("@{} ", bot_username);
+            if caption.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                let body = caption[prefix.len()..].trim_start();
+                body.strip_prefix(';').map(|s| s.trim_start()).unwrap_or(body)
+            } else {
+                ""
+            }
+        } else if caption.starts_with(';') {
+            caption[1..].trim_start()
+        } else {
+            ""
+        };
+        if extracted.is_empty() { None } else { Some(extracted.to_string()) }
+    } else {
+        let trimmed = caption.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    }
+}
+
+/// Dispatch the album's caption text via the same busy/queue/redirect logic
+/// that `handle_message` uses for caption-bearing single-photo uploads.
+async fn dispatch_album_caption(
+    bot: Bot,
+    chat_id: ChatId,
+    state: SharedState,
+    user_name: String,
+    text: String,
+) {
+    let (ai_busy, queue_enabled, queue_result, redirect_result):
+        (bool, bool, Option<(String, String)>, Option<(String, String, bool)>) = {
+        let mut data = state.lock().await;
+        let busy = data.cancel_tokens.contains_key(&chat_id);
+        let qkey = chat_id.0.to_string();
+        let qmode = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
+        msg_debug(&format!("[album:dispatch] chat_id={}, busy={}, queue_mode={}", chat_id.0, busy, qmode));
+        let (qr, rr) = if busy && qmode {
+            let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
+            let queue_full = cur_len >= MAX_QUEUE_SIZE;
+            let qr = if queue_full {
+                msg_debug(&format!("[album:dispatch] chat_id={}, queue FULL ({}/{})", chat_id.0, cur_len, MAX_QUEUE_SIZE));
+                None
+            } else {
+                let uploads = data.sessions.get_mut(&chat_id)
+                    .map(|s| std::mem::take(&mut s.pending_uploads))
+                    .unwrap_or_default();
+                let qid = generate_queue_id();
+                let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
+                q.push_back(QueuedMessage {
+                    id: qid.clone(),
+                    text: text.clone(),
+                    user_display_name: user_name.clone(),
+                    pending_uploads: uploads.clone(),
+                });
+                msg_debug(&format!("[album:dispatch] chat_id={}, QUEUED id={}, pos={}, uploads={}", chat_id.0, qid, q.len(), uploads.len()));
+                Some((qid, text.clone()))
+            };
+            (qr, None)
+        } else if busy && !qmode {
+            let uploads = data.sessions.get_mut(&chat_id)
+                .map(|s| std::mem::take(&mut s.pending_uploads))
+                .unwrap_or_default();
+            let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, text.clone(), user_name.clone(), uploads);
+            msg_debug(&format!("[album:dispatch] chat_id={}, REDIRECT id={}, replaced={}", chat_id.0, qid, replaced));
+            (None, Some((qid, text.clone(), replaced)))
+        } else {
+            (None, None)
+        };
+        (busy, qmode, qr, rr)
+    };
+    if ai_busy {
+        if let Some((_qid, qtxt, replaced)) = redirect_result {
+            shared_rate_limit_wait(&state, chat_id).await;
+            let preview = truncate_str(&qtxt, 30);
+            let m = if replaced {
+                format!("🔄 Redirect target updated: \"{preview}\"")
+            } else {
+                format!("🔄 Cancelling current task, will process: \"{preview}\"")
+            };
+            let _ = tg!("send_message", bot.send_message(chat_id, &m).await);
+        } else if queue_enabled {
+            shared_rate_limit_wait(&state, chat_id).await;
+            if let Some((qid, qtxt)) = queue_result {
+                let preview = truncate_str(&qtxt, 30);
+                let _ = tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this")).await);
+            } else {
+                let _ = tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE)).await);
+            }
+        } else {
+            shared_rate_limit_wait(&state, chat_id).await;
+            let _ = tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.").await);
+        }
+    } else {
+        let _ = handle_text_message(&bot, chat_id, &text, &state, &user_name, false).await;
+    }
+}
+
+/// Atomically handle an album that arrived as a contiguous run of photos
+/// inside a single `getUpdates` batch (size ≥2, all same `media_group_id`).
+///
+/// Differs from the per-photo path in `handle_message`: we know the exact
+/// album size up-front (it's `msgs.len()`) so no debounce/timeout buffering
+/// is needed. Each photo's `handle_file_upload` runs in order, pushing to
+/// `session.pending_uploads`. When all are saved, the caption (typically on
+/// the first photo) is dispatched once via `dispatch_album_caption`, the
+/// same helper used by the buffered fallback path.
+///
+/// Auth replicates the relevant parts of `handle_message`: imprinting,
+/// owner/public check, `require_prefix` calculation, and the `;`/`@bot`
+/// caption admission rule for prefix-mode group chats.
+async fn handle_album_batch(
+    bot: Bot,
+    msgs: Vec<Message>,
+    state: SharedState,
+    token: &str,
+    bot_username: &str,
+) -> ResponseResult<()> {
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    let primary = &msgs[0];
+    let chat_id = primary.chat.id;
+    let raw_user_name = primary.from.as_ref()
+        .map(|u| u.first_name.as_str())
+        .unwrap_or("unknown");
+    let timestamp = chrono::Local::now().format("%H:%M:%S");
+    let user_id = primary.from.as_ref().map(|u| u.id.0);
+
+    let Some(uid) = user_id else {
+        for m in &msgs { log_incoming_message(m, false, "no_user_id"); }
+        return Ok(());
+    };
+
+    let is_group_chat = matches!(primary.chat.kind, teloxide::types::ChatKind::Public(_));
+    let require_prefix = {
+        let mut data = state.lock().await;
+        let chat_key = chat_id.0.to_string();
+        let direct_setting = data.settings.direct.get(&chat_key).copied().unwrap_or(DIRECT_MODE_DEFAULT);
+        let is_direct = is_group_chat && direct_setting;
+        let require_prefix = is_group_chat && !is_direct;
+        match data.settings.owner_user_id {
+            None => {
+                data.settings.owner_user_id = Some(uid);
+                save_bot_settings(token, &data.settings);
+                println!("  [{timestamp}] ★ Owner registered: {raw_user_name} (id:{uid})");
+            }
+            Some(owner_id) => {
+                if uid != owner_id {
+                    let is_public = is_group_chat
+                        && data.settings.as_public_for_group_chat.get(&chat_key).copied().unwrap_or(PUBLIC_MODE_DEFAULT);
+                    if !is_public {
+                        println!("  [{timestamp}] ✗ Rejected: {raw_user_name} (id:{uid})");
+                        for m in &msgs { log_incoming_message(m, false, "unauthorized"); }
+                        return Ok(());
+                    }
+                    println!("  [{timestamp}] ○ [{raw_user_name}(id:{uid})] Public group access");
+                }
+            }
+        }
+        require_prefix
+    };
+
+    for m in &msgs { log_incoming_message(m, true, ""); }
+
+    let user_name = format!("{}({uid})", raw_user_name);
+
+    // First non-empty caption — Telegram clients put it on the first photo,
+    // but be defensive and scan the album in arrival order.
+    let caption_str: Option<String> = msgs.iter()
+        .find_map(|m| m.caption().filter(|c| !c.is_empty()).map(|c| c.to_string()));
+
+    // Prefix-mode admission: in group chats with prefix required, the album
+    // is admitted only if its caption (typically on the first photo) starts
+    // with `;` or `@bot`. Within a single getUpdates batch we always have
+    // the caption-bearing photo, so caption-only admission is sufficient
+    // and fully deterministic.
+    if require_prefix {
+        let admitted = match caption_str.as_deref() {
+            None => false,
+            Some(c) => {
+                if !bot_username.is_empty() && c.starts_with('@') {
+                    let prefix = format!("@{}", bot_username.to_lowercase());
+                    let lower = c.to_lowercase();
+                    lower.starts_with(&prefix)
+                        && (lower.len() == prefix.len()
+                            || lower[prefix.len()..].starts_with(|ch: char| ch.is_whitespace()))
+                } else {
+                    c.starts_with(';')
+                }
+            }
+        };
+        if !admitted {
+            msg_debug(&format!("[album_batch] chat_id={}, rejected: caption lacks ;/@", chat_id.0));
+            return Ok(());
+        }
+        msg_debug(&format!("[album_batch] chat_id={}, admitted via caption prefix", chat_id.0));
+    }
+
+    auto_restore_session(&state, chat_id, &user_name).await;
+
+    // Reserve the per-chat AI slot with a placeholder cancel token *before*
+    // starting downloads. Any text message that arrives during downloads
+    // will then see `cancel_tokens.contains_key` = true and naturally
+    // queue/redirect via the existing handle_message busy-check path,
+    // preserving the user's intended order: album dispatches first with all
+    // its photos, the follow-up text waits in the queue. If the slot is
+    // already held by another in-flight AI request, we don't reserve and
+    // fall through to `dispatch_album_caption`, which queues/redirects
+    // this album normally.
+    let placeholder_token = Arc::new(CancelToken::new());
+    let reserved_slot = {
+        let mut data = state.lock().await;
+        if data.cancel_tokens.contains_key(&chat_id) {
+            msg_debug(&format!("[album_batch] chat_id={}, slot busy at admission → will queue/redirect at dispatch", chat_id.0));
+            false
+        } else {
+            data.cancel_tokens.insert(chat_id, placeholder_token.clone());
+            msg_debug(&format!("[album_batch] chat_id={}, reserved AI slot (placeholder)", chat_id.0));
+            true
+        }
+    };
+
+    println!("  [{timestamp}] ◀ [{user_name}] Album: {} photo(s)", msgs.len());
+
+    // Sequential downloads: handle_file_upload's own `shared_rate_limit_wait`
+    // calls would serialize them anyway, and sequential keeps state writeback
+    // (history append, pending_uploads push) deterministic in album order.
+    let mut ok_count = 0usize;
+    for m in &msgs {
+        match handle_file_upload(&bot, chat_id, m, &state, &user_name).await {
+            Ok(()) => ok_count += 1,
+            Err(e) => msg_debug(&format!("[album_batch] chat_id={}, upload failed: {}", chat_id.0, e)),
+        }
+    }
+    println!("  [{timestamp}] ▶ [{user_name}] Album upload complete ({}/{})", ok_count, msgs.len());
+
+    // If the user issued /stop or /stopall during downloads, the placeholder
+    // token will have been marked cancelled. Release the slot and run any
+    // queued message instead of dispatching this album.
+    if reserved_slot && placeholder_token.cancelled.load(Ordering::Relaxed) {
+        msg_debug(&format!("[album_batch] chat_id={}, cancelled during downloads → aborting dispatch", chat_id.0));
+        {
+            let mut data = state.lock().await;
+            // Only remove if the slot still holds *our* placeholder; another
+            // handler may have legitimately taken it over (e.g. via a queue
+            // pop racing with us).
+            if let Some(t) = data.cancel_tokens.get(&chat_id) {
+                if Arc::ptr_eq(t, &placeholder_token) {
+                    data.cancel_tokens.remove(&chat_id);
+                }
+            }
+        }
+        process_next_queued_message(&bot, chat_id, &state).await;
+        return Ok(());
+    }
+
+    let caption_text = caption_str.as_deref()
+        .and_then(|c| extract_caption_text(c, require_prefix, bot_username));
+    match (caption_text, reserved_slot) {
+        (Some(text), true) => {
+            // Slot is ours. handle_text_message with from_queue=true bypasses
+            // its busy check and overwrites the placeholder with its own
+            // real cancel token, taking over the slot for the AI request.
+            msg_debug(&format!("[album_batch] chat_id={}, dispatching caption (len={}) via reserved slot", chat_id.0, text.len()));
+            let _ = handle_text_message(&bot, chat_id, &text, &state, &user_name, true).await;
+        }
+        (Some(text), false) => {
+            // Slot was already busy at admission. Use the standard
+            // queue/redirect path — this album becomes the next request
+            // after the in-flight one (or replaces it in OFF mode).
+            msg_debug(&format!("[album_batch] chat_id={}, dispatching caption (len={}) via queue/redirect", chat_id.0, text.len()));
+            dispatch_album_caption(bot.clone(), chat_id, state.clone(), user_name.clone(), text).await;
+        }
+        (None, true) => {
+            // No caption to dispatch — release the placeholder slot and
+            // hand off to any queued message that was waiting behind us.
+            msg_debug(&format!("[album_batch] chat_id={}, no caption → releasing slot", chat_id.0));
+            {
+                let mut data = state.lock().await;
+                if let Some(t) = data.cancel_tokens.get(&chat_id) {
+                    if Arc::ptr_eq(t, &placeholder_token) {
+                        data.cancel_tokens.remove(&chat_id);
+                    }
+                }
+            }
+            process_next_queued_message(&bot, chat_id, &state).await;
+        }
+        (None, false) => {
+            msg_debug(&format!("[album_batch] chat_id={}, no caption, slot was busy → uploads pending for next text", chat_id.0));
+        }
+    }
+
+    Ok(())
 }
 
 /// Route incoming messages to appropriate handlers
@@ -2721,12 +3628,15 @@ async fn handle_message(
 
     // Handle file/photo/media uploads
     if has_file {
-        // In group chats (with prefix required), only process uploads whose caption starts with ';' or '@botname'
+        // In group chats (with prefix required), only process uploads whose
+        // caption starts with `;` or `@bot`. Albums in this code path are
+        // 1-photo fragments from a split `getUpdates` batch (the multi-photo
+        // case is handled atomically in `handle_album_batch`); since they
+        // necessarily lack the album's caption, prefix-mode rejects them.
         if require_prefix {
             let caption = msg.caption().unwrap_or("");
-            msg_debug(&format!("[handle_message] upload: require_prefix=true, caption={:?}", caption));
+            msg_debug(&format!("[handle_message] upload: require_prefix=true, caption={:?}, media_group={:?}", caption, msg.media_group_id()));
             if !bot_username.is_empty() && caption.starts_with('@') {
-                // Caption starts with @mention — only accept if targeting this bot
                 let caption_lower = caption.to_lowercase();
                 let prefix = format!("@{}", bot_username.to_lowercase());
                 if !caption_lower.starts_with(&prefix)
@@ -2754,6 +3664,7 @@ async fn handle_message(
             else if msg.audio().is_some() { "audio" }
             else { "video_note" };
         println!("  [{timestamp}] ◀ [{user_name}] Upload: {file_hint}");
+
         handle_file_upload(&bot, chat_id, &msg, &state, &user_name).await?;
         println!("  [{timestamp}] ▶ [{user_name}] Upload complete");
         // If caption contains text, send it to AI as a follow-up message
@@ -7370,7 +8281,12 @@ async fn handle_text_message(
         Some(instr) => format!("You are chatting with a user through {}.\n\nUser's instruction for this chat:\n{}", platform, instr),
         None => format!("You are chatting with a user through {}.", platform),
     };
-    ai_trace(&format!("[PROMPT] platform={}, role_len={}, path={}, bot_key={}", platform, role.len(), current_path, bot_key_for_prompt));
+    ai_trace(&format!(
+        "[PROMPT] platform={}, role_len={}, path={}, bot_key=<redacted>",
+        platform,
+        role.len(),
+        current_path
+    ));
     let system_prompt_owned = build_system_prompt(
         &role,
         &current_path, chat_id.0, &bot_key_for_prompt, &disabled_notice,
@@ -7463,6 +8379,11 @@ async fn handle_text_message(
             };
             msg_debug(&format!("[handle_text_message] → codex::execute, codex_model={:?}, codex_prompt_len={}, resume={}, system_prompt_passed=true",
                 codex_model, codex_prompt.len(), is_resume));
+            let codex_auto_send = codex::CodexAutoSendCtx {
+                cokacdir_bin: crate::bin_path().to_string(),
+                chat_id: chat_id.0,
+                bot_key: bot_key_for_prompt.clone(),
+            };
             codex::execute_command_streaming(
                 &codex_prompt,
                 session_id_clone.as_deref(),
@@ -7473,6 +8394,7 @@ async fn handle_text_message(
                 Some(cancel_token_clone),
                 codex_model,
                 false,
+                Some(&codex_auto_send),
             )
         } else {
             let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
@@ -9782,6 +10704,7 @@ async fn execute_schedule(
     // Session persistence must be kept so users can resume via /SCHEDULE_ID
     let workspace_path_for_claude = workspace_path.clone();
     let model_clone_for_exec = model.clone();
+    let bot_key_for_codex = bot_key.clone();
     tokio::task::spawn_blocking(move || {
         let provider = detect_provider(model_clone_for_exec.as_deref());
         sched_debug(&format!("[execute_schedule:spawn_blocking] provider={}, model={:?}",
@@ -9819,6 +10742,11 @@ async fn execute_schedule(
         } else if provider == "codex" {
             let codex_model = model_clone_for_exec.as_deref().and_then(codex::strip_codex_prefix);
             let codex_system_prompt = format!("{}{}", system_prompt_owned, codex_extra_instructions());
+            let codex_auto_send = codex::CodexAutoSendCtx {
+                cokacdir_bin: crate::bin_path().to_string(),
+                chat_id: chat_id.0,
+                bot_key: bot_key_for_codex,
+            };
             codex::execute_command_streaming(
                 &prompt,
                 None,
@@ -9829,6 +10757,7 @@ async fn execute_schedule(
                 Some(cancel_token_clone),
                 codex_model,
                 false,
+                Some(&codex_auto_send),
             )
         } else {
             let claude_model = model_clone_for_exec.as_deref().and_then(claude::strip_claude_prefix);
@@ -10565,6 +11494,7 @@ async fn process_bot_message(
     let model_clone = model.clone();
     let history_clone = history;
     let prompt_for_ai = prompt.clone();
+    let bot_key_for_codex = bot_key.clone();
     msg_debug(&format!("[process_bot_message] spawning AI backend: model={:?}, history_len={}, prompt_len={}",
         model_clone, history_clone.len(), prompt_for_ai.len()));
     tokio::task::spawn_blocking(move || {
@@ -10634,6 +11564,11 @@ async fn process_bot_message(
             };
             msg_debug(&format!("[process_bot_message] → codex::execute, codex_model={:?}, codex_prompt_len={}, resume={}, system_prompt_passed=true",
                 codex_model, codex_prompt.len(), is_resume));
+            let codex_auto_send = codex::CodexAutoSendCtx {
+                cokacdir_bin: crate::bin_path().to_string(),
+                chat_id: chat_id.0,
+                bot_key: bot_key_for_codex,
+            };
             codex::execute_command_streaming(
                 &codex_prompt,
                 session_id_clone.as_deref(),
@@ -10644,6 +11579,7 @@ async fn process_bot_message(
                 Some(cancel_token_clone),
                 codex_model,
                 false,
+                Some(&codex_auto_send),
             )
         } else {
             let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);

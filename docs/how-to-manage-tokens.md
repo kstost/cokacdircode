@@ -17,6 +17,9 @@
 - **Telegram**: Token created via [@BotFather](https://t.me/botfather) (format: `123456789:ABCdef...`)
 - **Discord**: Bot token created at [Discord Developer Portal](https://discord.com/developers/applications)
   - Discord tokens are auto-detected; you can also prefix with `discord:` explicitly
+- **Slack**: Socket Mode token pair from a Slack app
+  - Format: `slack:xoxb-...,xapp-...`
+  - `xoxb-` is the bot token, `xapp-` is the app-level token
 
 ## Multiple Tokens
 

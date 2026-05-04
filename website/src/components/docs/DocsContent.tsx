@@ -8,6 +8,7 @@ import InstallLinux from './sections/InstallLinux'
 import EC2Setup from './sections/EC2Setup'
 import TelegramBotSetup from './sections/TelegramBotSetup'
 import DiscordBotSetup from './sections/DiscordBotSetup'
+import SlackBotSetup from './sections/SlackBotSetup'
 import TokenManagement from './sections/TokenManagement'
 import FirstChat from './sections/FirstChat'
 import Updating from './sections/Updating'
@@ -30,6 +31,7 @@ const sectionComponents: Record<string, React.ComponentType> = {
   'install-ec2': EC2Setup,
   'telegram-bot': TelegramBotSetup,
   'discord-bot': DiscordBotSetup,
+  'slack-bot': SlackBotSetup,
   'token-management': TokenManagement,
   'first-chat': FirstChat,
   'update': Updating,

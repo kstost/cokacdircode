@@ -47,8 +47,8 @@ export default function Installation() {
 
       <InfoBox type="tip">
         {t(
-          <>After installation, you need to create a bot on Telegram or Discord and register its token. See the <strong>Telegram Bot Setup</strong> or <strong>Discord Bot Setup</strong> guides for details.</>,
-          <>설치 후 텔레그램 또는 디스코드에서 봇을 생성하고 토큰을 등록해야 합니다. 자세한 내용은 <strong>텔레그램 봇 설정</strong> 또는 <strong>디스코드 봇 설정</strong> 가이드를 참고하세요.</>
+          <>After installation, you need to create a bot on Telegram, Discord, or Slack and register its token. See the setup guides and Token Management for details.</>,
+          <>설치 후 텔레그램, 디스코드 또는 Slack에서 봇을 생성하고 토큰을 등록해야 합니다. 자세한 내용은 설정 가이드와 토큰 관리를 참고하세요.</>
         )}
       </InfoBox>
     </div>

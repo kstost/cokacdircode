@@ -8,8 +8,8 @@ export default function InstallWindows() {
       <SectionTitle>{t('Install on Windows', 'Windows에 설치하기')}</SectionTitle>
       <P>
         {t(
-          'Install cokacdir on a Windows PC and use AI coding agents via Telegram or Discord bot.',
-          'Windows PC에 cokacdir을 설치하고 텔레그램 또는 디스코드 봇으로 AI 코딩 에이전트를 사용하세요.'
+          'Install cokacdir on a Windows PC and use AI coding agents via Telegram, Discord, or Slack bot.',
+          'Windows PC에 cokacdir을 설치하고 텔레그램, 디스코드 또는 Slack 봇으로 AI 코딩 에이전트를 사용하세요.'
         )}
       </P>
 
@@ -93,8 +93,8 @@ export default function InstallWindows() {
         </StepList>
         <InfoBox type="tip">
           {t(
-            <>You need a bot token from Telegram or Discord. See the <strong>Telegram Bot Setup</strong> or <strong>Discord Bot Setup</strong> guides for details.</>,
-            <>텔레그램 또는 디스코드 봇 토큰이 필요합니다. 자세한 내용은 <strong>텔레그램 봇 설정</strong> 또는 <strong>디스코드 봇 설정</strong> 가이드를 참고하세요.</>
+            <>You need a bot token from Telegram, Discord, or Slack. See the setup guides and Token Management for details.</>,
+            <>텔레그램, 디스코드 또는 Slack 봇 토큰이 필요합니다. 자세한 내용은 설정 가이드와 토큰 관리를 참고하세요.</>
           )}
         </InfoBox>
       </SubSection>

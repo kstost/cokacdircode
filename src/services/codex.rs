@@ -1,11 +1,23 @@
 use std::process::{Command, Stdio};
 use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
 use serde_json::Value;
 use sha2::{Sha256, Digest};
 
 use crate::services::claude::{debug_log_to, StreamMessage, CancelToken, kill_child_tree};
+
+/// Context required to auto-deliver images that Codex's built-in `image_gen`
+/// tool drops into `~/.codex/generated_images/<session_id>/` without surfacing
+/// any JSON event in `codex exec --json`. Without this fallback the bot has no
+/// way to know an image was produced and the user sees nothing.
+pub struct CodexAutoSendCtx {
+    pub cokacdir_bin: String,
+    pub chat_id: i64,
+    pub bot_key: String,
+}
 
 /// Short (12-hex-char) SHA-256 of the input, used for /loop verification
 /// forensic logs so consecutive-iteration outputs can be compared at a
@@ -300,6 +312,7 @@ pub fn execute_command_streaming(
     cancel_token: Option<std::sync::Arc<CancelToken>>,
     model: Option<&str>,               // "codex:" prefix already stripped
     _no_session_persistence: bool,     // ignored — Codex exec handles persistence internally
+    auto_send: Option<&CodexAutoSendCtx>, // when Some, deliver image_gen outputs that the model forgot to sendfile
 ) -> Result<(), String> {
     codex_debug_log("========================================");
     codex_debug_log("=== codex execute_command_streaming START ===");
@@ -409,6 +422,16 @@ pub fn execute_command_streaming(
     codex_debug_log("--- Spawning codex process ---");
     codex_debug_log(&format!("Command: {} {:?}", codex_bin, args));
 
+    // Snapshot the generated-images dir for resumed sessions BEFORE spawn so
+    // we can later isolate files created during this turn. New sessions start
+    // with no thread_id-keyed dir, so an empty snapshot is correct.
+    let image_dir_snapshot: HashSet<PathBuf> = if auto_send.is_some() {
+        snapshot_image_dir(session_id)
+    } else {
+        HashSet::new()
+    };
+    let turn_started_at = std::time::SystemTime::now();
+
     let spawn_start = std::time::Instant::now();
     let mut child = Command::new(codex_bin)
         .args(&args)
@@ -465,6 +488,9 @@ pub fn execute_command_streaming(
     let mut got_done = false;
     let mut stdout_error: Option<(String, String)> = None;
     let mut line_count = 0;
+    // Track paths the model itself delivered via cokacdir --sendfile so the
+    // post-turn auto-deliver pass doesn't double-send the same file.
+    let mut model_sent_paths: Vec<PathBuf> = Vec::new();
 
     codex_debug_log("Entering JSONL lines loop...");
     'lines: for line in reader.lines() {
@@ -511,6 +537,22 @@ pub fn execute_command_streaming(
                     }
                     StreamMessage::Done { .. } => {
                         codex_debug_log("  >>> Done");
+                        // Inject auto-delivered images BEFORE forwarding Done so
+                        // the polling loop processes them as part of this turn.
+                        if let Some(ctx) = auto_send {
+                            if let Some(sid) = last_session_id.as_deref() {
+                                auto_deliver_new_images(
+                                    sid,
+                                    &image_dir_snapshot,
+                                    &model_sent_paths,
+                                    turn_started_at,
+                                    ctx,
+                                    &sender,
+                                );
+                            } else {
+                                codex_debug_log("[auto-send] skipped: no session_id captured");
+                            }
+                        }
                         got_done = true;
                     }
                     StreamMessage::Error { ref message, .. } => {
@@ -525,6 +567,10 @@ pub fn execute_command_streaming(
                     StreamMessage::ToolUse { name, input } => {
                         let input_preview: String = input.chars().take(200).collect();
                         codex_debug_log(&format!("  >>> ToolUse: name={}, input={:?}", name, input_preview));
+                        if let Some(p) = extract_sendfile_path(name, input) {
+                            codex_debug_log(&format!("  >>> ToolUse: model --sendfile path recorded: {}", p.display()));
+                            model_sent_paths.push(p);
+                        }
                     }
                     StreamMessage::ToolResult { content, is_error } => {
                         codex_debug_log(&format!("  >>> ToolResult: is_error={}, len={}", is_error, content.len()));
@@ -612,6 +658,20 @@ pub fn execute_command_streaming(
     // Send synthetic Done if not received
     if !got_done {
         codex_debug_log("No Done message received, sending synthetic Done");
+        // turn.completed never arrived, so the in-loop auto-deliver hook didn't
+        // fire. Still try to deliver any image_gen output before closing the turn.
+        if let Some(ctx) = auto_send {
+            if let Some(sid) = last_session_id.as_deref() {
+                auto_deliver_new_images(
+                    sid,
+                    &image_dir_snapshot,
+                    &model_sent_paths,
+                    turn_started_at,
+                    ctx,
+                    &sender,
+                );
+            }
+        }
         let _ = sender.send(StreamMessage::Done {
             result: String::new(),
             session_id: last_session_id,
@@ -622,6 +682,162 @@ pub fn execute_command_streaming(
     codex_debug_log("=== codex execute_command_streaming END (success) ===");
     Ok(())
     // _sp_guard dropped here — temp file removed
+}
+
+/// Resolve `~/.codex/generated_images/<session_id>/` for the given session.
+fn generated_images_dir(session_id: &str) -> Option<PathBuf> {
+    Some(dirs::home_dir()?.join(".codex/generated_images").join(session_id))
+}
+
+/// Snapshot existing files in the codex generated-images directory for a
+/// resumed session, so we can later distinguish files created during this turn
+/// from files left over from previous turns.
+fn snapshot_image_dir(session_id: Option<&str>) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    let Some(sid) = session_id else { return set };
+    let Some(dir) = generated_images_dir(sid) else { return set };
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                set.insert(entry.path());
+            }
+        }
+    }
+    set
+}
+
+/// Two paths point to the same file if either equality or canonicalization match.
+fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    if a == b { return true; }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Extract the FILEPATH from a `cokacdir --sendfile <PATH> ...` invocation, if
+/// the parsed Bash command happens to contain one. Used to record paths the
+/// model already delivered so we don't double-send them.
+fn extract_sendfile_path(name: &str, input_json: &str) -> Option<PathBuf> {
+    if name != "Bash" { return None; }
+    let v: Value = serde_json::from_str(input_json).ok()?;
+    let cmd = v.get("command")?.as_str()?;
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let idx = tokens.iter().position(|t| *t == "--sendfile")?;
+    let raw = tokens.get(idx + 1)?;
+    let unquoted = raw.trim_matches(|c: char| c == '"' || c == '\'');
+    Some(PathBuf::from(unquoted))
+}
+
+/// After a Codex turn completes, scan the session's generated-images directory
+/// for image files created during this turn (mtime ≥ `started_at`) that aren't
+/// in the pre-turn snapshot and weren't already delivered by the model itself,
+/// then invoke `cokacdir --sendfile` for each one and emit synthetic
+/// ToolUse/ToolResult events so the polling loop renders them like a normal
+/// model-issued sendfile.
+fn auto_deliver_new_images(
+    session_id: &str,
+    snapshot: &HashSet<PathBuf>,
+    model_sent: &[PathBuf],
+    started_at: std::time::SystemTime,
+    ctx: &CodexAutoSendCtx,
+    sender: &Sender<StreamMessage>,
+) {
+    let Some(dir) = generated_images_dir(session_id) else { return };
+    if !dir.exists() { return; }
+
+    let rd = match std::fs::read_dir(&dir) {
+        Ok(r) => r,
+        Err(e) => {
+            codex_debug_log(&format!("[auto-send] read_dir failed: {} ({})", dir.display(), e));
+            return;
+        }
+    };
+
+    // Collect candidate paths with their mtime, then sort by mtime ascending so
+    // multi-image turns deliver in creation order.
+    let mut candidates: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) { continue; }
+        if snapshot.contains(&path) { continue; }
+        let ext = path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+        if !matches!(ext.as_deref(), Some("png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp")) { continue; }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(mtime) = meta.modified() else { continue };
+        if mtime < started_at { continue; }
+        if model_sent.iter().any(|p| paths_equivalent(p, &path)) {
+            codex_debug_log(&format!("[auto-send] skip (already sent by model): {}", path.display()));
+            continue;
+        }
+        candidates.push((path, mtime));
+    }
+    candidates.sort_by_key(|(_, mtime)| *mtime);
+
+    if candidates.is_empty() { return; }
+    codex_debug_log(&format!(
+        "[auto-send] {} image(s) to deliver from {}", candidates.len(), dir.display()));
+
+    for (path, _) in candidates {
+        let path_str = path.to_string_lossy().to_string();
+        codex_debug_log(&format!("[auto-send] invoking cokacdir --sendfile {}", path_str));
+
+        let output = Command::new(&ctx.cokacdir_bin)
+            .args([
+                "--sendfile", &path_str,
+                "--chat", &ctx.chat_id.to_string(),
+                "--key", &ctx.bot_key,
+            ])
+            .output();
+
+        let (stdout, exit_code, is_error) = match output {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let exit = out.status.code();
+                let is_err = !out.status.success();
+                codex_debug_log(&format!(
+                    "[auto-send] result: exit={:?}, stdout_len={}, stderr_len={}",
+                    exit, stdout.len(), out.stderr.len()));
+                if is_err {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    codex_debug_log(&format!(
+                        "[auto-send] stderr_first_500={:?}",
+                        stderr.chars().take(500).collect::<String>()));
+                }
+                (stdout, exit, is_err)
+            }
+            Err(e) => {
+                codex_debug_log(&format!("[auto-send] spawn failed: {} (path={})", e, path_str));
+                continue;
+            }
+        };
+
+        // Build a Bash-shaped command string. `detect_cokacdir_command` matches
+        // by basename of any whitespace-split token, so the bin path here makes
+        // the polling loop route this exactly like a model-issued sendfile.
+        let cmd_str = format!(
+            "{} --sendfile {} --chat {} --key <auto>",
+            ctx.cokacdir_bin, path_str, ctx.chat_id);
+        let tool_input = serde_json::json!({
+            "command": cmd_str,
+            "exit_code": exit_code,
+        }).to_string();
+
+        if sender.send(StreamMessage::ToolUse {
+            name: "Bash".to_string(),
+            input: tool_input,
+        }).is_err() {
+            codex_debug_log("[auto-send] channel closed, aborting remaining deliveries");
+            return;
+        }
+        if sender.send(StreamMessage::ToolResult {
+            content: stdout,
+            is_error,
+        }).is_err() {
+            codex_debug_log("[auto-send] channel closed after ToolUse, aborting");
+            return;
+        }
+    }
 }
 
 /// Parse a Codex JSONL event into zero or more StreamMessages.
@@ -799,6 +1015,8 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
                 },
             ];
 
+            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
+
             // Check for error first (skip null — serde serializes None as null)
             if let Some(err) = item.get("error").filter(|v| !v.is_null()) {
                 let message = err.get("message")
@@ -815,16 +1033,31 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
                 } else {
                     result.to_string()
                 };
-                msgs.push(StreamMessage::ToolResult { content, is_error: false });
+                // codex's McpToolCallStatus: failed status overrides result presence.
+                let is_error = status == "failed";
+                msgs.push(StreamMessage::ToolResult { content, is_error });
+            } else if status == "failed" {
+                // status=failed but neither error nor result populated — surface a generic error
+                // so the user isn't left wondering why a ToolUse had no result.
+                msgs.push(StreamMessage::ToolResult {
+                    content: "MCP tool call failed (no error details)".to_string(),
+                    is_error: true,
+                });
             }
 
             msgs
         }
 
-        // Collab tool call — sub-agent interactions (SpawnAgent, SendInput, Wait, CloseAgent)
-        // Codex fields: tool, sender_thread_id, receiver_thread_ids, prompt, agents_states, status
+        // Collab tool call — sub-agent interactions.
+        // Codex CollabTool enum: spawn_agent, send_input, wait, close_agent.
+        // (Other names — send_message/followup_task/wait_agent/list_agents — are
+        //  forward-compat hooks for tools codex may add later; harmless if absent.)
+        // Fields: tool, sender_thread_id, receiver_thread_ids, prompt, agents_states, status
+        // CollabAgentStatus values: pending_init, running, interrupted, completed,
+        //   errored, shutdown, not_found.
         "collab_tool_call" => {
             let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+            let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
             // Extract prompt for tools that carry one; leave empty for others
             // (tool name is already in the Collab:{tool} name field — no need to repeat)
             let display = match tool {
@@ -839,57 +1072,117 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
                 input: display,
             }];
 
-            // For agent-state tools, extract agent messages from agents_states
+            // For agent-state tools, fold per-agent message into a ToolResult.
+            // Successful agents (running/completed/shutdown) display message-only
+            // to preserve existing UX. Problematic states (errored/interrupted/
+            // not_found/pending_init) get a "[status]" prefix and mark the
+            // ToolResult as is_error=true so the user actually sees the failure.
             if matches!(tool, "wait" | "close_agent" | "wait_agent" | "list_agents") {
                 if let Some(states) = item.get("agents_states").and_then(|v| v.as_object()) {
-                    let agent_msgs: Vec<String> = states.values().filter_map(|state| {
-                        state.get("message").and_then(|v| v.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(|s| s.to_string())
+                    let mut any_problem = false;
+                    let entries: Vec<String> = states.values().filter_map(|state| {
+                        let agent_status = state.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        let message = state.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                        let problem = matches!(agent_status,
+                            "errored" | "interrupted" | "not_found" | "pending_init");
+                        if problem { any_problem = true; }
+                        match (problem, message.is_empty()) {
+                            (false, true) => None,
+                            (false, false) => Some(message.to_string()),
+                            (true, true) => Some(format!("[{}]", agent_status)),
+                            (true, false) => Some(format!("[{}] {}", agent_status, message)),
+                        }
                     }).collect();
-                    if !agent_msgs.is_empty() {
+                    if !entries.is_empty() {
                         msgs.push(StreamMessage::ToolResult {
-                            content: agent_msgs.join("\n---\n"),
-                            is_error: false,
+                            content: entries.join("\n---\n"),
+                            is_error: any_problem || status == "failed",
+                        });
+                    } else if status == "failed" {
+                        msgs.push(StreamMessage::ToolResult {
+                            content: "Collab tool call failed".to_string(),
+                            is_error: true,
                         });
                     }
+                } else if status == "failed" {
+                    msgs.push(StreamMessage::ToolResult {
+                        content: "Collab tool call failed".to_string(),
+                        is_error: true,
+                    });
                 }
+            } else if status == "failed" {
+                // Non-state tools (spawn_agent, send_input) may also fail — surface it.
+                msgs.push(StreamMessage::ToolResult {
+                    content: format!("Collab:{} failed", tool),
+                    is_error: true,
+                });
             }
 
             msgs
         }
 
         // Web search — Codex fields: id, query, action
+        // action is a tagged enum (codex protocol::WebSearchAction) with variants:
+        //   - search    {query?, queries?[]}
+        //   - open_page {url?}
+        //   - find_in_page {url?, pattern?}
+        //   - other     (no fields)
         // Note: display is the raw query/URL without prefix — format_tool_input()
         // in telegram.rs adds the "Search:" prefix to avoid duplication.
         "web_search" => {
-            let query = item.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            let display = if !query.is_empty() {
-                let action_type = item.get("action")
-                    .and_then(|a| a.get("type"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if action_type == "search" {
-                    // Include expanded queries if available
-                    item.get("action")
+            let top_query = item.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            let action = item.get("action");
+            let action_type = action
+                .and_then(|a| a.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let display = match action_type {
+                "search" => {
+                    // Prefer expanded queries[] when present, else fall back to action.query
+                    // or top-level query.
+                    let from_queries = action
                         .and_then(|a| a.get("queries"))
                         .and_then(|v| v.as_array())
                         .filter(|arr| !arr.is_empty())
                         .map(|arr| arr.iter()
                             .filter_map(|q| q.as_str())
                             .collect::<Vec<_>>()
-                            .join(", "))
-                        .unwrap_or_else(|| query.to_string())
-                } else {
-                    query.to_string()
+                            .join(", "));
+                    let from_action_query = action
+                        .and_then(|a| a.get("query"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    from_queries
+                        .or_else(|| from_action_query.map(|s| s.to_string()))
+                        .unwrap_or_else(|| top_query.to_string())
                 }
-            } else {
-                String::new()
+                "open_page" => {
+                    let url = action
+                        .and_then(|a| a.get("url"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if url.is_empty() { top_query.to_string() } else { format!("open: {}", url) }
+                }
+                "find_in_page" => {
+                    let url = action.and_then(|a| a.get("url")).and_then(|v| v.as_str()).unwrap_or("");
+                    let pattern = action.and_then(|a| a.get("pattern")).and_then(|v| v.as_str()).unwrap_or("");
+                    match (url.is_empty(), pattern.is_empty()) {
+                        (false, false) => format!("find “{}” in {}", pattern, url),
+                        (false, true) => format!("find_in_page: {}", url),
+                        (true, false) => format!("find: {}", pattern),
+                        (true, true) => top_query.to_string(),
+                    }
+                }
+                _ => top_query.to_string(), // "other" or unknown — fall back
             };
-            vec![StreamMessage::ToolUse {
-                name: "WebSearch".to_string(),
-                input: display,
-            }]
+            if display.is_empty() {
+                vec![]
+            } else {
+                vec![StreamMessage::ToolUse {
+                    name: "WebSearch".to_string(),
+                    input: display,
+                }]
+            }
         }
 
         // Todo list — agent's running plan. Codex fields: items (Vec<{text, completed}>)

@@ -8,15 +8,15 @@ export default function EC2Setup() {
       <SectionTitle>{t('Install on AWS EC2', 'AWS EC2에 설치하기')}</SectionTitle>
       <P>
         {t(
-          'A guide to setting up a cokacdir & AI agent (Claude Code / Codex CLI) environment on AWS EC2 and using it anywhere via Telegram bot.',
-          'AWS EC2 위에 cokacdir & AI 에이전트 (Claude Code / Codex CLI) 환경을 만들고, 텔레그램 봇으로 어디서나 사용하는 가이드입니다.'
+          'A guide to setting up a cokacdir & AI agent (Claude Code / Codex CLI) environment on AWS EC2 and using it anywhere via Telegram, Discord, or Slack.',
+          'AWS EC2 위에 cokacdir & AI 에이전트 (Claude Code / Codex CLI) 환경을 만들고, 텔레그램, 디스코드 또는 Slack으로 어디서나 사용하는 가이드입니다.'
         )}
       </P>
 
       <InfoBox type="info">
         {t(
-          <>You need 3 things: <strong>EC2 Public IPv4 address</strong>, <strong>PEM key file</strong> (for SSH), and <strong>Telegram bot token</strong> (from BotFather).</>,
-          <>준비물 3가지: <strong>EC2 퍼블릭 IPv4 주소</strong>, <strong>PEM 키 파일</strong> (SSH 접속용), <strong>텔레그램 봇 토큰</strong> (BotFather 발급).</>
+          <>You need 3 things: <strong>EC2 Public IPv4 address</strong>, <strong>PEM key file</strong> (for SSH), and a <strong>bot token</strong> for Telegram, Discord, or Slack.</>,
+          <>준비물 3가지: <strong>EC2 퍼블릭 IPv4 주소</strong>, <strong>PEM 키 파일</strong> (SSH 접속용), 텔레그램, 디스코드 또는 Slack용 <strong>봇 토큰</strong>.</>
         )}
       </InfoBox>
 
@@ -63,11 +63,11 @@ export default function EC2Setup() {
         </P>
       </SubSection>
 
-      <SubSection title={String(t('Step 2. Create Telegram Bot', 'Step 2. 텔레그램 봇 만들기'))}>
+      <SubSection title={String(t('Step 2. Create a Chat Bot', 'Step 2. 채팅 봇 만들기'))}>
         <P>
           {t(
-            <>Go to <a href="https://t.me/botfather" target="_blank" rel="noopener noreferrer" className="text-accent-cyan hover:underline">@BotFather</a> and press <strong className="text-white">START BOT</strong> to begin.</>,
-            <><a href="https://t.me/botfather" target="_blank" rel="noopener noreferrer" className="text-accent-cyan hover:underline">@BotFather</a>에서 <strong className="text-white">START BOT</strong>을 눌러 대화를 시작합니다.</>
+            <>For Telegram, go to <a href="https://t.me/botfather" target="_blank" rel="noopener noreferrer" className="text-accent-cyan hover:underline">@BotFather</a> and press <strong className="text-white">START BOT</strong>. For Discord or Slack, follow the dedicated setup guide and keep the generated token ready.</>,
+            <>텔레그램은 <a href="https://t.me/botfather" target="_blank" rel="noopener noreferrer" className="text-accent-cyan hover:underline">@BotFather</a>에서 <strong className="text-white">START BOT</strong>을 눌러 시작합니다. 디스코드 또는 Slack은 전용 설정 가이드를 따라 생성한 토큰을 준비하세요.</>
           )}
         </P>
         <StepList>
@@ -140,8 +140,8 @@ ssh -t -i $PEM ubuntu@$IP "bash -ic 'curl -fsSL https://cokacdir.cokac.com/manag
           </StepItem>
           <StepItem number={2} title={String(t('cokacctl dashboard', 'cokacctl 대시보드'))}>
             {t(
-              <>After authentication, the cokacctl dashboard (for managing cokacdir) appears automatically. Press <IC>k</IC> to register your Telegram bot token, then press <IC>s</IC> to start the server.</>,
-              <>인증이 끝나면 cokacctl 대시보드(cokacdir 관리 화면)가 자동으로 나타납니다. <IC>k</IC>를 눌러 텔레그램 봇 토큰을 등록한 후, <IC>s</IC>를 눌러 서버를 시작합니다.</>
+              <>After authentication, the cokacctl dashboard (for managing cokacdir) appears automatically. Press <IC>k</IC> to register your Telegram, Discord, or Slack token, then press <IC>s</IC> to start the server.</>,
+              <>인증이 끝나면 cokacctl 대시보드(cokacdir 관리 화면)가 자동으로 나타납니다. <IC>k</IC>를 눌러 텔레그램, 디스코드 또는 Slack 토큰을 등록한 후, <IC>s</IC>를 눌러 서버를 시작합니다.</>
             )}
           </StepItem>
           <StepItem number={3} title={String(t('Done', '완료'))}>

@@ -6,7 +6,7 @@ export default function TokenManagement() {
   return (
     <div>
       <SectionTitle>{t('Token Management', '토큰 관리')}</SectionTitle>
-      <P>{t('Add and manage bot tokens for Telegram and Discord.', '텔레그램과 디스코드의 봇 토큰을 추가하고 관리하세요.')}</P>
+      <P>{t('Add and manage bot tokens for Telegram, Discord, and Slack.', '텔레그램, 디스코드, Slack의 봇 토큰을 추가하고 관리하세요.')}</P>
 
       <SubSection title={String(t('Token Types', '토큰 유형'))}>
         <CommandTable
@@ -21,6 +21,11 @@ export default function TokenManagement() {
               'Discord',
               String(t('Created at Discord Developer Portal', 'Discord Developer Portal에서 생성')),
               <span key="dc">{t(<>Auto-detected, or prefix with <IC>discord:</IC></>, <>자동 감지, 또는 <IC>discord:</IC> 접두사 사용</>)}</span>,
+            ],
+            [
+              'Slack',
+              String(t('Slack app using Socket Mode', 'Socket Mode를 사용하는 Slack 앱')),
+              <span key="sl">{t(<>Use <IC>slack:xoxb-...,xapp-...</IC></>, <><IC>slack:xoxb-...,xapp-...</IC> 형식 사용</>)}</span>,
             ],
           ]}
         />

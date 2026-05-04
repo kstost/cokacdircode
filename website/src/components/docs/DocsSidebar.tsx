@@ -29,6 +29,7 @@ const categories: SidebarCategory[] = [
       { id: 'install-ec2', en: 'Install on AWS EC2', ko: 'AWS EC2에 설치하기' },
       { id: 'telegram-bot', en: 'Telegram Bot Setup', ko: '텔레그램 봇 설정' },
       { id: 'discord-bot', en: 'Discord Bot Setup', ko: '디스코드 봇 설정' },
+      { id: 'slack-bot', en: 'Slack Bot Setup', ko: 'Slack 봇 설정' },
       { id: 'token-management', en: 'Token Management', ko: '토큰 관리' },
       { id: 'first-chat', en: 'First Chat', ko: '첫 번째 채팅' },
       { id: 'update', en: 'Updating', ko: '업데이트' },

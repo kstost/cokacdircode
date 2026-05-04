@@ -69,7 +69,7 @@ fn print_help() {
     println!("    --design                Enable theme hot-reload (for theme development)");
     println!("    --bridge <BACKEND>     Run as AI bridge (internal use, e.g. --bridge gemini)");
     println!("    --base64 <TEXT>         Decode base64 and print (internal use)");
-    println!("    --ccserver <TOKEN>...   Start bot server(s) (auto-detects Telegram/Discord)");
+    println!("    --ccserver <TOKEN>...   Start bot server(s) (auto-detects Telegram/Discord/Slack)");
     println!("    --sendfile <PATH> --chat <ID> --key <HASH>");
     println!("                            Send file via Telegram bot (internal use, HASH = token hash)");
     println!("    --currenttime            Print current server time");
@@ -234,7 +234,7 @@ fn handle_cron_register(prompt: &str, at_value: &str, chat_id: i64, hash_key: &s
     cron_debug(&format!("  prompt: {}", prompt));
     cron_debug(&format!("  at_value: {}", at_value));
     cron_debug(&format!("  chat_id: {}", chat_id));
-    cron_debug(&format!("  hash_key: {}", hash_key));
+    cron_debug("  key_supplied: true");
     cron_debug(&format!("  once(raw): {}", once));
     cron_debug(&format!("  session_id: {:?}", session_id));
 
@@ -471,7 +471,7 @@ fn handle_cron_context(args: &[String]) {
 fn handle_cron_list(chat_id: i64, hash_key: &str) {
     use services::telegram;
 
-    cron_debug(&format!("[handle_cron_list] chat_id={}, hash_key={}", chat_id, hash_key));
+    cron_debug(&format!("[handle_cron_list] chat_id={}, key_supplied=true", chat_id));
     let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
     cron_debug(&format!("[handle_cron_list] found {} entries", entries.len()));
     let items: Vec<serde_json::Value> = entries.iter().map(|e| {
@@ -493,7 +493,7 @@ fn handle_cron_list(chat_id: i64, hash_key: &str) {
 fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
     use services::telegram;
 
-    cron_debug(&format!("[handle_cron_remove] id={}, chat_id={}, hash_key={}", id, chat_id, hash_key));
+    cron_debug(&format!("[handle_cron_remove] id={}, chat_id={}, key_supplied=true", id, chat_id));
     // Verify ownership
     let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
     if !entries.iter().any(|e| e.id == id) {
@@ -518,15 +518,15 @@ fn handle_cron_remove(id: &str, chat_id: i64, hash_key: &str) {
 
 /// Read the run-history JSONL file for a schedule and emit its records as a JSON array.
 ///
-/// Authorization: prefers the live schedule entry's (chat_id, bot_key) match. If the
+/// Authorization: prefers the live schedule entry's (chat_id, key) match. If the
 /// entry is gone (one-time schedule already executed and auto-deleted), falls back to
-/// the first record in the history file — both `chat_id` and `bot_key` must match.
+/// the first record in the history file — both `chat_id` and the key verifier must match.
 /// Output: `{"status":"ok","id":"...","count":N,"history":[{...}, ...]}`. An entry that
 /// exists but has never run yields `count:0, history:[]`.
 fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
     use services::telegram;
 
-    cron_debug(&format!("[handle_cron_history] id={}, chat_id={}, hash_key={}", id, chat_id, hash_key));
+    cron_debug(&format!("[handle_cron_history] id={}, chat_id={}, key_supplied=true", id, chat_id));
 
     let history_path = match telegram::schedule_history_path_pub(id) {
         Some(p) => p,
@@ -536,21 +536,22 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
             std::process::exit(1);
         }
     };
+    if history_path.exists() {
+        telegram::redact_schedule_history_file_pub(&history_path);
+    }
 
-    // Authorization check 1: live schedule entry matching (chat_id, bot_key)
+    // Authorization check 1: live schedule entry matching (chat_id, key)
     let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
     let entry_authorized = entries.iter().any(|e| e.id == id);
 
     // Authorization check 2 (fallback for already-deleted one-time schedules):
-    // first record in the history file must carry the same (chat_id, bot_key).
+    // first record in the history file must carry the same chat_id and key verifier.
     let mut authorized_via_history = false;
     if !entry_authorized {
         if let Ok(content) = std::fs::read_to_string(&history_path) {
             if let Some(first_line) = content.lines().find(|l| !l.trim().is_empty()) {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(first_line) {
-                    let cid_match = v.get("chat_id").and_then(|c| c.as_i64()) == Some(chat_id);
-                    let key_match = v.get("bot_key").and_then(|c| c.as_str()) == Some(hash_key);
-                    if cid_match && key_match {
+                    if telegram::schedule_history_record_authorized_pub(&v, id, chat_id, hash_key) {
                         authorized_via_history = true;
                     }
                 }
@@ -570,7 +571,14 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
             Ok(content) => content
                 .lines()
                 .filter(|l| !l.trim().is_empty())
-                .filter_map(|l| serde_json::from_str(l).ok())
+                .filter_map(|l| {
+                    let mut record: serde_json::Value = serde_json::from_str(l).ok()?;
+                    if !telegram::schedule_history_record_authorized_pub(&record, id, chat_id, hash_key) {
+                        return None;
+                    }
+                    telegram::sanitize_schedule_history_record_pub(&mut record);
+                    Some(record)
+                })
                 .collect(),
             Err(e) => {
                 cron_debug(&format!("[handle_cron_history] id={}, read failed: {}", id, e));
@@ -597,7 +605,10 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
 fn handle_cron_update(id: &str, at_value: &str, chat_id: i64, hash_key: &str) {
     use services::telegram;
 
-    cron_debug(&format!("[handle_cron_update] id={}, at_value={:?}, chat_id={}, hash_key={}", id, at_value, chat_id, hash_key));
+    cron_debug(&format!(
+        "[handle_cron_update] id={}, at_value={:?}, chat_id={}, key_supplied=true",
+        id, at_value, chat_id
+    ));
     // Find the entry
     let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
     let entry = entries.iter().find(|e| e.id == id);
@@ -625,6 +636,13 @@ fn handle_cron_update(id: &str, at_value: &str, chat_id: i64, hash_key: &str) {
 
     // Update and write back
     let mut updated = entry.clone();
+    // `list_schedule_entries_pub` no longer surfaces the raw bot_key (it cannot
+    // recover the raw key from the on-disk verifier). Re-supply it from the
+    // CLI arg before write, so `From<&ScheduleEntryData> for ScheduleEntry`
+    // recomputes the same verifier this entry already passed the list filter
+    // with — without this line, the write would derive the verifier from an
+    // empty key and orphan the schedule from its owning bot.
+    updated.bot_key = hash_key.to_string();
     updated.schedule = schedule_value.clone();
     updated.schedule_type = schedule_type.clone();
     updated.last_run = None; // Reset last_run so it triggers again
@@ -650,17 +668,22 @@ fn handle_bot_message(content: &str, to: &str, chat_id: i64, hash_key: &str) {
     use services::telegram;
 
     msg_debug("========================================");
-    msg_debug(&format!("[handle_bot_message] START: to={}, chat_id={}, hash_key={}, content_len={}", to, chat_id, hash_key, content.len()));
+    msg_debug(&format!(
+        "[handle_bot_message] START: to={}, chat_id={}, key_supplied=true, content_len={}",
+        to,
+        chat_id,
+        content.len()
+    ));
 
     // 1. Verify sender: resolve username from --key
-    msg_debug(&format!("[handle_bot_message] resolving sender from hash_key={}", hash_key));
+    msg_debug("[handle_bot_message] resolving sender from supplied key");
     let from_username = match telegram::resolve_username_by_hash(hash_key) {
         Some(u) => {
             msg_debug(&format!("[handle_bot_message] sender resolved: {}", u));
             u
         }
         None => {
-            msg_debug(&format!("[handle_bot_message] sender resolution failed for hash_key={}", hash_key));
+            msg_debug("[handle_bot_message] sender resolution failed for supplied key");
             eprintln!("{}", serde_json::json!({"status":"error","message":"Invalid key"}));
             std::process::exit(1);
         }
@@ -747,18 +770,52 @@ fn is_discord_token(token: &str) -> bool {
     !token.contains(':') && token.chars().filter(|&c| c == '.').count() >= 2
 }
 
+/// Slack token format: `slack:<xoxb-...>,<xapp-...>` (explicit) or `<xoxb-...>,<xapp-...>` (auto).
+/// Socket Mode requires both a bot token (xoxb-) and an app-level token (xapp-).
+fn is_slack_token(token: &str) -> bool {
+    let s = token.strip_prefix("slack:").unwrap_or(token);
+    s.contains(',') && s.contains("xoxb-") && s.contains("xapp-")
+}
+
+/// Parse a Slack token pair string (e.g. `xoxb-...,xapp-...`) into (bot_token, app_token).
+/// Accepts either order.
+fn parse_slack_pair(s: &str) -> Option<(String, String)> {
+    let s = s.strip_prefix("slack:").unwrap_or(s);
+    let (a, b) = s.split_once(',')?;
+    let (a, b) = (a.trim(), b.trim());
+    if a.starts_with("xoxb-") && b.starts_with("xapp-") {
+        Some((a.to_string(), b.to_string()))
+    } else if a.starts_with("xapp-") && b.starts_with("xoxb-") {
+        Some((b.to_string(), a.to_string()))
+    } else {
+        None
+    }
+}
+
 fn handle_ccserver(tokens: Vec<String>) {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
     // Classify tokens by format:
     //   "discord:<token>" → explicit Discord
+    //   "slack:<xoxb-...>,<xapp-...>" → explicit Slack (token pair)
     //   "<digits>:<hash>" → Telegram  (e.g. 8603189801:AAHOgQ5z...)
     //   "<base64>.<ts>.<hmac>" → Discord (e.g. MTQ4OTA3..._zZ5-.fAh9...)
+    //   "xoxb-...,xapp-..." → Slack (auto)
     let mut tg_tokens: Vec<String> = Vec::new();
     let mut discord_tokens: Vec<String> = Vec::new();
+    let mut slack_tokens: Vec<(String, String)> = Vec::new();
+    let mut invalid_tokens = 0usize;
     for token in &tokens {
         if let Some(dt) = token.strip_prefix("discord:") {
             discord_tokens.push(dt.to_string());
+        } else if token.starts_with("slack:") || is_slack_token(token) {
+            match parse_slack_pair(token) {
+                Some(pair) => slack_tokens.push(pair),
+                None => {
+                    eprintln!("  [ccserver] invalid slack token format (expected: slack:xoxb-...,xapp-...)");
+                    invalid_tokens += 1;
+                }
+            }
         } else if is_telegram_token(token) {
             tg_tokens.push(token.clone());
         } else if is_discord_token(token) {
@@ -768,13 +825,21 @@ fn handle_ccserver(tokens: Vec<String>) {
             tg_tokens.push(token.clone());
         }
     }
+    if invalid_tokens > 0 {
+        eprintln!("  [ccserver] aborting: {} invalid token(s)", invalid_tokens);
+        std::process::exit(2);
+    }
 
     // Log token classification
     for (i, token) in tokens.iter().enumerate() {
         let kind = if token.starts_with("discord:") {
             "discord (explicit)"
+        } else if token.starts_with("slack:") {
+            "slack (explicit)"
         } else if is_telegram_token(token) {
             "telegram (auto)"
+        } else if is_slack_token(token) {
+            "slack (auto)"
         } else if is_discord_token(token) {
             "discord (auto)"
         } else {
@@ -785,7 +850,7 @@ fn handle_ccserver(tokens: Vec<String>) {
         eprintln!("  [ccserver] token #{}: {} → {}", i + 1, kind, format!("{}...", masked));
     }
 
-    let total = tg_tokens.len() + discord_tokens.len();
+    let total = tg_tokens.len() + discord_tokens.len() + slack_tokens.len();
     let title = format!("  cokacdir v{}  |  Bot Server  ", VERSION);
     let width = title.chars().count();
     println!();
@@ -821,15 +886,23 @@ fn handle_ccserver(tokens: Vec<String>) {
     if !discord_tokens.is_empty() {
         println!("  ▸ Discord      : {} bot(s)", discord_tokens.len());
     }
+    if !slack_tokens.is_empty() {
+        println!("  ▸ Slack        : {} bot(s)", slack_tokens.len());
+    }
     println!();
 
-    if total == 1 && discord_tokens.is_empty() {
+    if total == 1 && discord_tokens.is_empty() && slack_tokens.is_empty() {
         // Single Telegram bot — run directly
         rt.block_on(services::telegram::run_bot(&tg_tokens[0], None));
-    } else if total == 1 && tg_tokens.is_empty() {
+    } else if total == 1 && tg_tokens.is_empty() && slack_tokens.is_empty() {
         // Single Discord bot — run bridge directly
         let args = vec![discord_tokens[0].clone()];
         rt.block_on(services::messenger_bridge::run_bridge("discord", &args));
+    } else if total == 1 && tg_tokens.is_empty() && discord_tokens.is_empty() {
+        // Single Slack bot — run bridge directly
+        let (bot, app) = slack_tokens[0].clone();
+        let args = vec![bot, app];
+        rt.block_on(services::messenger_bridge::run_bridge("slack", &args));
     } else {
         // Multiple bots — spawn all concurrently
         rt.block_on(async {
@@ -843,6 +916,12 @@ fn handle_ccserver(tokens: Vec<String>) {
                 handles.push(tokio::spawn(async move {
                     let args = vec![dt];
                     services::messenger_bridge::run_bridge("discord", &args).await;
+                }));
+            }
+            for (bot, app) in slack_tokens {
+                handles.push(tokio::spawn(async move {
+                    let args = vec![bot, app];
+                    services::messenger_bridge::run_bridge("slack", &args).await;
                 }));
             }
             for handle in handles {
@@ -1448,8 +1527,15 @@ fn main() -> io::Result<()> {
                         _ => { j += 1; }
                     }
                 }
-                cron_debug(&format!("  Parsed: prompt={:?}, at={:?}, chat_id={:?}, key={:?}, once={}, session_id={:?}",
-                    prompt, at_value, chat_id, key, once, session_id));
+                cron_debug(&format!(
+                    "  Parsed: prompt={:?}, at={:?}, chat_id={:?}, key_supplied={}, once={}, session_id={:?}",
+                    prompt,
+                    at_value,
+                    chat_id,
+                    key.is_some(),
+                    once,
+                    session_id
+                ));
                 match (prompt, at_value, chat_id, key) {
                     (Some(p), Some(at), Some(cid), Some(k)) => {
                         cron_debug("  All required args present, calling handle_cron_register");
@@ -2507,4 +2593,40 @@ fn handle_panel_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> 
         }
     }
     false
+}
+
+#[cfg(test)]
+mod cli_token_tests {
+    use super::{is_slack_token, parse_slack_pair};
+
+    #[test]
+    fn parses_explicit_slack_token_pair() {
+        let pair = parse_slack_pair("slack:xoxb-bot-token,xapp-app-token");
+        assert_eq!(
+            pair,
+            Some(("xoxb-bot-token".to_string(), "xapp-app-token".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_slack_token_pair_in_either_order() {
+        let pair = parse_slack_pair("xapp-app-token, xoxb-bot-token");
+        assert_eq!(
+            pair,
+            Some(("xoxb-bot-token".to_string(), "xapp-app-token".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_explicit_slack_token_pair() {
+        assert!(parse_slack_pair("slack:not-a-pair").is_none());
+        assert!(parse_slack_pair("slack:xoxb-only,missing-app").is_none());
+    }
+
+    #[test]
+    fn detects_auto_slack_token_pair() {
+        assert!(is_slack_token("xoxb-bot-token,xapp-app-token"));
+        assert!(is_slack_token("slack:xoxb-bot-token,xapp-app-token"));
+        assert!(!is_slack_token("123456789:telegram-token"));
+    }
 }

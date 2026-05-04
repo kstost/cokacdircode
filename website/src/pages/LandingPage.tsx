@@ -20,7 +20,7 @@ export default function LandingPage() {
   const features = [
     {
       icon: <MessageSquare size={24} />,
-      title: t('Telegram & Discord', '텔레그램 & 디스코드'),
+      title: t('Telegram, Discord & Slack', '텔레그램, 디스코드 & Slack'),
       desc: t(
         'Chat with AI coding agents from your phone or desktop. Create a bot and start coding from anywhere.',
         '스마트폰이나 데스크톱에서 AI 코딩 에이전트와 채팅하세요. 봇을 만들고 어디서나 코딩을 시작하세요.'
@@ -126,8 +126,8 @@ export default function LandingPage() {
             </p>
             <p className="text-zinc-500 text-lg max-w-2xl mx-auto mb-10 leading-relaxed">
               {t(
-                'Run AI coding agents like Claude Code and Codex through Telegram & Discord bots. Code from your phone, tablet, or any device with a chat app.',
-                'Claude Code, Codex 등 AI 코딩 에이전트를 텔레그램 & 디스코드 봇으로 실행하세요. 스마트폰, 태블릿, 채팅 앱이 있는 어떤 기기에서든 코딩하세요.'
+        'Run AI coding agents like Claude Code and Codex through Telegram, Discord, and Slack bots. Code from your phone, tablet, or any device with a chat app.',
+                'Claude Code, Codex 등 AI 코딩 에이전트를 텔레그램, 디스코드, Slack 봇으로 실행하세요. 스마트폰, 태블릿, 채팅 앱이 있는 어떤 기기에서든 코딩하세요.'
               )}
             </p>
           </div>
@@ -233,13 +233,13 @@ export default function LandingPage() {
                     {t(
                       <>
                         Create a Telegram bot via{' '}
-                        <span className="text-accent-cyan">@BotFather</span> or a Discord bot at the Developer Portal.
+                        <span className="text-accent-cyan">@BotFather</span>, a Discord bot at the Developer Portal, or a Slack app with Socket Mode.
                         Press <code className="font-mono text-accent-cyan bg-bg-dark px-1.5 py-0.5 rounded text-sm">k</code> in
                         cokacctl to register your token.
                       </>,
                       <>
                         텔레그램에서 <span className="text-accent-cyan">@BotFather</span>를 통해 봇을 만들거나
-                        디스코드 개발자 포털에서 봇을 생성하세요.
+                        디스코드 개발자 포털에서 봇을 생성하고, Slack은 Socket Mode 앱을 생성하세요.
                         cokacctl에서 <code className="font-mono text-accent-cyan bg-bg-dark px-1.5 py-0.5 rounded text-sm">k</code>를
                         눌러 토큰을 등록하세요.
                       </>

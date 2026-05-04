@@ -199,8 +199,8 @@ cokacctl`} />
 
       <SubSection title={String(t('/envvars — Inspect the Running Environment', '/envvars — 실행 중인 환경 확인'))}>
         <P>{t(
-          <><IC>/envvars</IC> is a Telegram command that prints every environment variable currently visible to the bot process, along with its value. The variables are sorted alphabetically and rendered as <IC>KEY=VALUE</IC> pairs in the response.</>,
-          <><IC>/envvars</IC>는 봇 프로세스에 현재 보이는 모든 환경변수와 그 값을 출력하는 Telegram 명령입니다. 변수들은 알파벳순으로 정렬되어 <IC>KEY=VALUE</IC> 쌍으로 응답에 렌더링됩니다.</>
+          <><IC>/envvars</IC> is a chat command that prints every environment variable currently visible to the bot process, along with its value. The variables are sorted alphabetically and rendered as <IC>KEY=VALUE</IC> pairs in the response.</>,
+          <><IC>/envvars</IC>는 봇 프로세스에 현재 보이는 모든 환경변수와 그 값을 출력하는 채팅 명령입니다. 변수들은 알파벳순으로 정렬되어 <IC>KEY=VALUE</IC> 쌍으로 응답에 렌더링됩니다.</>
         )}</P>
         <CodeBlock code="/envvars" />
 

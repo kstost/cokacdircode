@@ -110,7 +110,7 @@ In other words, setting `COKACDIR_DEBUG=0` does **not** guarantee debug is off â
 
 ## `/envvars` â€” Inspect the running environment
 
-`/envvars` is a Telegram command that prints every environment variable currently visible to the bot process, along with its value. The variables are sorted alphabetically and rendered as `KEY=VALUE` pairs in the response.
+`/envvars` is a chat command that prints every environment variable currently visible to the bot process, along with its value. The variables are sorted alphabetically and rendered as `KEY=VALUE` pairs in the response.
 
 ```
 /envvars
