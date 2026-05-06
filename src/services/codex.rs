@@ -731,11 +731,35 @@ fn extract_sendfile_path(name: &str, input_json: &str) -> Option<PathBuf> {
     if name != "Bash" { return None; }
     let v: Value = serde_json::from_str(input_json).ok()?;
     let cmd = v.get("command")?.as_str()?;
-    let tokens: Vec<&str> = cmd.split_whitespace().collect();
-    let idx = tokens.iter().position(|t| *t == "--sendfile")?;
-    let raw = tokens.get(idx + 1)?;
-    let unquoted = raw.trim_matches(|c: char| c == '"' || c == '\'');
-    Some(PathBuf::from(unquoted))
+
+    // Locate `--sendfile` as a whitespace-bounded token (any whitespace,
+    // matching what `split_whitespace` accepts), then capture its argument
+    // honoring single/double quotes so paths with spaces survive —
+    // split_whitespace alone would truncate at the first inner space.
+    const TOKEN: &str = "--sendfile";
+    let mut search_start = 0;
+    while let Some(rel) = cmd[search_start..].find(TOKEN) {
+        let pos = search_start + rel;
+        let lhs_ok = pos == 0
+            || cmd[..pos].chars().last().map_or(true, char::is_whitespace);
+        let rest = &cmd[pos + TOKEN.len()..];
+        let rhs_ok = rest.chars().next().map_or(false, char::is_whitespace);
+        if lhs_ok && rhs_ok {
+            let after = rest.trim_start();
+            let mut iter = after.chars();
+            let first = iter.next()?;
+            let arg: String = if first == '"' || first == '\'' {
+                iter.take_while(|&c| c != first).collect()
+            } else {
+                std::iter::once(first)
+                    .chain(iter.take_while(|c| !c.is_whitespace()))
+                    .collect()
+            };
+            return Some(PathBuf::from(arg));
+        }
+        search_start = pos + TOKEN.len();
+    }
+    None
 }
 
 /// After a Codex turn completes, scan the session's generated-images directory

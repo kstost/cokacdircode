@@ -564,6 +564,9 @@ pub fn read_group_chat_log_tail(
         };
         for (i, line_result) in std::io::BufReader::new(&file).lines().enumerate() {
             let line_num = i + 1;
+            // Pass 1 already counted any io / parse errors on this same file
+            // (locked shared, deterministic). Re-counting here would
+            // double-report the same corrupt lines.
             let Ok(line) = line_result else { continue; };
             let Ok(entry) = serde_json::from_str::<GroupChatLogEntry>(&line) else { continue; };
             if entry.clear { continue; }
@@ -3347,7 +3350,16 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     register_token_for_redaction(token);
     let api_base_url = api_url.unwrap_or("https://api.telegram.org");
     msg_debug(&format!("[run_bot] api_url={:?}, api_base_url={}", api_url.is_some(), api_base_url));
-    let bot = Bot::new(token);
+    // The HTTP client timeout must exceed the long-polling timeout used in
+    // `polling_loop` (30s, see `bot.get_updates().timeout(30)`). teloxide's
+    // default_reqwest_settings ships a 17s timeout which closes the connection
+    // before the server-side long-poll completes, surfacing as repeated
+    // `getUpdates ... operation timed out` errors in idle periods.
+    let client = teloxide::net::default_reqwest_settings()
+        .timeout(std::time::Duration::from_secs(45))
+        .build()
+        .expect("failed to build reqwest client for Telegram bot");
+    let bot = Bot::with_client(token, client);
     let bot = if let Some(url) = api_url {
         msg_debug(&format!("[run_bot] setting custom api_url: {}", url));
         match reqwest::Url::parse(url) {

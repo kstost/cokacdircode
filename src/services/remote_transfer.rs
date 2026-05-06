@@ -254,6 +254,14 @@ fn create_askpass_script(password: &str) -> Result<PathBuf, String> {
 
     #[cfg(windows)]
     {
+        // CMD `echo` cannot safely encode every byte: a newline splits the
+        // script into a new command (injection) and `"` closes a quoted
+        // segment. Reject passwords that contain characters we cannot
+        // safely embed instead of attempting partial escaping that
+        // CMD's parser quirks would defeat.
+        if password.contains('\n') || password.contains('\r') || password.contains('"') {
+            return Err("Password contains characters (newline or double quote) that cannot be safely embedded in a Windows askpass script.".to_string());
+        }
         // Escape CMD special characters in password
         let escaped = password
             .replace('^', "^^")
