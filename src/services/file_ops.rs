@@ -267,6 +267,50 @@ pub fn copy_dir_recursive_with_progress(
     total_bytes: u64,
     total_files: usize,
 ) -> io::Result<()> {
+    let mut visited = HashSet::new();
+    copy_dir_recursive_with_progress_inner(
+        src,
+        dest,
+        cancel_flag,
+        progress_tx,
+        completed_bytes,
+        completed_files,
+        total_bytes,
+        total_files,
+        &mut visited,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn copy_dir_recursive_with_progress_inner(
+    src: &Path,
+    dest: &Path,
+    cancel_flag: &Arc<AtomicBool>,
+    progress_tx: &Sender<ProgressMessage>,
+    completed_bytes: &mut u64,
+    completed_files: &mut usize,
+    total_bytes: u64,
+    total_files: usize,
+    visited: &mut HashSet<PathBuf>,
+    depth: usize,
+) -> io::Result<()> {
+    // Guard against pathological recursion (e.g. circular symlinks).
+    if depth > MAX_COPY_DEPTH {
+        return Err(io::Error::other(
+            format!("Maximum directory depth ({}) exceeded - possible circular symlink", MAX_COPY_DEPTH),
+        ));
+    }
+
+    // Detect symlink loops via canonicalised path.
+    let canonical_src = src.canonicalize().map(strip_unc_prefix).unwrap_or_else(|_| src.to_path_buf());
+    if visited.contains(&canonical_src) {
+        return Err(io::Error::other(
+            format!("Circular symlink detected: {}", src.display()),
+        ));
+    }
+    visited.insert(canonical_src);
+
     // Check for cancellation
     if cancel_flag.load(Ordering::Relaxed) {
         return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
@@ -287,6 +331,21 @@ pub fn copy_dir_recursive_with_progress(
         let metadata = fs::symlink_metadata(&src_path)?;
 
         if metadata.is_symlink() {
+            // Reject symlinks pointing to sensitive system paths
+            #[cfg(unix)]
+            if let Ok(resolved) = src_path.canonicalize().map(strip_unc_prefix) {
+                let resolved_str = resolved.to_string_lossy();
+                if target_is_sensitive(&resolved_str) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Symlink '{}' points to sensitive system path: {}",
+                            src_path.display(),
+                            resolved_str
+                        ),
+                    ));
+                }
+            }
             // Copy symlink as-is
             #[cfg(unix)]
             {
@@ -311,7 +370,7 @@ pub fn copy_dir_recursive_with_progress(
                 total_bytes,
             ));
         } else if metadata.is_dir() {
-            copy_dir_recursive_with_progress(
+            copy_dir_recursive_with_progress_inner(
                 &src_path,
                 &dest_path,
                 cancel_flag,
@@ -320,6 +379,8 @@ pub fn copy_dir_recursive_with_progress(
                 completed_files,
                 total_bytes,
                 total_files,
+                visited,
+                depth + 1,
             )?;
         } else {
             // Regular file - copy with progress
@@ -828,17 +889,15 @@ fn copy_dir_recursive_inner(
             #[cfg(unix)]
             if let Ok(resolved) = src_path.canonicalize().map(strip_unc_prefix) {
                 let resolved_str = resolved.to_string_lossy();
-                for sensitive in SENSITIVE_PATHS {
-                    if resolved_str.starts_with(sensitive) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "Symlink '{}' points to sensitive system path: {}",
-                                src_path.display(),
-                                resolved_str
-                            ),
-                        ));
-                    }
+                if target_is_sensitive(&resolved_str) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Symlink '{}' points to sensitive system path: {}",
+                            src_path.display(),
+                            resolved_str
+                        ),
+                    ));
                 }
             }
             // Copy symlink as-is (don't follow it)
@@ -1010,22 +1069,54 @@ const SENSITIVE_PATHS: &[&str] = &[
     "C:\\Windows", "C:\\Program Files", "C:\\Program Files (x86)",
 ];
 
+/// True iff `target` equals or is contained within one of `SENSITIVE_PATHS`.
+/// Matches on path-segment boundaries, so "/etc" does not match "/etcd/foo".
+fn target_is_sensitive(target: &str) -> bool {
+    #[cfg(unix)]
+    const SEP: char = '/';
+    #[cfg(windows)]
+    const SEP: char = '\\';
+    for sensitive in SENSITIVE_PATHS {
+        if target == *sensitive {
+            return true;
+        }
+        let mut boundary = String::with_capacity(sensitive.len() + 1);
+        boundary.push_str(sensitive);
+        boundary.push(SEP);
+        if target.starts_with(&boundary) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Check symlinks in files to be archived for security
 /// Returns an error if any symlink points outside base_dir or to sensitive system paths
 pub fn check_symlinks_for_tar(base_dir: &Path, files: &[String]) -> io::Result<()> {
     use std::collections::HashSet;
+    // Compute base canonical once and fail-secure if it cannot be resolved.
+    let base_canonical = base_dir.canonicalize().map(strip_unc_prefix).map_err(|e| {
+        io::Error::other(format!(
+            "Cannot canonicalize base directory '{}': {}",
+            base_dir.display(),
+            e
+        ))
+    })?;
     let mut visited = HashSet::new();
     for file in files {
         let file_path = base_dir.join(file);
-        check_symlink_recursive(&file_path, base_dir, &mut visited)?;
+        check_symlink_recursive(&file_path, &base_canonical, &mut visited)?;
     }
     Ok(())
 }
 
-/// Recursively check symlinks in a file or directory
+/// Recursively check symlinks in a file or directory.
+/// `base_canonical` is the canonicalised archive root and is used as the
+/// containment boundary; computing it once also closes the prior fail-open
+/// behaviour where a transient base canonicalize failure bypassed all checks.
 fn check_symlink_recursive(
     path: &Path,
-    base_dir: &Path,
+    base_canonical: &Path,
     visited: &mut std::collections::HashSet<std::path::PathBuf>,
 ) -> io::Result<()> {
     // Detect symlink loops using visited set
@@ -1055,10 +1146,9 @@ fn check_symlink_recursive(
 
         // Absolute symlinks pointing outside base_dir are always rejected
         if link_target.is_absolute() {
-            // Check if it points inside base_dir
-            if let Ok(base_canonical) = base_dir.canonicalize().map(strip_unc_prefix) {
-                if let Ok(target_canonical) = link_target.canonicalize().map(strip_unc_prefix) {
-                    if !target_canonical.starts_with(&base_canonical) {
+            match link_target.canonicalize().map(strip_unc_prefix) {
+                Ok(target_canonical) => {
+                    if !target_canonical.starts_with(base_canonical) {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             format!(
@@ -1068,8 +1158,8 @@ fn check_symlink_recursive(
                             ),
                         ));
                     }
-                } else {
-                    // Can't resolve target - reject absolute symlinks to non-existent paths
+                }
+                Err(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         format!(
@@ -1087,7 +1177,7 @@ fn check_symlink_recursive(
             link_target.clone()
         } else {
             // Relative symlink - resolve from the symlink's parent directory
-            let parent = path.parent().unwrap_or(base_dir);
+            let parent = path.parent().unwrap_or(base_canonical);
             parent.join(&link_target)
         };
 
@@ -1095,33 +1185,27 @@ fn check_symlink_recursive(
         match resolved_target.canonicalize().map(strip_unc_prefix) {
             Ok(canonical) => {
                 let target_str = canonical.to_string_lossy();
-
-                // Check if symlink points outside base_dir
-                if let Ok(base_canonical) = base_dir.canonicalize().map(strip_unc_prefix) {
-                    if !canonical.starts_with(&base_canonical) {
-                        // Check against sensitive paths for better error message
-                        for sensitive in SENSITIVE_PATHS {
-                            if target_str.starts_with(sensitive) {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::PermissionDenied,
-                                    format!(
-                                        "Symlink '{}' points to sensitive system path: {}",
-                                        path.display(),
-                                        target_str
-                                    ),
-                                ));
-                            }
-                        }
-                        // Even if not a sensitive path, reject any symlink pointing outside base_dir
+                if !canonical.starts_with(base_canonical) {
+                    // Use the more specific sensitive-path message when applicable.
+                    if target_is_sensitive(&target_str) {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             format!(
-                                "Symlink '{}' points outside archive directory: {}",
+                                "Symlink '{}' points to sensitive system path: {}",
                                 path.display(),
                                 target_str
                             ),
                         ));
                     }
+                    // Otherwise reject any symlink pointing outside base_dir.
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "Symlink '{}' points outside archive directory: {}",
+                            path.display(),
+                            target_str
+                        ),
+                    ));
                 }
             }
             Err(_) => {
@@ -1138,11 +1222,15 @@ fn check_symlink_recursive(
             }
         }
     } else if metadata.is_dir() {
-        // Recursively check directory contents
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                check_symlink_recursive(&entry.path(), base_dir, visited)?;
-            }
+        // Recursively check directory contents. Fail-secure: if the directory
+        // cannot be enumerated we cannot prove its contents are safe, so error.
+        let entries = fs::read_dir(path).map_err(|e| io::Error::new(
+            e.kind(),
+            format!("Cannot read directory '{}' for symlink check: {}", path.display(), e),
+        ))?;
+        for entry in entries {
+            let entry = entry?;
+            check_symlink_recursive(&entry.path(), base_canonical, visited)?;
         }
     }
 
@@ -1217,12 +1305,19 @@ fn collect_unsafe_symlinks(
             excluded.push(relative_path.to_string());
         }
     } else if metadata.is_dir() {
-        // Recursively check directory contents
-        if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let entry_name = entry.file_name().to_string_lossy().to_string();
-                let entry_relative = format!("{}/{}", relative_path, entry_name);
-                collect_unsafe_symlinks(&entry.path(), base_dir, &entry_relative, excluded, visited);
+        // Recursively check directory contents. Fail-secure: if the directory
+        // cannot be enumerated, exclude the whole directory rather than letting
+        // its (unknown) contents into the archive.
+        match fs::read_dir(path) {
+            Ok(entries) => {
+                for entry in entries.filter_map(|e| e.ok()) {
+                    let entry_name = entry.file_name().to_string_lossy().to_string();
+                    let entry_relative = format!("{}/{}", relative_path, entry_name);
+                    collect_unsafe_symlinks(&entry.path(), base_dir, &entry_relative, excluded, visited);
+                }
+            }
+            Err(_) => {
+                excluded.push(relative_path.to_string());
             }
         }
     }

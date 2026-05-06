@@ -185,11 +185,7 @@ fn handle_read_group_chat(chat_id: i64, range_str: Option<&str>, filter_bot: Opt
     };
 
     let entries = match mode {
-        ReadMode::LastN(n) => {
-            let all = telegram::read_group_chat_log_range(chat_id, 1, None, filter_bot);
-            let start = all.len().saturating_sub(n);
-            all[start..].to_vec()
-        }
+        ReadMode::LastN(n) => telegram::read_group_chat_log_tail(chat_id, n, filter_bot),
         ReadMode::Range(start, end) => {
             telegram::read_group_chat_log_range(chat_id, start, end, filter_bot)
         }
@@ -427,6 +423,18 @@ fn handle_cron_context(args: &[String]) {
         }
     };
 
+    // `--cron-context` is invoked as a detached subprocess from
+    // `handle_cron_register`, but the binary remains externally callable —
+    // a malformed `id` from outside would compose a path-traversal segment
+    // into the eventual `dir.join(format!("{}.json", id))` write. Reject
+    // anything outside the generator format ([0-9A-F]{8}) up front. The
+    // legitimate caller always supplies a freshly generated id, so this
+    // never triggers in normal use.
+    if !telegram::is_valid_schedule_id_pub(&ctx.id) {
+        cron_debug(&format!("  ERROR: rejected malformed schedule_id: {:?}", ctx.id));
+        return;
+    }
+
     cron_debug(&format!("  id={}, session_id={}, prompt_len={}", ctx.id, ctx.session_id, ctx.prompt.len()));
 
     let extract_start = std::time::Instant::now();
@@ -531,14 +539,14 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
     let history_path = match telegram::schedule_history_path_pub(id) {
         Some(p) => p,
         None => {
-            cron_debug("[handle_cron_history] cannot determine home directory");
-            eprintln!("{}", serde_json::json!({"status":"error","message":"Cannot determine home directory"}));
+            // `schedule_history_path_pub` returns None for malformed ids
+            // (path-traversal guard) as well as a missing home dir. Either
+            // way we can't locate a history file — refuse uniformly.
+            cron_debug(&format!("[handle_cron_history] schedule_history_path_pub returned None for id={:?}", id));
+            eprintln!("{}", serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)}));
             std::process::exit(1);
         }
     };
-    if history_path.exists() {
-        telegram::redact_schedule_history_file_pub(&history_path);
-    }
 
     // Authorization check 1: live schedule entry matching (chat_id, key)
     let entries = telegram::list_schedule_entries_pub(hash_key, Some(chat_id));
@@ -546,6 +554,11 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
 
     // Authorization check 2 (fallback for already-deleted one-time schedules):
     // first record in the history file must carry the same chat_id and key verifier.
+    // We must read the file pre-redact for this check — the redact step only
+    // touches legacy `bot_key` fields and can leave `bot_key_verifier` /
+    // `chat_id` intact, so authorization works either way; running redact
+    // before auth would let an unauthorized caller trigger writes outside
+    // the schedule_history dir if they smuggled a path in via `id`.
     let mut authorized_via_history = false;
     if !entry_authorized {
         if let Ok(content) = std::fs::read_to_string(&history_path) {
@@ -563,6 +576,11 @@ fn handle_cron_history(id: &str, chat_id: i64, hash_key: &str) {
         cron_debug(&format!("[handle_cron_history] id={}, not authorized (no entry, no matching history)", id));
         eprintln!("{}", serde_json::json!({"status":"error","message":format!("schedule not found or access denied: {}", id)}));
         std::process::exit(1);
+    }
+
+    // Caller is authorized — safe to redact legacy `bot_key` fields now.
+    if history_path.exists() {
+        telegram::redact_schedule_history_file_pub(&history_path);
     }
 
     // Read history file. Missing file is valid (entry exists but never ran) → empty list.

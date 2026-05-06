@@ -40,7 +40,10 @@ export default function Settings() {
           <li>{t('Cron scheduler', '크론 스케줄러')}</li>
         </ul>
         <InfoBox type="info">
-          {t('This is a global toggle — it affects all chats.', '이것은 전역 토글입니다 — 모든 채팅에 영향을 미칩니다.')}
+          {t(
+            'The preference is stored per bot, but debug logging is process-wide while the bot server is running. If any bot in the same process has debug enabled, shared debug logs remain on.',
+            '설정값은 봇별로 저장되지만, 봇 서버가 실행 중일 때 디버그 로깅은 프로세스 전체에 적용됩니다. 같은 프로세스의 어떤 봇이라도 디버그가 켜져 있으면 공유 디버그 로그는 계속 켜져 있습니다.'
+          )}
         </InfoBox>
       </SubSection>
 
@@ -73,8 +76,8 @@ export default function Settings() {
         )}</P>
         <InfoBox type="warning">
           {t(
-            <><strong>⚠ Security warning:</strong> <IC>/envvars</IC> exposes <strong>all</strong> environment variables with no redaction — including API keys, tokens, and credentials. Chat platforms (Telegram, Discord, Slack) store message history on their servers, so anything printed by this command is persisted until you delete the messages. Use it only for diagnostics, clear the response afterward, and <strong>always use it in a 1:1 chat (DM)</strong> — never in a group chat or channel. When the owner runs <IC>/envvars</IC> in a group, the response is a normal group message that every member sees, regardless of the <IC>/public</IC> setting.</>,
-            <><strong>⚠ 보안 경고:</strong> <IC>/envvars</IC>는 API 키, 토큰, 자격 증명을 포함한 <strong>모든</strong> 환경변수를 마스킹 없이 노출합니다. 채팅 플랫폼(Telegram, Discord, Slack)은 메시지 기록을 서버에 저장하므로, 이 명령으로 출력된 내용은 메시지를 삭제할 때까지 남아 있습니다. 진단 용도로만 사용하고, 사용 후에는 응답을 삭제하며, <strong>항상 1:1 채팅(DM)에서만 사용하세요</strong> — 절대 그룹 채팅이나 채널에서는 사용하지 마세요. 소유자가 그룹에서 <IC>/envvars</IC>를 실행하면, 응답은 <IC>/public</IC> 설정과 무관하게 그룹의 모든 멤버가 보는 일반 그룹 메시지가 됩니다.</>
+            <><strong>⚠ Security warning:</strong> <IC>/envvars</IC> exposes <strong>all</strong> environment variables with no redaction — including API keys, tokens, and credentials. Chat platforms (Telegram, Discord, Slack) store message history on their servers, so anything printed by this command is persisted until you delete the messages. Use it only for diagnostics, clear the response afterward, and <strong>always use it in a 1:1 chat (DM)</strong>. Group chats are rejected for this command.</>,
+            <><strong>⚠ 보안 경고:</strong> <IC>/envvars</IC>는 API 키, 토큰, 자격 증명을 포함한 <strong>모든</strong> 환경변수를 마스킹 없이 노출합니다. 채팅 플랫폼(Telegram, Discord, Slack)은 메시지 기록을 서버에 저장하므로, 이 명령으로 출력된 내용은 메시지를 삭제할 때까지 남아 있습니다. 진단 용도로만 사용하고, 사용 후에는 응답을 삭제하며, <strong>항상 1:1 채팅(DM)에서만 사용하세요</strong>. 이 명령은 그룹 채팅에서 거부됩니다.</>
           )}
         </InfoBox>
         <P>{t(

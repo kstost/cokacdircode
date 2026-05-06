@@ -334,10 +334,15 @@ fn session_id_regex() -> &'static Regex {
     REGEX.get_or_init(|| Regex::new(r"^[a-zA-Z0-9_-]+$").expect("Invalid session ID regex pattern"))
 }
 
-/// Validate session ID format (alphanumeric, dashes, underscores only)
-/// Max length reduced to 64 characters for security
+/// Validate session ID format (alphanumeric, dashes, underscores only).
+/// Rejects a leading `-` because the value is spliced into argv and would
+/// otherwise be parsed as a CLI flag (`--config`, `-i`, …).
+/// Max length capped at 64 characters for security.
 fn is_valid_session_id(session_id: &str) -> bool {
-    !session_id.is_empty() && session_id.len() <= 64 && session_id_regex().is_match(session_id)
+    !session_id.is_empty()
+        && session_id.len() <= 64
+        && !session_id.starts_with('-')
+        && session_id_regex().is_match(session_id)
 }
 
 /// Default allowed tools for Claude CLI
@@ -1125,7 +1130,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Store child PID in cancel token so the caller can kill it externally
     if let Some(ref token) = cancel_token {
-        *token.child_pid.lock().unwrap() = Some(child.id());
+        if let Ok(mut guard) = token.child_pid.lock() {
+            *guard = Some(child.id());
+        }
         // If /stop arrived before PID was stored, kill immediately
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             kill_child_tree(&mut child);
@@ -1145,6 +1152,14 @@ IMPORTANT: Format your responses using Markdown for better readability:
     } else {
         debug_log("WARNING: Could not get stdin handle!");
     }
+
+    // Drain stderr in a background thread to prevent deadlock: if the child
+    // writes more than the OS pipe buffer (~64KB) to stderr while we're
+    // blocked reading stdout, the child's stderr write blocks and the whole
+    // pipeline hangs. Mirrors the pattern in codex.rs / gemini.rs.
+    let stderr_thread = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
+    });
 
     // Read stdout line by line for streaming
     debug_log("Taking stdout handle...");
@@ -1298,8 +1313,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
 
     // Handle stdout error or non-zero exit code
     if stdout_error.is_some() || !status.success() {
-        let stderr_msg = child.stderr.take()
-            .and_then(|s| std::io::read_to_string(s).ok())
+        // Collect stderr drained by the background thread.
+        let stderr_msg = stderr_thread
+            .and_then(|h| h.join().ok())
             .unwrap_or_default();
 
         let (message, stdout_raw) = if let Some((msg, raw)) = stdout_error {
@@ -1504,6 +1520,18 @@ mod tests {
         assert!(!is_valid_session_id("세션아이디"));
         assert!(!is_valid_session_id("session_日本語"));
         assert!(!is_valid_session_id("émoji🎉"));
+    }
+
+    #[test]
+    fn test_session_id_argparse_injection_rejected() {
+        // A leading `-` would be parsed as a CLI flag when spliced into argv.
+        assert!(!is_valid_session_id("-i"));
+        assert!(!is_valid_session_id("--help"));
+        assert!(!is_valid_session_id("--config"));
+        assert!(!is_valid_session_id("--version"));
+        assert!(!is_valid_session_id("-"));
+        // Leading underscore is fine for argparsers (kept for back-compat).
+        assert!(is_valid_session_id("_internal"));
     }
 
     // ========== ClaudeResponse tests ==========

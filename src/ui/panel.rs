@@ -389,9 +389,10 @@ fn create_file_line(
                 .and_then(|e| e.to_str())
                 .map(|e| {
                     let lower = e.to_lowercase();
-                    if lower.len() > type_width {
-                        // Truncate with ".." suffix
-                        format!("{}..", &lower[..type_width.saturating_sub(2)])
+                    if lower.chars().count() > type_width {
+                        let take_n = type_width.saturating_sub(2);
+                        let truncated: String = lower.chars().take(take_n).collect();
+                        format!("{}..", truncated)
                     } else {
                         lower
                     }

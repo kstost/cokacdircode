@@ -365,6 +365,9 @@ fn truncate_utf8_boundary(s: &str, max: usize) -> String {
 fn is_valid_session_id(s: &str) -> bool {
     if s.is_empty() || s.len() > 64 { return false; }
     if s.contains('/') || s.contains('\\') || s.contains("..") { return false; }
+    // A leading `-` would be treated as a CLI flag if this id is ever
+    // spliced into an argv list.
+    if s.starts_with('-') { return false; }
     s.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 

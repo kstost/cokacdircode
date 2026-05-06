@@ -24,6 +24,17 @@ pub struct ProcessInfo {
     pub command: String,
 }
 
+/// Validate a session ID for use as a CLI argument.
+/// Accepts only `[a-zA-Z0-9_-]{1..=64}` AND rejects a leading `-` —
+/// without that, `--config` (made up entirely of `-`/alnum) would slip
+/// through and be treated as a new flag by the downstream argument parser.
+pub fn is_valid_session_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && !s.starts_with('-')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 /// Protected PIDs that should never be killed
 const PROTECTED_PIDS: &[i32] = &[1, 2];
 
@@ -562,5 +573,34 @@ mod tests {
         assert_eq!(cloned.pid, info.pid);
         assert_eq!(cloned.user, info.user);
         assert_eq!(cloned.command, info.command);
+    }
+
+    // ========== is_valid_session_id tests ==========
+
+    #[test]
+    fn test_session_id_basic() {
+        assert!(is_valid_session_id("abc123"));
+        assert!(is_valid_session_id("a"));
+        assert!(is_valid_session_id("session-1"));
+        assert!(is_valid_session_id("session_2"));
+        assert!(!is_valid_session_id(""));
+        assert!(!is_valid_session_id(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn test_session_id_argparse_injection_rejected() {
+        assert!(!is_valid_session_id("-i"));
+        assert!(!is_valid_session_id("--help"));
+        assert!(!is_valid_session_id("--config"));
+        assert!(!is_valid_session_id("-"));
+        // A leading underscore is harmless to argparsers, keep it valid for
+        // backward-compat with any pre-existing session ids on disk.
+        assert!(is_valid_session_id("_internal"));
+    }
+
+    #[test]
+    fn test_session_id_unicode_rejected() {
+        assert!(!is_valid_session_id("세션"));
+        assert!(!is_valid_session_id("session_日本語"));
     }
 }

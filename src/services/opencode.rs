@@ -927,6 +927,15 @@ pub fn execute_command(
         prompt.len(), session_id, working_dir, model));
     opencode_debug(&format!("[execute_command] prompt_preview={:?}", log_preview(prompt, 200)));
 
+    if let Some(sid) = session_id {
+        if !crate::services::process::is_valid_session_id(sid) {
+            return ClaudeResponse {
+                success: false, response: None, session_id: None,
+                error: Some(format!("Invalid session_id format: {}", sid)),
+            };
+        }
+    }
+
     let (mut cmd, _sp_path) = build_opencode_command(
         session_id, working_dir, None, model,
     );
@@ -1196,6 +1205,11 @@ pub fn execute_command_streaming(
     model: Option<&str>,
     no_session_persistence: bool,
 ) -> Result<(), String> {
+    if let Some(sid) = session_id {
+        if !crate::services::process::is_valid_session_id(sid) {
+            return Err(format!("Invalid session_id format: {}", sid));
+        }
+    }
     let force_legacy = std::env::var("COKACDIR_OPENCODE_LEGACY")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -1296,7 +1310,9 @@ fn execute_command_streaming_legacy(
 
     // Store PID for cancel
     if let Some(ref token) = cancel_token {
-        *token.child_pid.lock().unwrap() = Some(child.id());
+        if let Ok(mut guard) = token.child_pid.lock() {
+            *guard = Some(child.id());
+        }
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             opencode_debug("[stream] cancelled before stdin write, killing");
             kill_child_tree(&mut child);
@@ -1319,6 +1335,14 @@ fn execute_command_streaming_legacy(
     } else {
         opencode_debug("[stream] WARN: no stdin handle");
     }
+
+    // Drain stderr in a background thread to prevent deadlock: if the child
+    // writes more than the OS pipe buffer (~64KB) to stderr while we're
+    // blocked reading stdout, the child's stderr write blocks and the whole
+    // pipeline hangs. Mirrors the pattern in codex.rs / gemini.rs.
+    let stderr_thread = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
+    });
 
     // Read stdout line by line
     let stdout = child.stdout.take().ok_or_else(|| {
@@ -1540,9 +1564,9 @@ fn execute_command_streaming_legacy(
         format!("Process error: {}", e)
     })?;
 
-    // Always capture stderr for diagnostics
-    let stderr_msg = child.stderr.take()
-        .and_then(|s| std::io::read_to_string(s).ok())
+    // Collect stderr drained by the background thread.
+    let stderr_msg = stderr_thread
+        .and_then(|h| h.join().ok())
         .unwrap_or_default();
     if !stderr_msg.is_empty() {
         opencode_debug(&format!("[stream] STDERR: {}", log_preview(&stderr_msg, 500)));

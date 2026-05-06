@@ -519,7 +519,7 @@ async fn route_request(state: &ProxyState, req: &HttpRequest) -> Vec<u8> {
         if parts.len() >= 4 {
             // Verify token: "bot<token>" → strip "bot" prefix
             let token = parts[2].strip_prefix("bot").unwrap_or("");
-            if token != state.expected_token {
+            if !tokens_eq_constant_time(token, &state.expected_token) {
                 return http_json_response(401, unauthorized.to_string().as_bytes());
             }
             return handle_file_download(state, parts[3]).await;
@@ -532,7 +532,7 @@ async fn route_request(state: &ProxyState, req: &HttpRequest) -> Vec<u8> {
     let (token, method) = extract_token_and_method(path);
 
     // Verify token
-    if token != state.expected_token {
+    if !tokens_eq_constant_time(token, &state.expected_token) {
         return http_json_response(401, unauthorized.to_string().as_bytes());
     }
 
@@ -1622,7 +1622,13 @@ impl MessengerBackend for DiscordBackend {
     }
 
     async fn get_file_data(&self, file_path: &str) -> Result<Vec<u8>, String> {
-        // file_path is a Discord CDN URL stored by store_file
+        // file_path is supposed to be a Discord CDN URL stored by store_file.
+        // The proxy receives `file_path` from an HTTP path component, so an
+        // attacker who can reach the bridge port could otherwise have us
+        // fetch arbitrary URLs (SSRF). Restrict to Discord CDN hosts.
+        if !is_allowed_discord_file_url(file_path) {
+            return Err(format!("Refused to fetch non-Discord URL: {}", file_path));
+        }
         let resp = reqwest::get(file_path)
             .await
             .map_err(|e| format!("Download failed: {}", e))?;
@@ -1632,6 +1638,47 @@ impl MessengerBackend for DiscordBackend {
             .map_err(|e| format!("Read failed: {}", e))?;
         Ok(bytes.to_vec())
     }
+}
+
+/// Constant-time byte comparison for authentication tokens.
+/// Always inspects every byte of both inputs so that an attacker cannot
+/// learn the prefix of the expected token from response timing.
+fn tokens_eq_constant_time(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        // Still consume one full pass over `a` to discourage length-leak via timing.
+        let mut acc: u8 = 0;
+        for &x in a {
+            acc |= x;
+        }
+        let _ = std::hint::black_box(acc);
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+fn is_allowed_discord_file_url(url: &str) -> bool {
+    // Accept only HTTPS Discord-controlled CDN hosts. Matching the host on a
+    // segment boundary prevents tricks like `https://cdn.discordapp.com.evil/`.
+    const ALLOWED_HOSTS: &[&str] = &[
+        "cdn.discordapp.com",
+        "media.discordapp.net",
+    ];
+    let rest = match url.strip_prefix("https://") {
+        Some(r) => r,
+        None => return false,
+    };
+    // The host portion ends at the first '/', '?', or '#' — without including
+    // '?' and '#' a query-only or fragment-only URL would smuggle them into
+    // the host slice and the eq comparison would fail open or false-negative.
+    let host_end = rest.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(rest.len());
+    let host = &rest[..host_end];
+    ALLOWED_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
 }
 
 /// Split text into Discord-compatible chunks (max 2000 chars each).
@@ -2847,6 +2894,13 @@ impl MessengerBackend for SlackBackend {
     }
 
     async fn get_file_data(&self, file_path: &str) -> Result<Vec<u8>, String> {
+        // The Authorization header below carries the Slack bot token.
+        // file_path arrives via an HTTP path component, so without a host
+        // check we'd happily ship the bot token to any attacker-controlled
+        // URL. Restrict to Slack-owned hosts.
+        if !is_allowed_slack_file_url(file_path) {
+            return Err(format!("Refused to fetch non-Slack URL: {}", file_path));
+        }
         let auth = format!("Bearer {}", self.bot_token);
         let resp = reqwest::Client::new()
             .get(file_path)
@@ -2863,6 +2917,20 @@ impl MessengerBackend for SlackBackend {
             .map_err(|e| format!("Slack file read: {}", e))?;
         Ok(bytes.to_vec())
     }
+}
+
+fn is_allowed_slack_file_url(url: &str) -> bool {
+    let rest = match url.strip_prefix("https://") {
+        Some(r) => r,
+        None => return false,
+    };
+    // Host ends at '/', '?', or '#' — see is_allowed_discord_file_url for why.
+    let host_end = rest.find(|c: char| c == '/' || c == '?' || c == '#').unwrap_or(rest.len());
+    let host = &rest[..host_end].to_ascii_lowercase();
+    // Slack file URLs are served from files.slack.com; allow subdomains of
+    // slack.com only on a path-segment boundary so "files.slack.com.evil"
+    // does not match.
+    host == "files.slack.com" || host == "slack.com" || host.ends_with(".slack.com")
 }
 
 /// Process a Slack push event from the Socket Mode listener.

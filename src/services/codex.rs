@@ -347,6 +347,12 @@ pub fn execute_command_streaming(
 
     // Build CLI arguments
     let mut args = if let Some(sid) = session_id {
+        // Validate before placing the value adjacent to other CLI flags;
+        // an unvalidated sid like "--config /etc/passwd" would be treated
+        // as a new flag by Codex's argument parser.
+        if !crate::services::process::is_valid_session_id(sid) {
+            return Err(format!("Invalid session_id format: {}", sid));
+        }
         codex_debug_log(&format!("Building RESUME args, session_id={}", sid));
         // codex exec resume --json --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check <session_id> -
         vec![
@@ -435,6 +441,7 @@ pub fn execute_command_streaming(
     let spawn_start = std::time::Instant::now();
     let mut child = Command::new(codex_bin)
         .args(&args)
+        .current_dir(working_dir)
         .env("PATH", crate::services::claude::enhanced_path_for_bin(codex_bin))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -448,7 +455,9 @@ pub fn execute_command_streaming(
 
     // Store child PID in cancel token
     if let Some(ref token) = cancel_token {
-        *token.child_pid.lock().unwrap() = Some(child.id());
+        if let Ok(mut guard) = token.child_pid.lock() {
+            *guard = Some(child.id());
+        }
         // If /stop arrived before PID was stored, kill immediately
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             kill_child_tree(&mut child);

@@ -423,6 +423,12 @@ impl AIScreenState {
             return false;
         }
 
+        // A leading `-` would be parsed as a CLI flag if this id is ever
+        // spliced into an argv list.
+        if session_id.starts_with('-') {
+            return false;
+        }
+
         // Only allow alphanumeric, dash, underscore
         session_id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
     }

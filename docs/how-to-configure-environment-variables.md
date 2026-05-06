@@ -119,7 +119,7 @@ In other words, setting `COKACDIR_DEBUG=0` does **not** guarantee debug is off �
 ### Access control
 
 - **Bot owner only.** Non-owners are rejected with the message `Only the bot owner can use /envvars.` This matches the other admin-only commands in cokacdir.
-- The command is available in both 1:1 and group chats, but only the owner of that specific bot can use it.
+- The command is available only in a 1:1 chat with the bot. Group chats are rejected even for the owner, to avoid accidentally posting secrets where other members can read them.
 
 ### ⚠ Security warning — `/envvars` exposes sensitive values
 
@@ -130,7 +130,7 @@ Be aware of the following before using it:
 - Telegram message history is stored on Telegram's servers. Anything you send via `/envvars` is persisted there until you delete the messages.
 - If you forward the response, screenshot it, or share your chat with anyone, the secrets are exposed.
 - If a bot's owner account is ever compromised, the attacker can run `/envvars` and harvest every secret in your environment in one command.
-- Do **not** use `/envvars` in a shared group chat. The owner-only check prevents non-owners from *invoking* the command, but when you — the owner — run it, the bot's response is a normal Telegram message sent into the group, and **every group member will see it** regardless of your `/public` setting. The `/public` toggle controls who can issue commands to the bot, not who can read the bot's output. Always use `/envvars` in a 1:1 chat with the bot.
+- Group chats are rejected for `/envvars`. Always use it in a 1:1 chat with the bot so secrets are not posted where other members can read them.
 
 Treat `/envvars` as a diagnostic tool for verifying configuration — for example, confirming that `.env.json` loaded correctly or that `COKAC_CLAUDE_PATH` is pointing where you expect — and clear the messages afterward.
 

@@ -213,8 +213,8 @@ cokacctl`} />
             <><strong>봇 소유자 전용입니다.</strong> 소유자가 아닌 경우 <IC>Only the bot owner can use /envvars.</IC> 메시지로 거부됩니다. 이것은 cokacdir의 다른 관리자 전용 명령과 동일한 방식입니다.</>
           )}</li>
           <li>{t(
-            'The command is available in both 1:1 and group chats, but only the owner of that specific bot can use it.',
-            '이 명령은 1:1 채팅과 그룹 채팅 모두에서 사용 가능하지만, 해당 특정 봇의 소유자만 사용할 수 있습니다.'
+            'The command is available only in a 1:1 chat with the bot. Group chats are rejected even for the owner, to avoid accidentally posting secrets where other members can read them.',
+            '이 명령은 봇과의 1:1 채팅에서만 사용할 수 있습니다. 다른 멤버가 볼 수 있는 곳에 비밀값을 실수로 게시하지 않도록, 소유자라도 그룹 채팅에서는 거부됩니다.'
           )}</li>
         </UL>
 
@@ -246,8 +246,8 @@ cokacctl`} />
             <>봇 소유자 계정이 탈취되면, 공격자는 <IC>/envvars</IC>를 실행하여 환경의 모든 비밀을 한 번의 명령으로 수집할 수 있습니다.</>
           )}</li>
           <li>{t(
-            <>Do <strong>not</strong> use <IC>/envvars</IC> in a shared group chat or channel. The owner-only check prevents non-owners from <em>invoking</em> the command, but when you — the owner — run it, the bot's response is a normal chat message sent into the group/channel, and <strong>every member will see it</strong> regardless of your <IC>/public</IC> setting. The <IC>/public</IC> toggle controls who can issue commands to the bot, not who can read the bot's output. Always use <IC>/envvars</IC> in a 1:1 chat (DM) with the bot.</>,
-            <>공유된 그룹 채팅이나 채널에서는 <IC>/envvars</IC>를 <strong>사용하지 마세요</strong>. 소유자 전용 검사는 소유자가 아닌 사람이 명령을 <em>호출</em>하는 것을 막지만, 당신(소유자)이 명령을 실행하면 봇의 응답은 그룹/채널에 전송되는 일반 채팅 메시지이고, <IC>/public</IC> 설정과 무관하게 <strong>모든 멤버가 그 응답을 봅니다</strong>. <IC>/public</IC> 토글은 누가 봇에게 명령을 보낼 수 있는지를 제어할 뿐, 누가 봇의 출력을 읽을 수 있는지는 제어하지 않습니다. <IC>/envvars</IC>는 항상 봇과의 1:1 채팅(DM)에서만 사용하세요.</>
+            <>Group chats are rejected for <IC>/envvars</IC>. Always use it in a 1:1 chat (DM) with the bot so secrets are not posted where other members can read them.</>,
+            <>그룹 채팅에서는 <IC>/envvars</IC>가 거부됩니다. 비밀값이 다른 멤버가 읽을 수 있는 곳에 게시되지 않도록 항상 봇과의 1:1 채팅(DM)에서만 사용하세요.</>
           )}</li>
         </UL>
         <P>{t(

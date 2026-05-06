@@ -19,6 +19,72 @@ use crate::ui::ai_screen::{self, HistoryItem, HistoryType, SessionData};
 /// Global debug log flag for Telegram API calls
 static TG_DEBUG: AtomicBool = AtomicBool::new(false);
 
+/// In-process registry of bot tokens used solely for redaction in debug logs.
+/// reqwest / teloxide errors can include the request URL on some failure
+/// kinds, and that URL embeds `bot<TOKEN>` in plaintext — without redaction
+/// the daily debug log would persist the token. Tokens are appended on
+/// `run_bot` startup; the list is only ever read for redaction.
+static TG_BOT_TOKENS: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> = std::sync::OnceLock::new();
+
+fn register_token_for_redaction(token: &str) {
+    let lock = TG_BOT_TOKENS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
+    if let Ok(mut guard) = lock.write() {
+        if !guard.iter().any(|t| t == token) {
+            guard.push(token.to_string());
+        }
+    }
+}
+
+fn redact_known_tokens(s: &str) -> String {
+    let Some(lock) = TG_BOT_TOKENS.get() else { return s.to_string() };
+    let Ok(guard) = lock.read() else { return s.to_string() };
+    if guard.is_empty() {
+        return s.to_string();
+    }
+    let mut out = s.to_string();
+    for t in guard.iter() {
+        if !t.is_empty() && out.contains(t.as_str()) {
+            out = out.replace(t.as_str(), "<bot_token_redacted>");
+        }
+    }
+    out
+}
+
+/// Render any `Display` value with registered bot tokens stripped. Use
+/// wherever a `teloxide::RequestError` / `reqwest::Error` ends up in
+/// `println!` / `eprintln!` / a user-facing Telegram message — both can
+/// include the `bot<TOKEN>` request URL in their `Display` impl.
+fn redact_err(e: &impl std::fmt::Display) -> String {
+    redact_known_tokens(&e.to_string())
+}
+
+fn any_saved_bot_debug_enabled() -> bool {
+    let Some(path) = bot_settings_path() else {
+        return false;
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    let Some(obj) = json.as_object() else {
+        return false;
+    };
+    obj.values()
+        .any(|entry| entry.get("debug").and_then(|v| v.as_bool()).unwrap_or(false))
+}
+
+fn refresh_global_debug_flags() -> bool {
+    let enabled_by_env = std::env::var("COKACDIR_DEBUG")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let enabled = enabled_by_env || any_saved_bot_debug_enabled();
+    TG_DEBUG.store(enabled, Ordering::Relaxed);
+    crate::services::claude::DEBUG_ENABLED.store(enabled, Ordering::Relaxed);
+    enabled
+}
+
 /// Log Telegram API call result to ~/.cokacdir/debug/ file
 fn tg_debug<T, E: std::fmt::Display>(name: &str, result: &Result<T, E>) {
     if !TG_DEBUG.load(Ordering::Relaxed) {
@@ -33,7 +99,10 @@ fn tg_debug<T, E: std::fmt::Display>(name: &str, result: &Result<T, E>) {
     let ts = chrono::Local::now().format("%H:%M:%S%.3f");
     let status = match result {
         Ok(_) => "✓".to_string(),
-        Err(e) => format!("✗ {e}"),
+        // Redact any bot token that may appear inside the error string before
+        // it is persisted to disk. teloxide / reqwest can include the request
+        // URL (`/bot<TOKEN>/...`) in some error kinds.
+        Err(e) => redact_known_tokens(&format!("✗ {e}")),
     };
     let line = format!("[{ts}] {name}: {status}\n");
     let _ = std::fs::OpenOptions::new()
@@ -263,16 +332,31 @@ fn group_chat_log_path(chat_id: i64) -> Option<std::path::PathBuf> {
 /// Append an entry to the group chat shared log.
 /// Uses a separate lock file for synchronization to avoid Windows LockFileEx
 /// conflicts when locking and writing on the same file handle.
+///
+/// All failure paths trace via `msg_debug` so silent log loss is at least
+/// diagnosable when /debug is enabled. Entries dropped here are not retried.
 fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
     use fs2::FileExt;
 
-    let Some(path) = group_chat_log_path(chat_id) else { return };
+    let Some(path) = group_chat_log_path(chat_id) else {
+        msg_debug(&format!("[append_group_chat_log] LOST: no log path resolvable for chat_id={}", chat_id));
+        return;
+    };
     if let Some(parent) = path.parent() {
-        if fs::create_dir_all(parent).is_err() { return; }
+        if let Err(e) = fs::create_dir_all(parent) {
+            msg_debug(&format!("[append_group_chat_log] LOST: create_dir_all({:?}) failed for chat_id={}: {}", parent, chat_id, e));
+            return;
+        }
     }
 
     // Serialize before acquiring lock to minimize lock hold time
-    let Ok(json) = serde_json::to_string(entry) else { return };
+    let json = match serde_json::to_string(entry) {
+        Ok(j) => j,
+        Err(e) => {
+            msg_debug(&format!("[append_group_chat_log] LOST: serialize failed for chat_id={}: {}", chat_id, e));
+            return;
+        }
+    };
 
     // Skip entries containing --read_chat_log to prevent recursive snowball growth:
     // each --read_chat_log result embeds the entire log, causing exponential JSONL inflation.
@@ -286,22 +370,41 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
     // Lock via a dedicated lock file (not the data file itself)
     // On Windows, LockFileEx is mandatory and can conflict with WriteFile on the same handle
     let lock_path = path.with_extension("jsonl.lock");
-    let Ok(lock_file) = fs::OpenOptions::new()
+    let lock_file = match fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(&lock_path) else { return };
-    if lock_file.lock_exclusive().is_err() { return; }
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            msg_debug(&format!("[append_group_chat_log] LOST: open lock_file({:?}) failed for chat_id={}: {}", lock_path, chat_id, e));
+            return;
+        }
+    };
+    if let Err(e) = lock_file.lock_exclusive() {
+        msg_debug(&format!("[append_group_chat_log] LOST: lock_exclusive failed for chat_id={}: {}", chat_id, e));
+        return;
+    }
 
     // Write to data file without locking it
-    if let Ok(mut data_file) = fs::OpenOptions::new()
+    match fs::OpenOptions::new()
         .create(true)
         .write(true)
         .append(true)
         .open(&path)
     {
-        use std::io::Write;
-        let _ = data_file.write_all(line.as_bytes());
-        let _ = data_file.sync_data();
+        Ok(mut data_file) => {
+            use std::io::Write;
+            if let Err(e) = data_file.write_all(line.as_bytes()) {
+                msg_debug(&format!("[append_group_chat_log] LOST: write_all failed for chat_id={} (entry len={}): {}", chat_id, line.len(), e));
+            }
+            if let Err(e) = data_file.sync_data() {
+                msg_debug(&format!("[append_group_chat_log] sync_data failed for chat_id={} (entry written but not durable): {}", chat_id, e));
+            }
+        }
+        Err(e) => {
+            msg_debug(&format!("[append_group_chat_log] LOST: open data file({:?}) failed for chat_id={}: {}", path, chat_id, e));
+        }
     }
 
     let _ = lock_file.unlock();
@@ -338,17 +441,31 @@ pub fn read_group_chat_log_range(
     let reader = std::io::BufReader::new(&file);
     use std::io::BufRead;
 
-    // First pass: collect all entries and find the last clear marker per bot
+    // First pass: collect all entries and find the last clear marker per bot.
+    // Track corrupt lines so a sudden surge in malformed entries is at least
+    // visible via /debug instead of silently disappearing.
+    let mut dropped_io: usize = 0;
+    let mut dropped_parse: usize = 0;
     let all_entries: Vec<(usize, GroupChatLogEntry)> = reader.lines()
-        .filter_map(|line| line.ok())
         .enumerate()
-        .filter_map(|(i, line)| {
+        .filter_map(|(i, line_result)| {
             let line_num = i + 1; // 1-based
-            serde_json::from_str::<GroupChatLogEntry>(&line)
-                .ok()
-                .map(|entry| (line_num, entry))
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => { dropped_io += 1; return None; }
+            };
+            match serde_json::from_str::<GroupChatLogEntry>(&line) {
+                Ok(entry) => Some((line_num, entry)),
+                Err(_) => { dropped_parse += 1; None }
+            }
         })
         .collect();
+    if dropped_io > 0 || dropped_parse > 0 {
+        msg_debug(&format!(
+            "[read_group_chat_log_range] chat_id={}: dropped {} io-error line(s), {} unparseable line(s)",
+            chat_id, dropped_io, dropped_parse
+        ));
+    }
 
     // Build a map of bot -> last clear marker line number
     let mut last_clear: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -376,6 +493,102 @@ pub fn read_group_chat_log_range(
 
     let _ = lock_file.unlock();
     entries
+}
+
+/// Tail-N variant of `read_group_chat_log_range`: returns at most `n` of the
+/// most recent entries (after applying clear-marker suppression and
+/// `filter_bot`). Streams the file in two passes with O(n + bot_count)
+/// memory instead of loading every entry — important for the system-prompt
+/// hot path where the log can grow into the MB-range while the caller only
+/// wants the last 12 entries.
+pub fn read_group_chat_log_tail(
+    chat_id: i64,
+    n: usize,
+    filter_bot: Option<&str>,
+) -> Vec<(usize, GroupChatLogEntry)> {
+    use fs2::FileExt;
+    use std::io::BufRead;
+    use std::collections::VecDeque;
+
+    if n == 0 {
+        return Vec::new();
+    }
+
+    let filter_bot_owned: Option<String> = filter_bot.map(|b| b.strip_prefix('@').unwrap_or(b).to_lowercase());
+    let filter_bot = filter_bot_owned.as_deref();
+
+    let Some(path) = group_chat_log_path(chat_id) else { return Vec::new() };
+
+    let lock_path = path.with_extension("jsonl.lock");
+    let Ok(lock_file) = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path) else { return Vec::new() };
+    if lock_file.lock_shared().is_err() { return Vec::new(); }
+
+    let mut dropped_io: usize = 0;
+    let mut dropped_parse: usize = 0;
+
+    // Pass 1: scan for clear markers (small per-bot map). We need to know
+    // every marker before deciding which entries in the tail are suppressed.
+    let mut last_clear: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    {
+        let Ok(file) = fs::File::open(&path) else {
+            let _ = lock_file.unlock();
+            return Vec::new();
+        };
+        for (i, line_result) in std::io::BufReader::new(&file).lines().enumerate() {
+            let line_num = i + 1;
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => { dropped_io += 1; continue; }
+            };
+            match serde_json::from_str::<GroupChatLogEntry>(&line) {
+                Ok(entry) => {
+                    if entry.clear {
+                        last_clear.insert(entry.bot.clone(), line_num);
+                    }
+                }
+                Err(_) => { dropped_parse += 1; }
+            }
+        }
+    }
+
+    // Pass 2: stream forward, keep a sliding window of the last `n` entries
+    // that pass the marker and bot filters.
+    let mut tail: VecDeque<(usize, GroupChatLogEntry)> = VecDeque::with_capacity(n + 1);
+    {
+        let Ok(file) = fs::File::open(&path) else {
+            let _ = lock_file.unlock();
+            return Vec::new();
+        };
+        for (i, line_result) in std::io::BufReader::new(&file).lines().enumerate() {
+            let line_num = i + 1;
+            let Ok(line) = line_result else { continue; };
+            let Ok(entry) = serde_json::from_str::<GroupChatLogEntry>(&line) else { continue; };
+            if entry.clear { continue; }
+            if let Some(&clear_line) = last_clear.get(&entry.bot) {
+                if line_num <= clear_line { continue; }
+            }
+            if let Some(b) = filter_bot {
+                if entry.bot != b { continue; }
+            }
+            tail.push_back((line_num, entry));
+            if tail.len() > n {
+                tail.pop_front();
+            }
+        }
+    }
+
+    if dropped_io > 0 || dropped_parse > 0 {
+        msg_debug(&format!(
+            "[read_group_chat_log_tail] chat_id={}: dropped {} io-error line(s), {} unparseable line(s)",
+            chat_id, dropped_io, dropped_parse
+        ));
+    }
+
+    let _ = lock_file.unlock();
+    tail.into_iter().collect()
 }
 
 /// Collect all bots that have ever appeared in a group chat log, with their
@@ -562,15 +775,22 @@ fn schedule_dir() -> Option<std::path::PathBuf> {
 }
 
 fn sched_debug(msg: &str) {
-    crate::services::claude::debug_log_to("cron.log", msg);
+    // AI provider errors that surface here can carry the bot token via
+    // teloxide / reqwest URL renderings. Redact before persisting, matching
+    // `msg_debug` and `tg_debug`.
+    crate::services::claude::debug_log_to("cron.log", &redact_known_tokens(msg));
 }
 
 fn msg_debug(msg: &str) {
-    crate::services::claude::debug_log_to("msg.log", msg);
+    // teloxide / reqwest errors can embed `bot<TOKEN>` URLs in their Display
+    // output. Redact before persisting to disk.
+    crate::services::claude::debug_log_to("msg.log", &redact_known_tokens(msg));
 }
 
 /// Always-on debug log (independent of /debug toggle).
 /// Writes to ~/.cokacdir/debug/ai_trace.log for diagnosing AI execution issues.
+/// AI provider stream errors can include URLs with the bot token; redact
+/// before persisting so this always-on log stays safe to share.
 fn ai_trace(msg: &str) {
     if let Some(home) = dirs::home_dir() {
         let debug_dir = home.join(".cokacdir").join("debug");
@@ -583,7 +803,8 @@ fn ai_trace(msg: &str) {
             .open(log_path)
         {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
-            let _ = std::io::Write::write_fmt(&mut file, format_args!("[{}] {}\n", timestamp, msg));
+            let redacted = redact_known_tokens(msg);
+            let _ = std::io::Write::write_fmt(&mut file, format_args!("[{}] {}\n", timestamp, redacted));
         }
     }
 }
@@ -873,6 +1094,16 @@ fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
 fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
     sched_debug(&format!("[write_schedule_entry] id={}, type={}, schedule={}, once={:?}, last_run={:?}",
         entry.id, entry.schedule_type, entry.schedule, entry.once, entry.last_run));
+    // Reject cron expressions the matcher can't interpret so a syntactically
+    // wrong --at value fails loudly at register/update time instead of
+    // silently never firing. `absolute` schedules carry a wall-clock
+    // timestamp, not cron syntax, so they're exempt.
+    if entry.schedule_type == "cron" {
+        if let Err(e) = validate_cron_expression(&entry.schedule) {
+            sched_debug(&format!("[write_schedule_entry] id={}, invalid cron: {}", entry.id, e));
+            return Err(e);
+        }
+    }
     let dir = schedule_dir().ok_or("Cannot determine home directory")?;
     fs::create_dir_all(&dir).map_err(|e| format!("Failed to create schedule dir: {e}"))?;
     // `bot_key_verifier` replaces the legacy plaintext `bot_key` field.
@@ -967,7 +1198,14 @@ fn schedule_history_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Public access to the schedule history file path (for `--cron-history` in main.rs).
+/// Rejects ids outside the `[0-9A-F]{8}` format generated by `--cron register`
+/// so user-controlled `id` strings can't compose path-traversal segments
+/// (e.g. `../../etc/passwd`) into the resulting path.
 pub fn schedule_history_path_pub(id: &str) -> Option<std::path::PathBuf> {
+    if !is_valid_schedule_id(id) {
+        sched_debug(&format!("[schedule_history_path_pub] rejected id={:?} (must match [0-9A-F]{{8}})", id));
+        return None;
+    }
     schedule_history_dir().map(|d| d.join(format!("{}.log", id)))
 }
 
@@ -1445,7 +1683,13 @@ fn delete_schedule_history(id: &str) {
 }
 
 /// Public wrapper for `delete_schedule_history` (used by `--cron-remove` in main.rs).
+/// Refuses ids that don't match the generator format — see
+/// `is_valid_schedule_id` for the path-traversal rationale.
 pub fn delete_schedule_history_pub(id: &str) {
+    if !is_valid_schedule_id(id) {
+        sched_debug(&format!("[delete_schedule_history_pub] rejected id={:?} (must match [0-9A-F]{{8}})", id));
+        return;
+    }
     delete_schedule_history(id);
 }
 
@@ -1517,6 +1761,127 @@ fn cron_matches(expr: &str, dt: chrono::DateTime<chrono::Local>) -> bool {
     }
     sched_debug(&format!("[cron_matches] expr={:?}, dt={} → true", expr, dt.format("%H:%M")));
     true
+}
+
+/// True iff `id` is the format produced by `--cron register` (8 uppercase
+/// hex chars). Used as a path-traversal guard wherever an `id` from outside
+/// the trust boundary is composed into a filesystem path. Internal callers
+/// that pass `id` from a disk-loaded `ScheduleEntry` are already trusted —
+/// only the public CLI surface needs this check, but the lower-level path
+/// helpers also enforce it as defense in depth.
+fn is_valid_schedule_id(id: &str) -> bool {
+    id.len() == 8 && id.bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+}
+
+/// Validate one comma-separated subexpression of a cron field. Mirrors the
+/// shape `cron_field_matches` actually accepts so we never write a schedule
+/// the matcher cannot interpret. `full_field` is included in errors to make
+/// the failure self-explanatory.
+fn validate_cron_part(part: &str, range_min: u32, range_max: u32, field_name: &str, full_field: &str) -> Result<(), String> {
+    // Step form: */n or a-b/n
+    if let Some((range_part, step_str)) = part.split_once('/') {
+        let step: u32 = step_str.parse().map_err(|_| {
+            format!("{}: invalid step '{}' in '{}'", field_name, step_str, full_field)
+        })?;
+        if step == 0 {
+            return Err(format!("{}: step must be > 0 in '{}'", field_name, full_field));
+        }
+        if range_part == "*" {
+            return Ok(());
+        }
+        if let Some((start_str, end_str)) = range_part.split_once('-') {
+            let start: u32 = start_str.parse().map_err(|_| {
+                format!("{}: invalid range start '{}' in '{}'", field_name, start_str, full_field)
+            })?;
+            let end: u32 = end_str.parse().map_err(|_| {
+                format!("{}: invalid range end '{}' in '{}'", field_name, end_str, full_field)
+            })?;
+            if start > end {
+                return Err(format!("{}: range {}-{} (start > end) in '{}'", field_name, start, end, full_field));
+            }
+            if start < range_min || end > range_max {
+                return Err(format!("{}: range {}-{} out of bounds [{},{}] in '{}'", field_name, start, end, range_min, range_max, full_field));
+            }
+            return Ok(());
+        }
+        return Err(format!("{}: step requires '*/n' or 'a-b/n' (got '{}' in '{}')", field_name, part, full_field));
+    }
+    // Range: a-b
+    if let Some((start_str, end_str)) = part.split_once('-') {
+        let start: u32 = start_str.parse().map_err(|_| {
+            format!("{}: invalid range start '{}' in '{}'", field_name, start_str, full_field)
+        })?;
+        let end: u32 = end_str.parse().map_err(|_| {
+            format!("{}: invalid range end '{}' in '{}'", field_name, end_str, full_field)
+        })?;
+        if start > end {
+            return Err(format!("{}: range {}-{} (start > end) in '{}'", field_name, start, end, full_field));
+        }
+        if start < range_min || end > range_max {
+            return Err(format!("{}: range {}-{} out of bounds [{},{}] in '{}'", field_name, start, end, range_min, range_max, full_field));
+        }
+        return Ok(());
+    }
+    // Single number
+    let n: u32 = part.parse().map_err(|_| {
+        format!(
+            "{}: unsupported value '{}' in '{}' (named values like JAN/MON, macros like @reboot, and characters L/W/? are not supported)",
+            field_name, part, full_field
+        )
+    })?;
+    if n < range_min || n > range_max {
+        // Common-case hint: many cron implementations accept day-of-week=7
+        // as Sunday alias, but our matcher uses 0..=6 (chrono
+        // `num_days_from_sunday`). Surface the convention explicitly so the
+        // user doesn't have to spelunk the source to figure out the right
+        // value.
+        let hint = if field_name == "day-of-week" && n == 7 {
+            " (Sunday is 0, not 7)"
+        } else {
+            ""
+        };
+        return Err(format!("{}: {} out of bounds [{},{}]{} in '{}'", field_name, n, range_min, range_max, hint, full_field));
+    }
+    Ok(())
+}
+
+fn validate_cron_field(field: &str, range_min: u32, range_max: u32, field_name: &str) -> Result<(), String> {
+    if field == "*" { return Ok(()); }
+    for part in field.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(format!("{}: empty part in '{}'", field_name, field));
+        }
+        validate_cron_part(part, range_min, range_max, field_name, field)?;
+    }
+    Ok(())
+}
+
+/// Validate a 5-field cron expression against the syntax actually accepted
+/// by `cron_field_matches`. Rejects field-count mismatches, named values
+/// (JAN/MON), macros (`@reboot`), and special characters (L/W/?) at write
+/// time so users see an immediate error instead of a silently dead
+/// schedule.
+fn validate_cron_expression(expr: &str) -> Result<(), String> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return Err(format!(
+            "cron expression must have exactly 5 fields (minute hour day-of-month month day-of-week), got {}",
+            fields.len()
+        ));
+    }
+    let bounds: [(u32, u32, &str); 5] = [
+        (0, 59, "minute"),
+        (0, 23, "hour"),
+        (1, 31, "day-of-month"),
+        (1, 12, "month"),
+        (0, 6, "day-of-week"),
+    ];
+    for (i, field) in fields.iter().enumerate() {
+        let (min, max, name) = bounds[i];
+        validate_cron_field(field, min, max, name)?;
+    }
+    Ok(())
 }
 
 /// Check if a single cron field matches a value.
@@ -1680,7 +2045,21 @@ pub fn list_all_schedule_ids_pub() -> std::collections::HashSet<String> {
 }
 
 pub fn delete_schedule_entry_pub(id: &str) -> bool {
+    if !is_valid_schedule_id(id) {
+        sched_debug(&format!("[delete_schedule_entry_pub] rejected id={:?} (must match [0-9A-F]{{8}})", id));
+        return false;
+    }
     delete_schedule_entry(id)
+}
+
+/// Public wrapper for `is_valid_schedule_id` so CLI handlers in `main.rs`
+/// (notably `--cron-context`, which is externally invokable as a CLI
+/// subcommand) can refuse a malformed `id` before it reaches any
+/// path-composing function. The internal `write_schedule_entry` itself
+/// stays unchecked so unit tests using non-generator ids (`sched-1`,
+/// `sched-guard`, …) keep passing.
+pub fn is_valid_schedule_id_pub(id: &str) -> bool {
+    is_valid_schedule_id(id)
 }
 
 /// Resolve the current working path for a chat from bot_settings.json
@@ -1789,10 +2168,11 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
         String::new()
     };
     let group_chat_log_section = if is_group_chat {
-        // Fetch the last N log entries to embed directly in the prompt
-        let recent_entries = read_group_chat_log_range(chat_id, 1, None, None);
-        let start = recent_entries.len().saturating_sub(context_count);
-        let recent_lines: String = recent_entries[start..].iter().map(|(_, entry)| {
+        // Fetch the last N log entries to embed directly in the prompt.
+        // Uses the tail-N variant so we don't load the whole JSONL into RAM
+        // on every AI request when the chat history grows large.
+        let recent_entries = read_group_chat_log_tail(chat_id, context_count, None);
+        let recent_lines: String = recent_entries.iter().map(|(_, entry)| {
             let bot_label = match &entry.bot_display_name {
                 Some(dn) if !dn.is_empty() => format!("{}(@{})", dn, entry.bot),
                 _ => format!("@{}", entry.bot),
@@ -1819,20 +2199,20 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
         let recent_section = if recent_lines.is_empty() {
             String::from("\n(No recent entries)")
         } else {
-            format!("\nRecent entries (last {}):\n{}", recent_entries.len() - start, recent_lines)
+            format!("\nRecent entries (last {}):\n{}", recent_entries.len(), recent_lines)
         };
 
         // Detect if another bot already answered the SAME user request
         let my_bot = bot_username.trim_start_matches('@').to_lowercase();
-        msg_debug(&format!("[dedup] my_bot={:?}, user_message={:?}, total_entries={}, window_start={}",
-            my_bot, user_message.map(|s| truncate_str(s, 80)), recent_entries.len(), start));
+        msg_debug(&format!("[dedup] my_bot={:?}, user_message={:?}, window_size={}",
+            my_bot, user_message.map(|s| truncate_str(s, 80)), recent_entries.len()));
         let other_bot_answered_same = if let Some(user_msg) = user_message {
             let user_msg_trimmed = user_msg.trim();
             msg_debug(&format!("[dedup] comparing user_msg_trimmed={:?} (len={})", truncate_str(user_msg_trimmed, 100), user_msg_trimmed.len()));
             // If the log contains a "user" entry for ANOTHER bot with the same text,
             // that bot has already finished processing (entries are written after completion).
             let mut found = false;
-            for (line_num, entry) in &recent_entries[start..] {
+            for (line_num, entry) in &recent_entries {
                 let is_user = entry.role == "user";
                 let is_other_bot = entry.bot.to_lowercase() != my_bot;
                 let text_match = is_user && is_other_bot && entry.text.trim() == user_msg_trimmed;
@@ -2637,6 +3017,11 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
     // Ensure directory exists
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
     }
     // Use file lock to prevent race condition when multiple bots save simultaneously
     let lock_path = path.with_extension("json.lock");
@@ -2680,7 +3065,17 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
     if let Ok(s) = serde_json::to_string_pretty(&json) {
         let tmp_path = path.with_extension("json.tmp");
         if fs::write(&tmp_path, &s).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+            }
             let _ = fs::rename(&tmp_path, &path);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+            }
         }
     }
     // lock released when lock_file is dropped
@@ -2807,6 +3202,52 @@ fn normalize_tool_name(name: &str) -> String {
     }
 }
 
+fn command_name(text: &str) -> Option<&str> {
+    let token = text.strip_prefix('/')?.split_whitespace().next().unwrap_or("");
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.split('@').next().unwrap_or(token))
+}
+
+/// True iff `text` is the slash command `name` — i.e. `/name`, `/name args`,
+/// `/name@bot`, or `/name@bot args`. Substring-prefix matches do NOT count
+/// (e.g., `/silentmode` is not `/silent`). Use this everywhere instead of
+/// raw `text.starts_with("/foo")` so that future commands that share a
+/// prefix with an existing one don't get silently re-routed.
+fn is_cmd(text: &str, name: &str) -> bool {
+    command_name(text).map(|n| n == name).unwrap_or(false)
+}
+
+/// Exact-match check against the owner-only command list. Compares against
+/// `command_name` (after `@bot` and arg stripping) rather than raw
+/// `starts_with` so that adding a future command like `/silentmode` does
+/// not get mis-classified as owner-only just because it shares a prefix.
+fn is_owner_only_command(text: &str) -> bool {
+    let Some(name) = command_name(text) else { return false; };
+    matches!(
+        name,
+        "start"
+            | "clear"
+            | "public"
+            | "setpollingtime"
+            | "model"
+            | "greeting"
+            | "debug"
+            | "envvars"
+            | "usechrome"
+            | "silent"
+            | "queue"
+            | "direct"
+            | "contextlevel"
+            | "instruction"
+            | "instruction_clear"
+            | "setendhook"
+            | "setendhook_clear"
+            | "allowed"
+    )
+}
+
 /// All available tools with (description, is_destructive)
 const ALL_TOOLS: &[(&str, &str, bool)] = &[
     ("Bash",            "Execute shell commands",                          true),
@@ -2844,10 +3285,66 @@ fn risk_badge(destructive: bool) -> &'static str {
     if destructive { "!!!" } else { "" }
 }
 
+/// Compute the `getUpdates` offset that confirms `last_id`.
+/// Telegram's offset parameter is `i32`. If `last_id` sits at the i32 upper
+/// bound, `last_id + 1` is not representable; we cap at `i32::MAX` and log
+/// the boundary hit so production occurrences are visible. This means the
+/// boundary update will be re-delivered until Telegram's update_id rolls
+/// past it (rare in practice).
+fn next_offset_after(last_id: u32) -> i32 {
+    if last_id >= i32::MAX as u32 {
+        msg_debug(&format!(
+            "[polling] update_id {} at i32::MAX boundary — confirmation not representable, this update may be re-delivered",
+            last_id
+        ));
+        i32::MAX
+    } else {
+        (last_id + 1) as i32
+    }
+}
+
+/// Call `getUpdates(offset, limit=1)` with retry + exponential backoff.
+/// Honors a server-mandated `RetryAfter` (429) by sleeping the requested
+/// duration instead of the linear backoff. Used during startup flush where
+/// failure must not silently leak stale updates into the polling loop.
+async fn get_updates_with_retry(
+    bot: &Bot,
+    offset: i32,
+    max_attempts: u32,
+    label: &str,
+) -> Result<Vec<teloxide::types::Update>, teloxide::RequestError> {
+    let mut last_err: Option<teloxide::RequestError> = None;
+    for attempt in 1..=max_attempts {
+        match bot.get_updates().offset(offset).limit(1).await {
+            Ok(updates) => return Ok(updates),
+            Err(e) => {
+                let backoff = match &e {
+                    teloxide::RequestError::RetryAfter(s) => s.duration(),
+                    _ => std::time::Duration::from_millis(
+                        500u64.saturating_mul(attempt as u64).min(8_000),
+                    ),
+                };
+                msg_debug(&format!(
+                    "[run_bot] {} attempt {}/{} failed (sleep {}ms): {}",
+                    label, attempt, max_attempts, backoff.as_millis(), e
+                ));
+                last_err = Some(e);
+                if attempt < max_attempts {
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        }
+    }
+    Err(last_err.expect("get_updates_with_retry: max_attempts >= 1"))
+}
+
 /// Entry point: start the Telegram bot with long polling.
 /// `api_url`: Optional API base URL override (used by messenger bridge proxy).
 ///            When None, connects to the real Telegram API.
 pub async fn run_bot(token: &str, api_url: Option<&str>) {
+    // Register before any debug logging so a startup failure log still gets
+    // its token redacted.
+    register_token_for_redaction(token);
     let api_base_url = api_url.unwrap_or("https://api.telegram.org");
     msg_debug(&format!("[run_bot] api_url={:?}, api_base_url={}", api_url.is_some(), api_base_url));
     let bot = Bot::new(token);
@@ -2877,7 +3374,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         }
         Err(e) => {
             msg_debug(&format!("[run_bot] get_me failed: {}", e));
-            println!("  ⚠ Failed to get bot info: {e}");
+            println!("  ⚠ Failed to get bot info: {}", redact_err(&e));
             (String::new(), String::new())
         }
     };
@@ -2892,11 +3389,8 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         msg_debug("[run_bot] bot_username is empty, skipping save");
     }
 
-    // Restore debug flag from saved settings
-    if bot_settings.debug {
-        TG_DEBUG.store(true, Ordering::Relaxed);
-        crate::services::claude::DEBUG_ENABLED.store(true, Ordering::Relaxed);
-    }
+    // Restore process-wide debug flag from env or any saved bot setting.
+    refresh_global_debug_flags();
 
     // Register bot commands for autocomplete
     let commands = vec![
@@ -2929,7 +3423,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         teloxide::types::BotCommand::new("setendhook_clear", "Clear end hook message"),
     ];
     if let Err(e) = tg!("set_my_commands", bot.set_my_commands(commands).await) {
-        println!("  ⚠ Failed to set bot commands: {e}");
+        println!("  ⚠ Failed to set bot commands: {}", redact_err(&e));
     }
 
     match bot_settings.owner_user_id {
@@ -3003,37 +3497,30 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
 
     // Flush all pending updates so we don't process messages that arrived while
     // the bot was offline.
-    // Step 1: getUpdates(offset=-1) discards all but the last pending update.
-    // Step 2: getUpdates(offset=last_id+1) confirms the last one too.
-    match bot.get_updates().offset(-1).limit(1).await {
+    // Step 1: getUpdates(offset=-1) returns the last pending update id.
+    // Step 2: getUpdates(offset=last_id+1) confirms it so the polling loop
+    //         won't receive it.
+    // Both steps retry with backoff and honor `RetryAfter`. Either step
+    // failing exhausting all retries is fatal — proceeding without a
+    // successful flush would silently process stale messages, which the
+    // documented contract above forbids.
+    const FLUSH_MAX_ATTEMPTS: u32 = 5;
+    match get_updates_with_retry(&bot, -1, FLUSH_MAX_ATTEMPTS, "flush step 1").await {
         Ok(updates) => {
             if let Some(last) = updates.last() {
-                let next_offset = last.id.0.saturating_add(1).min(i32::MAX as u32) as i32;
+                let next_offset = next_offset_after(last.id.0);
                 msg_debug(&format!("[run_bot] flush step 1: got last update_id={}, confirming with offset={}",
                     last.id.0, next_offset));
-                // Confirm the last update so teloxide::repl won't receive it.
-                // Retry until confirmed — must not let the last message leak through.
-                let mut confirmed = false;
-                for attempt in 1..=5 {
-                    match bot.get_updates().offset(next_offset).limit(0).await {
-                        Ok(_) => {
-                            msg_debug(&format!("[run_bot] flush step 2: confirmed offset={} (attempt {})", next_offset, attempt));
-                            confirmed = true;
-                            break;
-                        }
-                        Err(e) => {
-                            msg_debug(&format!("[run_bot] flush step 2 failed (attempt {}): {}", attempt, e));
-                            if attempt < 5 {
-                                tokio::time::sleep(tokio::time::Duration::from_millis(500 * attempt as u64)).await;
-                            }
-                        }
+                match get_updates_with_retry(&bot, next_offset, FLUSH_MAX_ATTEMPTS, "flush step 2").await {
+                    Ok(_) => {
+                        msg_debug(&format!("[run_bot] flush step 2: confirmed offset={}", next_offset));
+                        println!("  ✓ Flushed pending updates (up to id={})", last.id.0);
                     }
-                }
-                if confirmed {
-                    println!("  ✓ Flushed pending updates (up to id={})", last.id.0);
-                } else {
-                    eprintln!("  ✗ FATAL: failed to confirm pending updates after 5 attempts — aborting to prevent processing stale messages");
-                    std::process::exit(1);
+                    Err(e) => {
+                        eprintln!("  ✗ FATAL: failed to confirm pending updates after {} attempts: {}", FLUSH_MAX_ATTEMPTS, redact_err(&e));
+                        eprintln!("    Aborting to prevent processing stale messages.");
+                        std::process::exit(1);
+                    }
                 }
             } else {
                 msg_debug("[run_bot] flush: no pending updates");
@@ -3041,8 +3528,9 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
             }
         }
         Err(e) => {
-            msg_debug(&format!("[run_bot] failed to flush pending updates: {}", e));
-            println!("  ⚠ Failed to flush pending updates: {}", e);
+            eprintln!("  ✗ FATAL: failed to fetch pending updates after {} attempts: {}", FLUSH_MAX_ATTEMPTS, redact_err(&e));
+            eprintln!("    Cannot safely start polling without flushing — aborting.");
+            std::process::exit(1);
         }
     }
 
@@ -3124,7 +3612,7 @@ async fn polling_loop(bot: Bot, state: SharedState, token: String, bot_username:
                 if let Some(last) = updates.last() {
                     // Match the conversion in the flush logic above so we
                     // stay compatible with teloxide's UpdateId type.
-                    offset = last.id.0.saturating_add(1).min(i32::MAX as u32) as i32;
+                    offset = next_offset_after(last.id.0);
                 }
                 if updates.is_empty() {
                     continue;
@@ -3147,6 +3635,12 @@ async fn polling_loop(bot: Bot, state: SharedState, token: String, bot_username:
 /// ≥2 go to `handle_album_batch` for atomic processing; singletons (no
 /// media_group_id, or 1-photo album fragments from a split batch) fall
 /// through to the existing `handle_message` path.
+///
+/// Within a single chat, units are processed strictly in arrival order: a
+/// per-chat task awaits each unit before starting the next, so two messages
+/// arriving in the same batch from the same chat cannot race for
+/// `state.lock()`. Different chats still run in parallel — each chat gets
+/// its own spawned task.
 async fn process_batch(
     bot: &Bot,
     updates: Vec<Update>,
@@ -3154,16 +3648,14 @@ async fn process_batch(
     token: &str,
     bot_username: &str,
 ) {
-    // Insertion-ordered list of dispatch units. We resolve each unit only
-    // after grouping, so an album that spans interleaved updates still
-    // appears at the position of its first photo.
+    // Insertion-ordered list of dispatch units. An album spanning interleaved
+    // updates appears at the position of its first photo.
     enum Unit {
         Single(Message),
-        Album(usize), // index into `albums`
+        Album(Vec<Message>),
     }
     let mut units: Vec<Unit> = Vec::new();
-    let mut albums: Vec<Vec<Message>> = Vec::new();
-    let mut album_index: HashMap<(ChatId, String), usize> = HashMap::new();
+    let mut album_pos: HashMap<(ChatId, String), usize> = HashMap::new();
 
     for upd in updates {
         let UpdateKind::Message(msg) = upd.kind else {
@@ -3175,13 +3667,16 @@ async fn process_batch(
         let chat_id = msg.chat.id;
         if let Some(gid) = msg.media_group_id() {
             let key = (chat_id, gid.to_string());
-            match album_index.get(&key) {
-                Some(&idx) => albums[idx].push(msg),
+            match album_pos.get(&key) {
+                Some(&idx) => {
+                    if let Unit::Album(ref mut msgs) = units[idx] {
+                        msgs.push(msg);
+                    }
+                }
                 None => {
-                    let idx = albums.len();
-                    albums.push(vec![msg]);
-                    album_index.insert(key, idx);
-                    units.push(Unit::Album(idx));
+                    let idx = units.len();
+                    album_pos.insert(key, idx);
+                    units.push(Unit::Album(vec![msg]));
                 }
             }
         } else {
@@ -3189,53 +3684,65 @@ async fn process_batch(
         }
     }
 
+    // Group units by chat_id so each chat's units can be processed serially
+    // by a single spawned task. Insertion order across chats doesn't matter
+    // (chats run independently); order within each chat must be preserved.
+    let mut chat_order: Vec<ChatId> = Vec::new();
+    let mut by_chat: HashMap<ChatId, Vec<Unit>> = HashMap::new();
     for unit in units {
-        match unit {
-            Unit::Single(msg) => {
-                let bot_c = bot.clone();
-                let state_c = state.clone();
-                let token_c = token.to_string();
-                let username_c = bot_username.to_string();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_message(bot_c, msg, state_c, &token_c, &username_c).await {
-                        msg_debug(&format!("[process_batch] handle_message error: {}", e));
-                    }
-                });
-            }
-            Unit::Album(idx) => {
-                let msgs = std::mem::take(&mut albums[idx]);
-                if msgs.len() < 2 {
-                    // 1-photo "album" — the message has a `media_group_id`
-                    // but no sibling within this batch. Process it through
-                    // the regular single-message path; if it's a fragment
-                    // of a larger album that got split across batches it
-                    // will be saved as an orphan upload and picked up by
-                    // the next text message.
-                    if let Some(msg) = msgs.into_iter().next() {
-                        let bot_c = bot.clone();
-                        let state_c = state.clone();
-                        let token_c = token.to_string();
-                        let username_c = bot_username.to_string();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_message(bot_c, msg, state_c, &token_c, &username_c).await {
-                                msg_debug(&format!("[process_batch] handle_message(album-fragment) error: {}", e));
-                            }
-                        });
-                    }
-                } else {
-                    msg_debug(&format!("[process_batch] atomic album: {} photo(s) in one batch", msgs.len()));
-                    let bot_c = bot.clone();
-                    let state_c = state.clone();
-                    let token_c = token.to_string();
-                    let username_c = bot_username.to_string();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_album_batch(bot_c, msgs, state_c, &token_c, &username_c).await {
-                            msg_debug(&format!("[process_batch] handle_album_batch error: {}", e));
+        let cid = match &unit {
+            Unit::Single(m) => m.chat.id,
+            // Album is built with `vec![msg]` and only ever appended to, so
+            // it is never empty here.
+            Unit::Album(msgs) => msgs[0].chat.id,
+        };
+        if !by_chat.contains_key(&cid) {
+            chat_order.push(cid);
+        }
+        by_chat.entry(cid).or_default().push(unit);
+    }
+
+    for cid in chat_order {
+        let chat_units = match by_chat.remove(&cid) {
+            Some(u) => u,
+            None => continue,
+        };
+        let bot_c = bot.clone();
+        let state_c = state.clone();
+        let token_c = token.to_string();
+        let username_c = bot_username.to_string();
+        tokio::spawn(async move {
+            for unit in chat_units {
+                match unit {
+                    Unit::Single(msg) => {
+                        if let Err(e) = handle_message(bot_c.clone(), msg, state_c.clone(), &token_c, &username_c).await {
+                            msg_debug(&format!("[process_batch] handle_message error: {}", e));
                         }
-                    });
+                    }
+                    Unit::Album(msgs) => {
+                        if msgs.len() < 2 {
+                            // 1-photo "album" — the message has a
+                            // `media_group_id` but no sibling within this
+                            // batch. Process via the regular single-message
+                            // path; if it's a fragment of a larger album
+                            // split across batches it will be saved as an
+                            // orphan upload and picked up by the next text
+                            // message.
+                            if let Some(msg) = msgs.into_iter().next() {
+                                if let Err(e) = handle_message(bot_c.clone(), msg, state_c.clone(), &token_c, &username_c).await {
+                                    msg_debug(&format!("[process_batch] handle_message(album-fragment) error: {}", e));
+                                }
+                            }
+                        } else {
+                            msg_debug(&format!("[process_batch] atomic album: {} photo(s) in one batch", msgs.len()));
+                            if let Err(e) = handle_album_batch(bot_c.clone(), msgs, state_c.clone(), &token_c, &username_c).await {
+                                msg_debug(&format!("[process_batch] handle_album_batch error: {}", e));
+                            }
+                        }
+                    }
                 }
             }
-        }
+        });
     }
 }
 
@@ -3904,9 +4411,14 @@ async fn handle_message(
             let args_part = &raw_text[space_pos..];
             if let Some(at_pos) = cmd_part.find('@') {
                 let mentioned = &cmd_part[at_pos + 1..];
-                let is_self = mentioned.to_lowercase() == bot_username;
+                // When bot_username is empty (get_me failed at startup) we
+                // can't tell whether `@x` is us or another bot. Treat any
+                // explicit `@suffix` on a command as "not for us" so we
+                // don't silently steal commands intended for siblings in a
+                // multi-bot setup.
+                let is_self = has_bot_username && mentioned.to_lowercase() == bot_username;
                 msg_debug(&format!("[cmd_routing] slash+args: cmd={:?}, mentioned={:?}, is_self={}, bot_username={:?}", cmd_part, mentioned, is_self, bot_username));
-                if has_bot_username && !is_self {
+                if !is_self {
                     msg_debug(&format!("[cmd_routing] IGNORED: command {:?} is for @{}, not for @{}", cmd_part, mentioned, bot_username));
                     return Ok(());
                 }
@@ -3921,9 +4433,11 @@ async fn handle_message(
             // "/cmd@bot" (no args) → "/cmd"
             if let Some(at_pos) = raw_text.find('@') {
                 let mentioned = &raw_text[at_pos + 1..];
-                let is_self = mentioned.to_lowercase() == bot_username;
+                // See note above: unknown bot_username + explicit @suffix
+                // → treat as not-for-us.
+                let is_self = has_bot_username && mentioned.to_lowercase() == bot_username;
                 msg_debug(&format!("[cmd_routing] slash-only: cmd={:?}, mentioned={:?}, is_self={}, bot_username={:?}", raw_text, mentioned, is_self, bot_username));
-                if has_bot_username && !is_self {
+                if !is_self {
                     msg_debug(&format!("[cmd_routing] IGNORED: command {:?} is for @{}, not for @{}", raw_text, mentioned, bot_username));
                     return Ok(());
                 }
@@ -3941,8 +4455,9 @@ async fn handle_message(
     };
     let preview = &text;
 
-    // Auto-restore session from bot_settings.json if not in memory
-    if !text.starts_with("/start") {
+    // Auto-restore session from bot_settings.json if not in memory.
+    // /start owns its own session setup, so skip auto-restore there.
+    if !is_cmd(&text, "start") {
         auto_restore_session(&state, chat_id, &user_name).await;
     }
 
@@ -3951,22 +4466,28 @@ async fn handle_message(
     msg_debug(&format!("[prefix_filter] text={:?}, require_prefix={}, has_valid_prefix={}, direct_mode={}", truncate_str(&text, 100), require_prefix, has_valid_prefix, !require_prefix));
     if require_prefix && !has_valid_prefix {
         msg_debug(&format!("[prefix_filter] IGNORED: require_prefix=true (direct mode OFF), no valid prefix in text={:?}", truncate_str(&text, 80)));
-        // Clear pending uploads — this message was not for this bot,
-        // so any previously shared location/file data should be discarded.
-        let mut data = state.lock().await;
-        if let Some(session) = data.sessions.get_mut(&chat_id) {
-            if !session.pending_uploads.is_empty() {
-                msg_debug(&format!("[handle_message] clearing {} pending_uploads (not addressed to this bot)", session.pending_uploads.len()));
-                session.pending_uploads.clear();
-            }
-        }
+        // Don't touch `pending_uploads` here. A previous `;`-prefixed photo
+        // upload (addressed to all bots) may be waiting for the next text
+        // message; wiping it because of an unrelated message to a sibling
+        // bot would silently lose the user's data. Uploads are consumed
+        // when an addressed message actually arrives.
+        return Ok(());
+    }
+
+    if is_group_chat && !is_owner && is_owner_only_command(&text) {
+        msg_debug(&format!("[handle_message] owner-only command rejected: text={:?}", truncate_str(&text, 80)));
+        shared_rate_limit_wait(&state, chat_id).await;
+        tg!("send_message", bot.send_message(chat_id, "Only the bot owner can use this command.").await)?;
         return Ok(());
     }
 
     // Block all messages except /stop, /stopall, /queue while an AI request is in progress
-    if !text.starts_with("/stop") && !text.starts_with("/queue") {
+    let cmd_for_busy = command_name(&text);
+    let is_busy_bypass = matches!(cmd_for_busy, Some("stop" | "stopall" | "queue"))
+        || cmd_for_busy.map_or(false, |c| c.starts_with("stop_"));
+    if !is_busy_bypass {
         // Determine the actual user text to queue (strip command prefix, pure string ops)
-        let queue_text = if text.starts_with("/query") {
+        let queue_text = if is_cmd(&text, "query") {
             // /query command → queue the body
             text.strip_prefix("/query")
                 .and_then(|s| {
@@ -4086,11 +4607,13 @@ async fn handle_message(
         }
     }
 
-    if text.starts_with("/stopall") {
+    let cmd_name_opt = command_name(&text);
+    let is_stop_id_form = cmd_name_opt.map_or(false, |c| c.starts_with("stop_"));
+    if is_cmd(&text, "stopall") {
         msg_debug(&format!("[handle_message] routing → /stopall"));
         println!("  [{timestamp}] ◀ [{user_name}] /stopall");
         handle_stopall_command(&bot, chat_id, &state).await?;
-    } else if text.starts_with("/stop") {
+    } else if is_cmd(&text, "stop") || is_stop_id_form {
         // Check if /stop has a valid queue ID argument (exactly 7 hex chars, e.g. "/stop A394FDA")
         let stop_queue_id = text.strip_prefix("/stop")
             .and_then(|s| {
@@ -4117,36 +4640,36 @@ async fn handle_message(
             println!("  [{timestamp}] ◀ [{user_name}] /stop");
             handle_stop_command(&bot, chat_id, &state).await?;
         }
-    } else if text.starts_with("/help") {
+    } else if is_cmd(&text, "help") {
         msg_debug(&format!("[handle_message] routing → /help"));
         println!("  [{timestamp}] ◀ [{user_name}] /help");
         handle_help_command(&bot, chat_id, &state).await?;
-    } else if text.starts_with("/start") {
+    } else if is_cmd(&text, "start") {
         msg_debug(&format!("[handle_message] routing → /start"));
         println!("  [{timestamp}] ◀ [{user_name}] /start");
         handle_start_command(&bot, chat_id, &text, &state, token).await?;
-    } else if text.starts_with("/clear") {
+    } else if is_cmd(&text, "clear") {
         msg_debug(&format!("[handle_message] routing → /clear"));
         println!("  [{timestamp}] ◀ [{user_name}] /clear");
         handle_clear_command(&bot, chat_id, &state).await?;
         println!("  [{timestamp}] ▶ [{user_name}] Session cleared");
-    } else if text.starts_with("/pwd") {
+    } else if is_cmd(&text, "pwd") {
         msg_debug(&format!("[handle_message] routing → /pwd"));
         println!("  [{timestamp}] ◀ [{user_name}] /pwd");
         handle_pwd_command(&bot, chat_id, &state).await?;
-    } else if text.starts_with("/session") {
+    } else if is_cmd(&text, "session") {
         msg_debug(&format!("[handle_message] routing → /session"));
         println!("  [{timestamp}] ◀ [{user_name}] /session");
         handle_session_command(&bot, chat_id, &state).await?;
-    } else if text.starts_with("/down") {
+    } else if is_cmd(&text, "down") {
         msg_debug(&format!("[handle_message] routing → /down"));
         println!("  [{timestamp}] ◀ [{user_name}] /down {}", text.strip_prefix("/down").unwrap_or("").trim());
         handle_down_command(&bot, chat_id, &text, &state).await?;
-    } else if text.starts_with("/public") {
+    } else if is_cmd(&text, "public") {
         msg_debug("[handle_message] routing → /public");
         println!("  [{timestamp}] ◀ [{user_name}] /public {}", text.strip_prefix("/public").unwrap_or("").trim());
         handle_public_command(&bot, chat_id, &text, &state, token, is_group_chat, is_owner).await?;
-    } else if text.starts_with("/availabletools") {
+    } else if is_cmd(&text, "availabletools") {
         msg_debug("[handle_message] routing → /availabletools");
         println!("  [{timestamp}] ◀ [{user_name}] /availabletools");
         { let _m = get_model(&state.lock().await.settings, chat_id);
@@ -4155,7 +4678,7 @@ async fn handle_message(
         } else {
             handle_availabletools_command(&bot, chat_id, &state).await?;
         } }
-    } else if text.starts_with("/allowedtools") {
+    } else if is_cmd(&text, "allowedtools") {
         msg_debug("[handle_message] routing → /allowedtools");
         println!("  [{timestamp}] ◀ [{user_name}] /allowedtools");
         { let _m = get_model(&state.lock().await.settings, chat_id);
@@ -4164,53 +4687,56 @@ async fn handle_message(
         } else {
             handle_allowedtools_command(&bot, chat_id, &state).await?;
         } }
-    } else if text.starts_with("/setpollingtime") {
+    } else if is_cmd(&text, "setpollingtime") {
         msg_debug("[handle_message] routing → /setpollingtime");
         println!("  [{timestamp}] ◀ [{user_name}] /setpollingtime {}", text.strip_prefix("/setpollingtime").unwrap_or("").trim());
         handle_setpollingtime_command(&bot, chat_id, &text, &state).await?;
-    } else if text.starts_with("/model") {
+    } else if is_cmd(&text, "model") {
         msg_debug("[handle_message] routing → /model");
         println!("  [{timestamp}] ◀ [{user_name}] /model {}", text.strip_prefix("/model").unwrap_or("").trim());
         handle_model_command(&bot, chat_id, &text, &state, token).await?;
-    } else if text.starts_with("/greeting") {
+    } else if is_cmd(&text, "greeting") {
         msg_debug("[handle_message] routing → /greeting");
         println!("  [{timestamp}] ◀ [{user_name}] /greeting");
         handle_greeting_command(&bot, chat_id, &state, token).await?;
-    } else if text.starts_with("/debug") {
+    } else if is_cmd(&text, "debug") {
         msg_debug("[handle_message] routing → /debug");
         println!("  [{timestamp}] ◀ [{user_name}] /debug");
         handle_debug_command(&bot, chat_id, &state, token).await?;
-    } else if text.starts_with("/envvars") {
+    } else if is_cmd(&text, "envvars") {
         msg_debug("[handle_message] routing → /envvars");
         println!("  [{timestamp}] ◀ [{user_name}] /envvars");
-        if !is_owner {
-            msg_debug("[handle_message] /envvars rejected: not owner");
+        // Non-owner-in-group is already blocked by the `is_owner_only_command`
+        // gate above; non-owner-in-1:1 is rejected during the imprinting
+        // check earlier in this function. So only owners reach this point.
+        if is_group_chat {
+            msg_debug("[handle_message] /envvars rejected: group chat");
             shared_rate_limit_wait(&state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "Only the bot owner can use /envvars.").await)?;
+            tg!("send_message", bot.send_message(chat_id, "/envvars is only available in a 1:1 chat with the bot.").await)?;
         } else {
             handle_envvars_command(&bot, chat_id, &state).await?;
         }
-    } else if text.starts_with("/usechrome") {
+    } else if is_cmd(&text, "usechrome") {
         msg_debug("[handle_message] routing → /usechrome");
         println!("  [{timestamp}] ◀ [{user_name}] /usechrome");
         handle_usechrome_command(&bot, chat_id, &state, token).await?;
-    } else if text.starts_with("/silent") {
+    } else if is_cmd(&text, "silent") {
         msg_debug("[handle_message] routing → /silent");
         println!("  [{timestamp}] ◀ [{user_name}] /silent");
         handle_silent_command(&bot, chat_id, &state, token).await?;
-    } else if text.starts_with("/queue") {
+    } else if is_cmd(&text, "queue") {
         msg_debug("[handle_message] routing → /queue");
         println!("  [{timestamp}] ◀ [{user_name}] /queue");
         handle_queue_command(&bot, chat_id, &state, token).await?;
-    } else if text.starts_with("/direct") {
+    } else if is_cmd(&text, "direct") {
         msg_debug("[handle_message] routing → /direct");
         println!("  [{timestamp}] ◀ [{user_name}] /direct");
         handle_direct_command(&bot, chat_id, &msg, &state, token, is_owner).await?;
-    } else if text.starts_with("/contextlevel") {
+    } else if is_cmd(&text, "contextlevel") {
         msg_debug("[handle_message] routing → /contextlevel");
         println!("  [{timestamp}] ◀ [{user_name}] /contextlevel {}", text.strip_prefix("/contextlevel").unwrap_or("").trim());
         handle_contextlevel_command(&bot, chat_id, &text, &state, token, is_group_chat).await?;
-    } else if text.starts_with("/query") {
+    } else if is_cmd(&text, "query") {
         let body = text.strip_prefix("/query").unwrap_or("").trim();
         if body.is_empty() {
             msg_debug("[handle_message] /query with empty body, ignoring");
@@ -4221,7 +4747,7 @@ async fn handle_message(
             println!("  [{timestamp}] ◀ [{user_name}] {body}");
             handle_text_message(&bot, chat_id, body, &state, &user_name, false).await?;
         }
-    } else if text.starts_with("/loop") {
+    } else if is_cmd(&text, "loop") {
         // Strip /loop prefix and handle @botname suffix (e.g. /loop@botname request)
         let body = text.strip_prefix("/loop").unwrap_or("");
         let body = if body.starts_with('@') {
@@ -4288,23 +4814,23 @@ async fn handle_message(
                 handle_text_message(&bot, chat_id, request, &state, &user_name, false).await?;
             }
         }
-    } else if text.starts_with("/setendhook_clear") {
+    } else if is_cmd(&text, "setendhook_clear") {
         msg_debug("[handle_message] routing → /setendhook_clear");
         println!("  [{timestamp}] ◀ [{user_name}] /setendhook_clear");
         handle_setendhook_clear_command(&bot, chat_id, &state, token).await?;
-    } else if text.starts_with("/setendhook") {
+    } else if is_cmd(&text, "setendhook") {
         msg_debug("[handle_message] routing → /setendhook");
         println!("  [{timestamp}] ◀ [{user_name}] /setendhook");
         handle_setendhook_command(&bot, chat_id, &text, &state, token).await?;
-    } else if text.starts_with("/instruction_clear") {
+    } else if is_cmd(&text, "instruction_clear") {
         msg_debug("[handle_message] routing → /instruction_clear");
         println!("  [{timestamp}] ◀ [{user_name}] /instruction_clear");
         handle_instruction_clear_command(&bot, chat_id, &state, token).await?;
-    } else if text.starts_with("/instruction") {
+    } else if is_cmd(&text, "instruction") {
         msg_debug("[handle_message] routing → /instruction");
         println!("  [{timestamp}] ◀ [{user_name}] /instruction");
         handle_instruction_command(&bot, chat_id, &text, &state, token).await?;
-    } else if text.starts_with("/allowed") {
+    } else if is_cmd(&text, "allowed") {
         msg_debug("[handle_message] routing → /allowed");
         println!("  [{timestamp}] ◀ [{user_name}] /allowed {}", text.strip_prefix("/allowed").unwrap_or("").trim());
         { let _m = get_model(&state.lock().await.settings, chat_id);
@@ -6516,20 +7042,28 @@ async fn handle_file_upload(
         let data = state.lock().await;
         data.api_base_url.clone()
     };
-    let url = format!("{}/file/bot{}/{}", base, bot.token(), file.path);
+    let token = bot.token().to_string();
+    let url = format!("{}/file/bot{}/{}", base, token, file.path);
     msg_debug(&format!("[handle_upload] download url: api_base={}, file_path={}", base, file.path));
+    // Strip the bot token from any error string before showing it to the chat.
+    // reqwest's Display impl can include the request URL on some error kinds
+    // (redirect, parse, …), and the URL embeds `bot<TOKEN>` in plaintext.
+    let scrub = |e: reqwest::Error| -> String {
+        let s = e.to_string();
+        s.replace(&token, "<bot_token_redacted>")
+    };
     let buf = match reqwest::get(&url).await {
         Ok(resp) => match resp.bytes().await {
             Ok(bytes) => bytes,
             Err(e) => {
                 shared_rate_limit_wait(state, chat_id).await;
-                tg!("send_message", bot.send_message(chat_id, &format!("Download failed: {}", e)).await)?;
+                tg!("send_message", bot.send_message(chat_id, &format!("Download failed: {}", scrub(e))).await)?;
                 return Ok(());
             }
         },
         Err(e) => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, &format!("Download failed: {}", e)).await)?;
+            tg!("send_message", bot.send_message(chat_id, &format!("Download failed: {}", scrub(e))).await)?;
             return Ok(());
         }
     };
@@ -7227,19 +7761,26 @@ async fn handle_debug_command(
     state: &SharedState,
     token: &str,
 ) -> ResponseResult<()> {
-    let prev = TG_DEBUG.load(Ordering::Relaxed);
+    let prev = {
+        let data = state.lock().await;
+        data.settings.debug
+    };
     let next = !prev;
     msg_debug(&format!("[handle_debug] chat_id={}, {} → {}", chat_id.0, prev, next));
-    TG_DEBUG.store(next, Ordering::Relaxed);
-    crate::services::claude::DEBUG_ENABLED.store(next, Ordering::Relaxed);
     {
         let mut data = state.lock().await;
         data.settings.debug = next;
         save_bot_settings(token, &data.settings);
     }
+    let global_enabled = refresh_global_debug_flags();
     let status = if next { "ON" } else { "OFF" };
+    let note = if !next && global_enabled {
+        "\nShared debug logging is still ON because another bot or COKACDIR_DEBUG=1 enables it."
+    } else {
+        ""
+    };
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, format!("🔍 Debug logging: {status}"))
+    tg!("send_message", bot.send_message(chat_id, format!("🔍 Debug logging: {status}{note}"))
         .await)?;
     Ok(())
 }
@@ -8702,7 +9243,7 @@ async fn handle_text_message(
                                 }
                                 Err(e) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}]   ⚠ new placeholder failed: {e}");
+                                    println!("  [{ts}]   ⚠ new placeholder failed: {}", redact_err(&e));
                                     msg_debug(&format!("[rolling_ph] NEW placeholder FAILED: keeping msg_id={}, err={}", placeholder_msg_id, e));
                                 }
                             }
@@ -8721,7 +9262,7 @@ async fn handle_text_message(
                                 .parse_mode(ParseMode::Html).await)
                             {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
-                                println!("  [{ts}]   ⚠ edit_message failed (streaming): {e}");
+                                println!("  [{ts}]   ⚠ edit_message failed (streaming): {}", redact_err(&e));
                             }
                             last_edit_text = display_text;
                         } else {
@@ -8781,7 +9322,7 @@ async fn handle_text_message(
                             .parse_mode(ParseMode::Html).await)
                         {
                             let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!("  [{ts}]   ⚠ edit_message failed (final HTML): {e}");
+                            println!("  [{ts}]   ⚠ edit_message failed (final HTML): {}", redact_err(&e));
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &normalized_remaining).await);
                         }
@@ -9218,7 +9759,7 @@ async fn handle_text_message(
                         .parse_mode(ParseMode::Html).await)
                     {
                         let ts_err = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts_err}]   ⚠ edit_message failed (stopped HTML): {e}");
+                        println!("  [{ts_err}]   ⚠ edit_message failed (stopped HTML): {}", redact_err(&e));
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &display_stopped).await);
                     }
@@ -9641,7 +10182,7 @@ async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -
             }
             Err(e) => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}]   ⚠ Upload failed: {e}");
+                println!("  [{ts}]   ⚠ Upload failed: {}", redact_err(&e));
             }
         }
         return true;
@@ -10416,15 +10957,29 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
                 sched_debug(&format!("[should_trigger] id={}, not yet (now < schedule_dt) → false", entry.id));
                 return false;
             }
-            // Already ran?
+            // Already ran? An unparseable / timezone-ambiguous `last_run`
+            // is treated as "already ran" defensively — silently re-firing
+            // a one-shot absolute schedule because of a corrupted timestamp
+            // is far worse than not firing at all (the user will notice and
+            // fix). Corrupted/legacy entries thus stay dormant.
             if let Some(ref last) = entry.last_run {
-                if let Ok(last_dt) = chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
-                    if let Some(last_local) = last_dt.and_local_timezone(chrono::Local).single() {
-                        if last_local >= schedule_dt {
-                            sched_debug(&format!("[should_trigger] id={}, already ran (last={} >= sched={}) → false",
-                                entry.id, last_local.format("%H:%M:%S"), schedule_dt.format("%H:%M:%S")));
+                match chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
+                    Ok(last_dt) => match last_dt.and_local_timezone(chrono::Local).single() {
+                        Some(last_local) => {
+                            if last_local >= schedule_dt {
+                                sched_debug(&format!("[should_trigger] id={}, already ran (last={} >= sched={}) → false",
+                                    entry.id, last_local.format("%H:%M:%S"), schedule_dt.format("%H:%M:%S")));
+                                return false;
+                            }
+                        }
+                        None => {
+                            sched_debug(&format!("[should_trigger] id={}, last_run timezone-ambiguous {:?} → defensively false", entry.id, last));
                             return false;
                         }
+                    },
+                    Err(e) => {
+                        sched_debug(&format!("[should_trigger] id={}, last_run parse failed {:?}: {} → defensively false", entry.id, last, e));
+                        return false;
                     }
                 }
             }
@@ -10436,16 +10991,31 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
                 sched_debug(&format!("[should_trigger] id={}, cron not matching → false", entry.id));
                 return false;
             }
-            // Check last_run to avoid duplicate triggers within the same minute
+            // Check last_run to avoid duplicate triggers within the same
+            // minute. An unparseable / timezone-ambiguous `last_run` is
+            // treated as "ran this minute" defensively so a corrupted
+            // timestamp can't cause repeated firing on every 5s scheduler
+            // tick. The schedule stays dormant until the next legitimate
+            // write rewrites `last_run`.
             if let Some(ref last) = entry.last_run {
-                if let Ok(last_dt) = chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
-                    if let Some(last_local) = last_dt.and_local_timezone(chrono::Local).single() {
-                        let now_min = now.format("%Y-%m-%d %H:%M").to_string();
-                        let last_min = last_local.format("%Y-%m-%d %H:%M").to_string();
-                        if now_min == last_min {
-                            sched_debug(&format!("[should_trigger] id={}, already ran this minute ({}) → false", entry.id, now_min));
+                match chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
+                    Ok(last_dt) => match last_dt.and_local_timezone(chrono::Local).single() {
+                        Some(last_local) => {
+                            let now_min = now.format("%Y-%m-%d %H:%M").to_string();
+                            let last_min = last_local.format("%Y-%m-%d %H:%M").to_string();
+                            if now_min == last_min {
+                                sched_debug(&format!("[should_trigger] id={}, already ran this minute ({}) → false", entry.id, now_min));
+                                return false;
+                            }
+                        }
+                        None => {
+                            sched_debug(&format!("[should_trigger] id={}, last_run timezone-ambiguous {:?} → defensively false", entry.id, last));
                             return false;
                         }
+                    },
+                    Err(e) => {
+                        sched_debug(&format!("[should_trigger] id={}, last_run parse failed {:?}: {} → defensively false", entry.id, last, e));
+                        return false;
                     }
                 }
             }
@@ -10619,7 +11189,7 @@ async fn execute_schedule(
         Ok(msg) => msg,
         Err(e) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ⚠ [Schedule] Failed to send placeholder: {e}");
+            println!("  [{ts}] ⚠ [Schedule] Failed to send placeholder: {}", redact_err(&e));
             // Clean up pending + cancel_token, restore session (workspace preserved)
             {
                 let mut data = state.lock().await;
@@ -11036,7 +11606,7 @@ async fn execute_schedule(
                             }
                             Err(e) => {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
-                                println!("  [{ts}]   ⚠ new placeholder failed (schedule): {e}");
+                                println!("  [{ts}]   ⚠ new placeholder failed (schedule): {}", redact_err(&e));
                                 msg_debug(&format!("[rolling_ph/sched] NEW placeholder FAILED: keeping msg_id={}, err={}", placeholder_msg_id, e));
                             }
                         }
@@ -11864,7 +12434,7 @@ async fn process_bot_message(
                                 Ok(new_ph) => { placeholder_msg_id = new_ph.id; }
                                 Err(e) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}]   ⚠ new placeholder failed (botmsg): {e}");
+                                    println!("  [{ts}]   ⚠ new placeholder failed (botmsg): {}", redact_err(&e));
                                 }
                             }
                             last_edit_text.clear();

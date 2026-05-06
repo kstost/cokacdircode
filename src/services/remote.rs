@@ -10,6 +10,64 @@ use russh_sftp::client::SftpSession as RusshSftpSession;
 // Obfuscation key for password storage (NOT real encryption — prevents casual viewing only)
 const OBFUSCATION_KEY: &[u8] = b"cokacdir_remote_v1_key";
 
+/// Expand a leading "~/" or bare "~" to the user's home directory.
+/// `~user/...` is intentionally NOT expanded — we cannot safely resolve another
+/// user's home, and silently rewriting it to `$HOME/user/...` produces a wrong
+/// path that the SSH layer would still try to read.
+pub(crate) fn expand_tilde(path: &str) -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// RAII guard that removes a partially-written file on drop unless `commit()`
+/// is called. Used to ensure failed/cancelled downloads do not leave truncated
+/// files behind for the user to mistake for a successful transfer.
+///
+/// The guard owns the open file handle so that on Drop the handle is released
+/// *before* the unlink — Windows refuses to remove a file that still has an
+/// open handle (sharing violation), which would otherwise leave the partial
+/// file behind even though we asked the guard to clean it up.
+struct PartialFileGuard {
+    path: String,
+    file: Option<std::fs::File>,
+    keep: bool,
+}
+
+impl PartialFileGuard {
+    fn create(path: String) -> std::io::Result<Self> {
+        let file = std::fs::File::create(&path)?;
+        Ok(Self { path, file: Some(file), keep: false })
+    }
+
+    fn writer(&mut self) -> &mut std::fs::File {
+        self.file.as_mut().expect("PartialFileGuard file handle already taken")
+    }
+
+    fn commit(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for PartialFileGuard {
+    fn drop(&mut self) {
+        // Release the file handle BEFORE attempting to unlink. On Windows an
+        // open file cannot be removed; on Unix this is harmless.
+        drop(self.file.take());
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Obfuscate a string for storage (XOR + base64, prefixed with "enc:")
 pub fn obfuscate(plaintext: &str) -> String {
     let xored: Vec<u8> = plaintext.as_bytes().iter()
@@ -210,15 +268,7 @@ impl SftpSession {
                     .map_err(|e| format!("Password auth failed: {}", e))?
             }
             RemoteAuth::KeyFile { path, passphrase } => {
-                let key_path = if path.starts_with('~') {
-                    if let Some(home) = dirs::home_dir() {
-                        home.join(path.trim_start_matches('~').trim_start_matches(['/', '\\']))
-                    } else {
-                        std::path::PathBuf::from(path)
-                    }
-                } else {
-                    std::path::PathBuf::from(path)
-                };
+                let key_path = expand_tilde(path);
 
                 let key_pair = if let Some(pass) = passphrase {
                     russh_keys::load_secret_key(&key_path, Some(pass))
@@ -404,7 +454,7 @@ impl SftpSession {
                 .await
                 .map_err(|e| format!("Failed to open '{}': {}", remote_path, e))?;
 
-            let mut local_file = std::fs::File::create(&local_path)
+            let mut guard = PartialFileGuard::create(local_path.clone())
                 .map_err(|e| format!("Failed to create '{}': {}", local_path, e))?;
 
             let mut buf = vec![0u8; 64 * 1024];
@@ -414,10 +464,11 @@ impl SftpSession {
                     .await
                     .map_err(|e| format!("Failed to read '{}': {}", remote_path, e))?;
                 if n == 0 { break; }
-                std::io::Write::write_all(&mut local_file, &buf[..n])
+                std::io::Write::write_all(guard.writer(), &buf[..n])
                     .map_err(|e| format!("Failed to write '{}': {}", local_path, e))?;
                 total += n as u64;
             }
+            guard.commit();
             Ok(total)
         })
     }
@@ -445,27 +496,28 @@ impl SftpSession {
                 .await
                 .map_err(|e| format!("Failed to open '{}': {}", remote_path, e))?;
 
-            let mut local_file = std::fs::File::create(&local_path)
+            // Guard owns the file handle; any early return (cancel / read-err
+            // / write-err) drops the partial file. Successful path calls
+            // commit() at the end.
+            let mut guard = PartialFileGuard::create(local_path.clone())
                 .map_err(|e| format!("Failed to create '{}': {}", local_path, e))?;
 
             let mut buf = vec![0u8; 64 * 1024];
             let mut total = 0u64;
             loop {
                 if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    // 취소 시 임시 파일 삭제
-                    drop(local_file);
-                    let _ = std::fs::remove_file(&local_path);
                     return Err("Cancelled".to_string());
                 }
                 let n = remote_file.read(&mut buf)
                     .await
                     .map_err(|e| format!("Failed to read '{}': {}", remote_path, e))?;
                 if n == 0 { break; }
-                std::io::Write::write_all(&mut local_file, &buf[..n])
+                std::io::Write::write_all(guard.writer(), &buf[..n])
                     .map_err(|e| format!("Failed to write '{}': {}", local_path, e))?;
                 total += n as u64;
                 on_progress(total, file_size);
             }
+            guard.commit();
             Ok(total)
         })
     }

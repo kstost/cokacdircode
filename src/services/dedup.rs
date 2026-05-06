@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufReader, Read};
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -9,6 +9,37 @@ use std::sync::Arc;
 use md5::{Digest, Md5};
 
 const READ_BUF_SIZE: usize = 64 * 1024; // 64KB
+
+/// Byte-level equality check; guards against MD5 collisions before destructive deletion.
+///
+/// Uses `read_exact` over equal-sized chunks rather than two independent
+/// `read` calls — `Read::read` is allowed to short-read, and the previous
+/// implementation could compare two slices of unequal length and falsely
+/// report identical files as different.
+fn files_byte_equal(a: &Path, b: &Path) -> io::Result<bool> {
+    let fa = File::open(a)?;
+    let fb = File::open(b)?;
+    let len_a = fa.metadata()?.len();
+    let len_b = fb.metadata()?.len();
+    if len_a != len_b {
+        return Ok(false);
+    }
+    let mut ra = BufReader::with_capacity(READ_BUF_SIZE, fa);
+    let mut rb = BufReader::with_capacity(READ_BUF_SIZE, fb);
+    let mut buf_a = [0u8; READ_BUF_SIZE];
+    let mut buf_b = [0u8; READ_BUF_SIZE];
+    let mut remaining = len_a;
+    while remaining > 0 {
+        let chunk = std::cmp::min(remaining, READ_BUF_SIZE as u64) as usize;
+        ra.read_exact(&mut buf_a[..chunk])?;
+        rb.read_exact(&mut buf_b[..chunk])?;
+        if buf_a[..chunk] != buf_b[..chunk] {
+            return Ok(false);
+        }
+        remaining -= chunk as u64;
+    }
+    Ok(true)
+}
 
 // Marker files: if any of these exist INSIDE a directory, skip that entire directory
 // (matches removeduplicated.js lines 47-50)
@@ -267,6 +298,7 @@ pub fn run_dedup(
 
     for (_hash, paths) in &dup_groups {
         // Keep first file, delete the rest
+        let keep_path = &paths[0];
         for dup_path in paths.iter().skip(1) {
             if cancel_flag.load(Ordering::Relaxed) {
                 let _ = tx.send(DedupMessage::Log(format!(
@@ -276,6 +308,25 @@ pub fn run_dedup(
                 let _ = tx.send(DedupMessage::Stats { scanned, duplicates: deleted_count, freed: freed_bytes });
                 let _ = tx.send(DedupMessage::Complete);
                 return;
+            }
+
+            // Verify byte-level equality before destructive deletion (guard against MD5 collision)
+            match files_byte_equal(keep_path, dup_path) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = tx.send(DedupMessage::Log(format!(
+                        "SKIP (hash collision; contents differ): {}",
+                        dup_path.display()
+                    )));
+                    continue;
+                }
+                Err(e) => {
+                    let _ = tx.send(DedupMessage::Error(format!(
+                        "Failed to verify {} vs {}: {}",
+                        keep_path.display(), dup_path.display(), e
+                    )));
+                    continue;
+                }
             }
 
             let file_size = fs::metadata(dup_path).map(|m| m.len()).unwrap_or(0);

@@ -342,6 +342,16 @@ pub fn execute_command(
         prompt.len(), session_id, working_dir, model));
     gemini_debug(&format!("[execute_command] prompt_preview={:?}", log_preview(prompt, 200)));
 
+    // Reject malformed session ids before they are placed adjacent to other CLI flags.
+    if let Some(sid) = session_id {
+        if !crate::services::process::is_valid_session_id(sid) {
+            return ClaudeResponse {
+                success: false, response: None, session_id: None,
+                error: Some(format!("Invalid session_id format: {}", sid)),
+            };
+        }
+    }
+
     let (mut cmd, sp_path) = build_bridge_command(
         prompt, session_id, working_dir, None, allowed_tools, model,
         "json", false, false,
@@ -471,6 +481,11 @@ pub fn execute_command_streaming(
     gemini_debug("=== gemini execute_command_streaming START ===");
     gemini_debug(&format!("[stream] prompt_len={} session_id={:?} working_dir={} model={:?}",
         prompt.len(), session_id, working_dir, model));
+    if let Some(sid) = session_id {
+        if !crate::services::process::is_valid_session_id(sid) {
+            return Err(format!("Invalid session_id format: {}", sid));
+        }
+    }
     gemini_debug(&format!("[stream] system_prompt_len={} cancel_token={} no_session_persistence={}",
         system_prompt.map_or(0, |s| s.len()), cancel_token.is_some(), no_session_persistence));
     gemini_debug(&format!("[stream] prompt_preview={:?}", log_preview(prompt, 200)));
@@ -541,7 +556,9 @@ pub fn execute_command_streaming(
 
     // Store PID for cancel
     if let Some(ref token) = cancel_token {
-        *token.child_pid.lock().unwrap() = Some(child.id());
+        if let Ok(mut guard) = token.child_pid.lock() {
+            *guard = Some(child.id());
+        }
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             gemini_debug("[stream] cancelled before stdin write, killing");
             kill_child_tree(&mut child);
@@ -561,6 +578,14 @@ pub fn execute_command_streaming(
     } else {
         gemini_debug("[stream] WARN: no stdin handle");
     }
+
+    // Drain stderr in a background thread to prevent deadlock: if the child
+    // writes more than the OS pipe buffer (~64KB) to stderr while we're
+    // blocked reading stdout, the child's stderr write blocks and the whole
+    // pipeline hangs. Mirrors the pattern in codex.rs.
+    let stderr_thread = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || std::io::read_to_string(stderr).unwrap_or_default())
+    });
 
     // Read stdout line by line — output is already Claude-compatible
     let stdout = child.stdout.take().ok_or_else(|| {
@@ -768,9 +793,9 @@ pub fn execute_command_streaming(
         format!("Process error: {}", e)
     })?;
 
-    // Always capture stderr for diagnostics
-    let stderr_msg = child.stderr.take()
-        .and_then(|s| std::io::read_to_string(s).ok())
+    // Collect stderr drained by the background thread.
+    let stderr_msg = stderr_thread
+        .and_then(|h| h.join().ok())
         .unwrap_or_default();
     if !stderr_msg.is_empty() {
         gemini_debug(&format!("[stream] STDERR: {}", log_preview(&stderr_msg, 500)));

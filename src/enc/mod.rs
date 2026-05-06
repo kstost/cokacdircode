@@ -628,7 +628,10 @@ fn unpack_file_group(
     #[cfg(unix)]
     if permissions != 0 {
         use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(permissions));
+        // Mask out setuid/setgid/sticky bits to prevent privilege-escalation
+        // when decrypting a maliciously crafted .cokacenc file.
+        let safe_mode = permissions & 0o0777;
+        let _ = fs::set_permissions(&out_path, fs::Permissions::from_mode(safe_mode));
     }
 
     // Restore mtime

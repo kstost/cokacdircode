@@ -8,7 +8,7 @@ use tokio::runtime::Runtime;
 use russh::{client, ChannelMsg, Disconnect};
 
 use crate::services::file_ops::ProgressMessage;
-use crate::services::remote::{RemoteAuth, RemoteProfile, SshHandler};
+use crate::services::remote::{expand_tilde, RemoteAuth, RemoteProfile, SshHandler};
 
 /// Transfer direction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,15 +80,7 @@ impl SshExec {
                         .map_err(|e| format!("Password auth failed: {}", e))?
                 }
                 RemoteAuth::KeyFile { path, passphrase } => {
-                    let key_path = if path.starts_with('~') {
-                        if let Some(home) = dirs::home_dir() {
-                            home.join(path.trim_start_matches('~').trim_start_matches(['/', '\\']))
-                        } else {
-                            PathBuf::from(path)
-                        }
-                    } else {
-                        PathBuf::from(path)
-                    };
+                    let key_path = expand_tilde(path);
 
                     let key_pair = if let Some(pass) = passphrase {
                         russh_keys::load_secret_key(&key_path, Some(pass))
@@ -184,17 +176,7 @@ fn build_ssh_option(profile: &RemoteProfile) -> String {
 
     // Key file
     if let RemoteAuth::KeyFile { ref path, .. } = profile.auth {
-        let expanded = if path.starts_with('~') {
-            if let Some(home) = dirs::home_dir() {
-                home.join(path.trim_start_matches('~').trim_start_matches(['/', '\\']))
-                    .display()
-                    .to_string()
-            } else {
-                path.clone()
-            }
-        } else {
-            path.clone()
-        };
+        let expanded = expand_tilde(path).display().to_string();
         ssh_cmd.push_str(&format!(" -i '{}'", expanded));
     }
 
@@ -216,8 +198,31 @@ fn build_remote_spec(profile: &RemoteProfile, path: &str) -> String {
     format!("{}@{}:'{}'", profile.user, profile.host, escaped)
 }
 
+/// RAII guard for the temporary SSH_ASKPASS script: removes the file on drop
+/// so the password leak window survives panics and early returns.
+struct AskpassGuard {
+    path: PathBuf,
+}
+
+impl AskpassGuard {
+    fn new(password: &str) -> Result<Self, String> {
+        Ok(Self { path: create_askpass_script(password)? })
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for AskpassGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Create a temporary SSH_ASKPASS script for password authentication.
-/// Returns the script path. Caller must clean up with cleanup_askpass_script().
+/// Prefer `AskpassGuard::new` over calling this directly; the guard ensures
+/// the script is removed even on panic / early return.
 fn create_askpass_script(password: &str) -> Result<PathBuf, String> {
     let home = dirs::home_dir()
         .ok_or_else(|| "Failed to get home directory".to_string())?;
@@ -225,10 +230,13 @@ fn create_askpass_script(password: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| format!("Failed to create tmp dir: {}", e))?;
 
+    // Random suffix prevents collision when the same process spawns multiple
+    // transfers concurrently (single-PID file would race).
+    let nonce: u32 = rand::random();
     #[cfg(unix)]
-    let script_path = tmp_dir.join(format!("askpass_{}", std::process::id()));
+    let script_path = tmp_dir.join(format!("askpass_{}_{:08x}", std::process::id(), nonce));
     #[cfg(windows)]
-    let script_path = tmp_dir.join(format!("askpass_{}.bat", std::process::id()));
+    let script_path = tmp_dir.join(format!("askpass_{}_{:08x}.bat", std::process::id(), nonce));
 
     #[cfg(unix)]
     {
@@ -263,11 +271,6 @@ fn create_askpass_script(password: &str) -> Result<PathBuf, String> {
     Ok(script_path)
 }
 
-/// Remove the temporary askpass script
-fn cleanup_askpass_script(path: &PathBuf) {
-    let _ = std::fs::remove_file(path);
-}
-
 /// Transfer files using rsync with progress reporting.
 /// Uses --progress flag (compatible with GNU rsync and openrsync/macOS).
 /// For password auth: tries sshpass first, falls back to SSH_ASKPASS mechanism.
@@ -283,9 +286,9 @@ fn transfer_rsync(
     // Prepare password auth mechanism
     let needs_password = matches!(&config.profile.auth, RemoteAuth::Password { .. });
     let use_sshpass = needs_password && has_sshpass();
-    let askpass_script = if needs_password && !use_sshpass {
+    let askpass_script: Option<AskpassGuard> = if needs_password && !use_sshpass {
         if let RemoteAuth::Password { ref password } = config.profile.auth {
-            Some(create_askpass_script(password)?)
+            Some(AskpassGuard::new(password)?)
         } else {
             None
         }
@@ -295,7 +298,6 @@ fn transfer_rsync(
 
     for source_file in &config.source_files {
         if cancel_flag.load(Ordering::Relaxed) {
-            if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
             return Ok(());
         }
 
@@ -341,8 +343,8 @@ fn transfer_rsync(
             } else {
                 cmd
             }
-        } else if let Some(ref script_path) = askpass_script {
-            cmd.env("SSH_ASKPASS", script_path)
+        } else if let Some(ref guard) = askpass_script {
+            cmd.env("SSH_ASKPASS", guard.path())
                 .env("SSH_ASKPASS_REQUIRE", "force")
                 .env("DISPLAY", ":0")
                 .stdin(Stdio::null());
@@ -351,10 +353,7 @@ fn transfer_rsync(
             cmd
         };
 
-        let mut child = cmd.spawn().map_err(|e| {
-            if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
-            format!("Failed to start rsync: {}", e)
-        })?;
+        let mut child = cmd.spawn().map_err(|e| format!("Failed to start rsync: {}", e))?;
 
         // Parse rsync progress output.
         // rsync --progress uses \r (carriage return) to update progress in-place,
@@ -367,7 +366,6 @@ fn transfer_rsync(
                 if cancel_flag.load(Ordering::Relaxed) {
                     crate::services::claude::kill_child_tree(&mut child);
                     let _ = child.wait();
-                    if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
                     return Ok(());
                 }
 
@@ -399,10 +397,7 @@ fn transfer_rsync(
             }
         }
 
-        let status = child.wait().map_err(|e| {
-            if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
-            format!("rsync wait failed: {}", e)
-        })?;
+        let status = child.wait().map_err(|e| format!("rsync wait failed: {}", e))?;
 
         if status.success() {
             completed_files += 1;
@@ -417,13 +412,9 @@ fn transfer_rsync(
                 format!("rsync exited with code {}", status.code().unwrap_or(-1))
             };
             let _ = tx.send(ProgressMessage::Error(file_name, stderr_msg.clone()));
-            if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
             return Err(stderr_msg);
         }
     }
-
-    // Cleanup
-    if let Some(ref path) = askpass_script { cleanup_askpass_script(path); }
 
     Ok(())
 }
