@@ -3288,6 +3288,242 @@ fn risk_badge(destructive: bool) -> &'static str {
     if destructive { "!!!" } else { "" }
 }
 
+/// One unit of work dispatched into a chat's serial worker. Module-level
+/// (not local to `process_batch`) so the same type can flow through the
+/// per-chat mpsc channel.
+enum DispatchUnit {
+    Single(Message),
+    Album(Vec<Message>),
+}
+
+/// Per-chat serial worker registry. Each chat has at most one
+/// long-lived worker task that consumes a FIFO mpsc; this guarantees
+/// strict-arrival-order processing **across** `getUpdates` batches, not
+/// just within one batch. Different chats keep running in parallel.
+type ChatWorkers = Arc<Mutex<HashMap<ChatId, tokio::sync::mpsc::UnboundedSender<DispatchUnit>>>>;
+
+fn new_chat_workers() -> ChatWorkers {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Result of `polling_loop`. `Fatal` means the loop must NOT be restarted
+/// by the outer reconnect wrapper — restarting would just re-trigger the
+/// same condition (e.g. another instance polling, or a revoked token).
+enum PollingExit {
+    Fatal(String),
+}
+
+/// Classify a `getUpdates` error as a non-recoverable misconfiguration we
+/// must surface to the user instead of silently retrying. Returns `Some`
+/// with a human-readable label only for cases where retrying cannot help.
+///
+/// We inspect the full `RequestError` `Display` (not just the inner
+/// `ApiError`) so the check works regardless of whether teloxide reports
+/// the failure as `Api(Unauthorized)`, `Api(Unknown("Unauthorized"))`, or
+/// (in some versions) wraps it in `Network(...)`.
+///
+/// Anchoring on the exact Telegram description prefixes — `Conflict: `
+/// and `Unauthorized` at a word boundary — avoids false positives on
+/// generic strings like "merge conflict" or sentences containing
+/// "unauthorized" mid-message. False-positive here is severe (it would
+/// stop a healthy bot), so we err on the side of precision; a missed
+/// classification merely degrades to the prior infinite-retry behaviour.
+fn detect_fatal_polling_error(e: &teloxide::RequestError) -> Option<&'static str> {
+    let display = e.to_string();
+
+    // 409: Telegram returns description literally `Conflict: terminated by
+    // other getUpdates request` (or similar `Conflict: <reason>`). The
+    // colon+space anchor keeps unrelated uses of the word out.
+    if display.contains("Conflict: ") {
+        return Some("CONFLICT: another bot instance is using this token");
+    }
+
+    // 401: typed `ApiError::Unauthorized` renders as `... Unauthorized` at
+    // the end of the Display string; `ApiError::Unknown("Unauthorized")`
+    // and the rare `Unauthorized: <reason>` form also surface here.
+    // Trailing-anchor and `: ` anchor avoid matches like
+    // `... user is unauthorized to ...` mid-message.
+    if display.ends_with("Unauthorized") || display.contains("Unauthorized: ") {
+        return Some("UNAUTHORIZED: bot token is invalid or has been revoked");
+    }
+
+    None
+}
+
+/// Get-or-create the FIFO sender for `cid`. The worker task is spawned on
+/// first use and lives until the sender is dropped (workers map cleared on
+/// shutdown). Sender is cheap to clone (Arc inside).
+async fn ensure_chat_worker(
+    workers: &ChatWorkers,
+    cid: ChatId,
+    bot: &Bot,
+    state: &SharedState,
+    token: &str,
+    bot_username: &str,
+) -> tokio::sync::mpsc::UnboundedSender<DispatchUnit> {
+    let mut guard = workers.lock().await;
+    if let Some(tx) = guard.get(&cid) {
+        return tx.clone();
+    }
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let bot_owned = bot.clone();
+    let state_owned = state.clone();
+    let token_owned = token.to_string();
+    let username_owned = bot_username.to_string();
+    tokio::spawn(run_chat_worker(rx, bot_owned, state_owned, token_owned, username_owned, cid));
+    guard.insert(cid, tx.clone());
+    tx
+}
+
+/// Long-lived per-chat worker: pulls units from the FIFO and runs each
+/// handler to completion before pulling the next. Handlers are run inside
+/// a child `tokio::spawn` so a panic kills only that one unit — the worker
+/// observes it via `JoinError` and continues.
+async fn run_chat_worker(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<DispatchUnit>,
+    bot: Bot,
+    state: SharedState,
+    token: String,
+    bot_username: String,
+    cid: ChatId,
+) {
+    while let Some(unit) = rx.recv().await {
+        let bot_c = bot.clone();
+        let state_c = state.clone();
+        let token_c = token.clone();
+        let username_c = bot_username.clone();
+        let join = tokio::spawn(async move {
+            process_unit(unit, bot_c, state_c, &token_c, &username_c).await
+        });
+        match join.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => msg_debug(&format!(
+                "[chat_worker {}] handler error: {}", cid.0, e
+            )),
+            Err(join_err) => {
+                let panic_str = redact_known_tokens(&join_err.to_string());
+                msg_debug(&format!(
+                    "[chat_worker {}] handler PANICKED: {}", cid.0, panic_str
+                ));
+                eprintln!(
+                    "  ⚠ Chat {} handler panicked: {} — recovering",
+                    cid.0, panic_str
+                );
+                // Recover the busy-slot lock held by the panicked task.
+                // `/stop` and `/stopall` only set `cancelled=true` — they do
+                // NOT remove the entry from `cancel_tokens`, deferring the
+                // actual removal to the task's normal cleanup path. When
+                // the task panics that cleanup never runs, leaving the
+                // slot held forever and the chat permanently "busy".
+                //
+                // Reclaim only when `Arc::strong_count == 1` — i.e. the
+                // map's entry is the **only** live reference to this
+                // `CancelToken`. Every still-running owner of this slot
+                // (the handler itself before unwind, a fire-and-forget
+                // child it spawned with a clone, a scheduler-side
+                // `execute_schedule` / `process_bot_message`, or any
+                // foreign task that inserted before this dispatch) holds
+                // an extra `Arc` clone in its stack — `strong_count`
+                // therefore observes ≥ 2 while any of them are alive,
+                // and we leave the entry for the real owner to clean up.
+                //
+                // We hold the state lock across both the count check and
+                // the `remove`, so the count cannot increase between the
+                // two: a new clone can only be obtained by reading the
+                // map, and the lock blocks that. If the count is 1 here,
+                // it stays 1 until we remove. Conversely, if it is ≥ 2
+                // here, dropping a foreign owner's clone afterwards
+                // brings it back to 1 — but at that point a future
+                // dispatch's recovery (or that owner's own cleanup
+                // path) handles it; we never falsely reclaim a token
+                // that any task is still using.
+                //
+                // This is the strictly safer replacement for the prior
+                // `Arc::ptr_eq(pre, post)` snapshot check, which had a
+                // narrow race where a foreign owner inserted between
+                // the pre-snapshot and the handler's first lock would
+                // be falsely reclaimed (and its child SIGTERMed). The
+                // identity check could not distinguish "foreign just
+                // arrived" from "panicked handler inserted"; the
+                // strong-count check distinguishes by observing whether
+                // anyone else still holds the token, which is the
+                // actual property we care about for safe cleanup.
+                let leaked: Option<Arc<CancelToken>> = {
+                    let mut data = state.lock().await;
+                    let reclaim = match data.cancel_tokens.get(&cid) {
+                        Some(post) => {
+                            let count = Arc::strong_count(post);
+                            if count != 1 {
+                                msg_debug(&format!(
+                                    "[chat_worker {}] panic recovery: token still held by {} ref(s) (foreign owner or surviving sub-task), no cleanup",
+                                    cid.0, count
+                                ));
+                            }
+                            count == 1
+                        }
+                        None => false,
+                    };
+                    if reclaim {
+                        data.cancel_tokens.remove(&cid)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(tok) = leaked {
+                    // Best-effort: kill the AI child process if it's still
+                    // alive (the parent task panicked but the child may
+                    // have outlived it via process group inheritance).
+                    // The strong_count==1 check above guarantees no other
+                    // task is using this token, so SIGTERMing the PID
+                    // recorded inside it cannot affect a running foreign
+                    // task's child.
+                    if let Ok(guard) = tok.child_pid.lock() {
+                        if let Some(pid) = *guard {
+                            #[cfg(unix)]
+                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+                            #[cfg(windows)]
+                            { let _ = std::process::Command::new("taskkill")
+                                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                                .output(); }
+                        }
+                    }
+                    msg_debug(&format!("[chat_worker {}] reset busy slot after panic", cid.0));
+                    eprintln!("  ⚠ Chat {} busy slot reset (held by panicked task)", cid.0);
+                }
+            }
+        }
+    }
+    msg_debug(&format!("[chat_worker {}] channel closed, worker exiting", cid.0));
+}
+
+/// Dispatch a single unit to its real handler. Album fragments (size 1)
+/// fall through to the regular text path; size ≥ 2 albums hit the atomic
+/// album handler.
+async fn process_unit(
+    unit: DispatchUnit,
+    bot: Bot,
+    state: SharedState,
+    token: &str,
+    bot_username: &str,
+) -> ResponseResult<()> {
+    match unit {
+        DispatchUnit::Single(msg) => {
+            handle_message(bot, msg, state, token, bot_username).await
+        }
+        DispatchUnit::Album(msgs) => {
+            if msgs.len() < 2 {
+                if let Some(msg) = msgs.into_iter().next() {
+                    handle_message(bot, msg, state, token, bot_username).await
+                } else {
+                    Ok(())
+                }
+            } else {
+                handle_album_batch(bot, msgs, state, token, bot_username).await
+            }
+        }
+    }
+}
+
 /// Compute the `getUpdates` offset that confirms `last_id`.
 /// Telegram's offset parameter is `i32`. If `last_id` sits at the i32 upper
 /// bound, `last_id + 1` is not representable; we cap at `i32::MAX` and log
@@ -3558,8 +3794,15 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     // two batches in such backlog conditions are processed as separate
     // shorter dispatches — no timing heuristic involved.
     //
+    // Per-chat FIFO workers: each chat has one long-lived task that pulls
+    // units in arrival order, so strict ordering holds across batches as
+    // well as within them. Workers are reused across reconnects.
+    //
     // Outer reconnect loop: catches panics inside the polling task and
-    // retries with exponential backoff, mirroring the prior `repl` wrapper.
+    // retries with exponential backoff. A `PollingExit::Fatal` from
+    // `polling_loop` (Conflict, Unauthorized) breaks out instead — those
+    // conditions cannot recover via reconnect.
+    let chat_workers: ChatWorkers = new_chat_workers();
     let token_for_loop = token.to_string();
     let username_for_loop = bot_username;
     let mut reconnect_backoff_secs = 5u64;
@@ -3568,20 +3811,20 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         let loop_start = std::time::Instant::now();
         let bot_clone = bot.clone();
         let state_clone = state.clone();
+        let workers_clone = chat_workers.clone();
         let token_clone = token_for_loop.clone();
         let username_clone = username_for_loop.clone();
 
         let task_result = tokio::spawn(async move {
-            polling_loop(bot_clone, state_clone, token_clone, username_clone).await;
+            polling_loop(bot_clone, state_clone, workers_clone, token_clone, username_clone).await
         })
         .await;
 
         match task_result {
-            Ok(()) => {
-                // polling_loop only returns on irrecoverable shutdown (it
-                // currently has no such path; loops forever). If we ever
-                // arrive here, treat as graceful shutdown.
-                msg_debug("[run_bot] polling task exited normally (shutdown)");
+            Ok(PollingExit::Fatal(reason)) => {
+                eprintln!("  ✗ Bot @{} stopped: {}", username_for_loop, reason);
+                eprintln!("    No reconnect — fix the underlying issue and restart cokacdir.");
+                msg_debug(&format!("[run_bot] polling exited fatally: {}", reason));
                 break;
             }
             Err(e) => {
@@ -3603,13 +3846,25 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         }
     }
 
+    // Drop chat-worker senders so the worker tasks observe channel closure
+    // and exit on their own (no abort needed; each is between units).
+    chat_workers.lock().await.clear();
     scheduler_handle.abort();
 }
 
-/// Long-poll `getUpdates` and dispatch each batch via `process_batch`. Runs
-/// forever; transient errors (network blips) sleep + retry inline so the
-/// outer panic-recovery wrapper only fires for truly fatal conditions.
-async fn polling_loop(bot: Bot, state: SharedState, token: String, bot_username: String) {
+/// Long-poll `getUpdates` and dispatch each batch via `process_batch`.
+/// Returns `PollingExit::Fatal` when Telegram reports a non-recoverable
+/// condition (Conflict, Unauthorized) so the outer reconnect wrapper can
+/// stop instead of looping forever. Transient errors (network blips,
+/// 5xx) sleep with bounded exponential backoff and retry inline; a
+/// `RetryAfter(s)` is honored verbatim for `s` seconds.
+async fn polling_loop(
+    bot: Bot,
+    state: SharedState,
+    workers: ChatWorkers,
+    token: String,
+    bot_username: String,
+) -> PollingExit {
     let mut offset: i32 = 0;
     let mut transient_backoff_ms: u64 = 500;
     loop {
@@ -3630,43 +3885,61 @@ async fn polling_loop(bot: Bot, state: SharedState, token: String, bot_username:
                     continue;
                 }
                 msg_debug(&format!("[polling_loop] batch: {} update(s)", updates.len()));
-                process_batch(&bot, updates, &state, &token, &bot_username).await;
+                process_batch(&bot, updates, &state, &workers, &token, &bot_username).await;
             }
             Err(e) => {
-                msg_debug(&format!("[polling_loop] getUpdates error (sleeping {}ms): {}", transient_backoff_ms, e));
-                tokio::time::sleep(tokio::time::Duration::from_millis(transient_backoff_ms)).await;
-                // Cap at 10s; outer reconnect handles longer outages via panic path.
-                transient_backoff_ms = (transient_backoff_ms * 2).min(10_000);
+                // Misconfiguration: bail out so the outer wrapper doesn't
+                // loop forever on a condition that retrying cannot fix.
+                if let Some(reason) = detect_fatal_polling_error(&e) {
+                    return PollingExit::Fatal(format!("{}: {}", reason, redact_err(&e)));
+                }
+                // Server-mandated cooldown is honored verbatim. Reset our
+                // own backoff so we don't compound it on the next loop
+                // (the server told us exactly how long to wait).
+                let (sleep_dur, is_retry_after) = match &e {
+                    teloxide::RequestError::RetryAfter(s) => (s.duration(), true),
+                    _ => (std::time::Duration::from_millis(transient_backoff_ms), false),
+                };
+                msg_debug(&format!(
+                    "[polling_loop] getUpdates error (sleeping {}ms{}): {}",
+                    sleep_dur.as_millis(),
+                    if is_retry_after { ", RetryAfter" } else { "" },
+                    redact_err(&e),
+                ));
+                tokio::time::sleep(sleep_dur).await;
+                if is_retry_after {
+                    transient_backoff_ms = 500;
+                } else {
+                    // Cap at 10s; outer reconnect handles longer outages via panic path.
+                    transient_backoff_ms = (transient_backoff_ms * 2).min(10_000);
+                }
             }
         }
     }
 }
 
 /// Group album members by `(chat_id, media_group_id)` within this batch and
-/// dispatch each unit while preserving overall arrival order. Albums of size
-/// ≥2 go to `handle_album_batch` for atomic processing; singletons (no
+/// hand each unit off to its chat's serial worker. Albums of size ≥2 go to
+/// `handle_album_batch` for atomic processing; singletons (no
 /// media_group_id, or 1-photo album fragments from a split batch) fall
 /// through to the existing `handle_message` path.
 ///
-/// Within a single chat, units are processed strictly in arrival order: a
-/// per-chat task awaits each unit before starting the next, so two messages
-/// arriving in the same batch from the same chat cannot race for
-/// `state.lock()`. Different chats still run in parallel — each chat gets
-/// its own spawned task.
+/// Strict arrival order is preserved per chat **across** batches: each
+/// chat has a long-lived FIFO worker, and we only push into the FIFO here
+/// — the worker itself awaits each unit before pulling the next, so two
+/// messages from the same chat in different batches cannot race for
+/// `state.lock()` either. Different chats keep running in parallel.
 async fn process_batch(
     bot: &Bot,
     updates: Vec<Update>,
     state: &SharedState,
+    workers: &ChatWorkers,
     token: &str,
     bot_username: &str,
 ) {
     // Insertion-ordered list of dispatch units. An album spanning interleaved
     // updates appears at the position of its first photo.
-    enum Unit {
-        Single(Message),
-        Album(Vec<Message>),
-    }
-    let mut units: Vec<Unit> = Vec::new();
+    let mut units: Vec<DispatchUnit> = Vec::new();
     let mut album_pos: HashMap<(ChatId, String), usize> = HashMap::new();
 
     for upd in updates {
@@ -3681,80 +3954,57 @@ async fn process_batch(
             let key = (chat_id, gid.to_string());
             match album_pos.get(&key) {
                 Some(&idx) => {
-                    if let Unit::Album(ref mut msgs) = units[idx] {
+                    if let DispatchUnit::Album(ref mut msgs) = units[idx] {
                         msgs.push(msg);
                     }
                 }
                 None => {
                     let idx = units.len();
                     album_pos.insert(key, idx);
-                    units.push(Unit::Album(vec![msg]));
+                    units.push(DispatchUnit::Album(vec![msg]));
                 }
             }
         } else {
-            units.push(Unit::Single(msg));
+            units.push(DispatchUnit::Single(msg));
         }
     }
 
-    // Group units by chat_id so each chat's units can be processed serially
-    // by a single spawned task. Insertion order across chats doesn't matter
-    // (chats run independently); order within each chat must be preserved.
-    let mut chat_order: Vec<ChatId> = Vec::new();
-    let mut by_chat: HashMap<ChatId, Vec<Unit>> = HashMap::new();
+    // Push each unit into its chat's FIFO worker. We do not await the
+    // handler here — that would re-introduce head-of-line blocking across
+    // chats. Sending is non-blocking (unbounded mpsc).
     for unit in units {
         let cid = match &unit {
-            Unit::Single(m) => m.chat.id,
-            // Album is built with `vec![msg]` and only ever appended to, so
-            // it is never empty here.
-            Unit::Album(msgs) => msgs[0].chat.id,
+            DispatchUnit::Single(m) => m.chat.id,
+            // Album is built with `vec![msg]` and only appended to, so it
+            // is never empty here.
+            DispatchUnit::Album(msgs) => msgs[0].chat.id,
         };
-        if !by_chat.contains_key(&cid) {
-            chat_order.push(cid);
-        }
-        by_chat.entry(cid).or_default().push(unit);
-    }
-
-    for cid in chat_order {
-        let chat_units = match by_chat.remove(&cid) {
-            Some(u) => u,
-            None => continue,
-        };
-        let bot_c = bot.clone();
-        let state_c = state.clone();
-        let token_c = token.to_string();
-        let username_c = bot_username.to_string();
-        tokio::spawn(async move {
-            for unit in chat_units {
-                match unit {
-                    Unit::Single(msg) => {
-                        if let Err(e) = handle_message(bot_c.clone(), msg, state_c.clone(), &token_c, &username_c).await {
-                            msg_debug(&format!("[process_batch] handle_message error: {}", e));
-                        }
-                    }
-                    Unit::Album(msgs) => {
-                        if msgs.len() < 2 {
-                            // 1-photo "album" — the message has a
-                            // `media_group_id` but no sibling within this
-                            // batch. Process via the regular single-message
-                            // path; if it's a fragment of a larger album
-                            // split across batches it will be saved as an
-                            // orphan upload and picked up by the next text
-                            // message.
-                            if let Some(msg) = msgs.into_iter().next() {
-                                if let Err(e) = handle_message(bot_c.clone(), msg, state_c.clone(), &token_c, &username_c).await {
-                                    msg_debug(&format!("[process_batch] handle_message(album-fragment) error: {}", e));
-                                }
-                            }
-                        } else {
-                            msg_debug(&format!("[process_batch] atomic album: {} photo(s) in one batch", msgs.len()));
-                            if let Err(e) = handle_album_batch(bot_c.clone(), msgs, state_c.clone(), &token_c, &username_c).await {
-                                msg_debug(&format!("[process_batch] handle_album_batch error: {}", e));
-                            }
-                        }
-                    }
-                }
+        if let DispatchUnit::Album(ref msgs) = unit {
+            if msgs.len() >= 2 {
+                msg_debug(&format!(
+                    "[process_batch] atomic album: {} photo(s) in one batch",
+                    msgs.len()
+                ));
             }
-        });
+        }
+        let tx = ensure_chat_worker(workers, cid, bot, state, token, bot_username).await;
+        if let Err(send_err) = tx.send(unit) {
+            // Worker exited (only possible if its sender was dropped from
+            // the map). Recreate exactly once and retry; a second failure
+            // is logged and dropped rather than spinning.
+            msg_debug(&format!(
+                "[process_batch] chat_worker for {} closed; recreating",
+                cid.0
+            ));
+            workers.lock().await.remove(&cid);
+            let new_tx = ensure_chat_worker(workers, cid, bot, state, token, bot_username).await;
+            if let Err(e) = new_tx.send(send_err.0) {
+                msg_debug(&format!(
+                    "[process_batch] chat {} send failed even after recreate: {:?}",
+                    cid.0, e
+                ));
+            }
+        }
     }
 }
 
@@ -11939,10 +12189,26 @@ async fn process_bot_message(
         let mut data = state.lock().await;
         if data.cancel_tokens.contains_key(&chat_id) {
             msg_debug(&format!("[process_bot_message] chat_id={}, cancel_token exists (busy), skipping id={}", chat_id.0, msg.id));
+            // Slot was claimed by someone else between the scheduler's
+            // busy-check and our claim attempt. Leave the bot-message
+            // file on disk so the next scheduler tick re-tries — without
+            // this, the message would be lost (file deleted by scheduler
+            // before claim, claim fails, no retry path).
             return;
         }
         data.cancel_tokens.insert(chat_id, cancel_token.clone());
     }
+
+    // Claim succeeded — now safe to delete the on-disk message file.
+    // Doing this here (post-claim) instead of in `scheduler_loop` closes
+    // the prior TOCTOU window where a concurrent claim by another task
+    // would cause this function to return early with the file already
+    // gone, dropping the bot-to-bot message silently.
+    let remove_result = fs::remove_file(&msg.file_path);
+    msg_debug(&format!(
+        "[process_bot_message] deleted message file post-claim: id={}, path={}, ok={}",
+        msg.id, msg.file_path.display(), remove_result.is_ok()
+    ));
 
     // Acquire group chat lock (serializes processing across bots in the same group chat)
     let group_lock = acquire_group_chat_lock(chat_id.0).await;
@@ -12953,13 +13219,13 @@ async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_usernam
                     }
                 }
 
-                // Delete message file immediately (mark as processed)
-                let remove_result = fs::remove_file(&msg.file_path);
-                msg_debug(&format!("[scheduler_loop] deleted message file: id={}, path={}, ok={}",
-                    msg.id, msg.file_path.display(), remove_result.is_ok()));
+                // Note: file deletion moved into `process_bot_message` (post-claim)
+                // to close the TOCTOU window where a concurrent task could claim
+                // the slot between the busy-check above and process_bot_message's
+                // own claim — leaving the file deleted but the message unprocessed.
                 msg_debug(&format!("[scheduler_loop] processing bot message: {} (from={}, to={}, chat_id={})", msg.id, msg.from, msg.to, chat_id_num));
 
-                // Process the message
+                // Process the message (will delete the file iff its claim succeeds)
                 process_bot_message(&bot, chat_id, msg, &state, &token, &bot_username, &bot_display_name).await;
                 msg_debug(&format!("[scheduler_loop] process_bot_message returned for msg: {}", msg.id));
             }

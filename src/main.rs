@@ -913,17 +913,34 @@ fn handle_ccserver(tokens: Vec<String>) {
         // Single Telegram bot — run directly
         rt.block_on(services::telegram::run_bot(&tg_tokens[0], None));
     } else if total == 1 && tg_tokens.is_empty() && slack_tokens.is_empty() {
-        // Single Discord bot — run bridge directly
+        // Single Discord bot — run bridge directly. A `BridgeExit::Fatal`
+        // (backend death, init failure) maps to exit code 1 here so
+        // supervisors (systemd, docker) see the same signal they did
+        // before `run_bridge` was made non-fatal-returning.
         let args = vec![discord_tokens[0].clone()];
-        rt.block_on(services::messenger_bridge::run_bridge("discord", &args));
+        let exit = rt.block_on(services::messenger_bridge::run_bridge("discord", &args));
+        if matches!(exit, services::messenger_bridge::BridgeExit::Fatal) {
+            std::process::exit(1);
+        }
     } else if total == 1 && tg_tokens.is_empty() && discord_tokens.is_empty() {
-        // Single Slack bot — run bridge directly
+        // Single Slack bot — same exit-code handling as Discord above.
         let (bot, app) = slack_tokens[0].clone();
         let args = vec![bot, app];
-        rt.block_on(services::messenger_bridge::run_bridge("slack", &args));
+        let exit = rt.block_on(services::messenger_bridge::run_bridge("slack", &args));
+        if matches!(exit, services::messenger_bridge::BridgeExit::Fatal) {
+            std::process::exit(1);
+        }
     } else {
-        // Multiple bots — spawn all concurrently
+        // Multiple bots — spawn all concurrently. A backend death in one
+        // bridge no longer kills the others (previously `run_bridge`
+        // called `process::exit(1)` directly, which also tore down
+        // unrelated Telegram/Slack/Discord bots). Instead each bridge
+        // sets a shared `any_fatal` flag, and the process exits with
+        // status 1 only after every bot's task has finished — so
+        // healthy bots keep serving traffic until they exit on their
+        // own (or the operator restarts cokacdir).
         rt.block_on(async {
+            let any_fatal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut handles = Vec::new();
             for token in tg_tokens {
                 handles.push(tokio::spawn(async move {
@@ -931,19 +948,30 @@ fn handle_ccserver(tokens: Vec<String>) {
                 }));
             }
             for dt in discord_tokens {
+                let any_fatal = any_fatal.clone();
                 handles.push(tokio::spawn(async move {
                     let args = vec![dt];
-                    services::messenger_bridge::run_bridge("discord", &args).await;
+                    let exit = services::messenger_bridge::run_bridge("discord", &args).await;
+                    if matches!(exit, services::messenger_bridge::BridgeExit::Fatal) {
+                        any_fatal.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }));
             }
             for (bot, app) in slack_tokens {
+                let any_fatal = any_fatal.clone();
                 handles.push(tokio::spawn(async move {
                     let args = vec![bot, app];
-                    services::messenger_bridge::run_bridge("slack", &args).await;
+                    let exit = services::messenger_bridge::run_bridge("slack", &args).await;
+                    if matches!(exit, services::messenger_bridge::BridgeExit::Fatal) {
+                        any_fatal.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }));
             }
             for handle in handles {
                 let _ = handle.await;
+            }
+            if any_fatal.load(std::sync::atomic::Ordering::Relaxed) {
+                std::process::exit(1);
             }
         });
     }
