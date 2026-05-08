@@ -2611,6 +2611,10 @@ struct SharedData {
     settings: BotSettings,
     /// Per-chat cancel tokens for stopping in-progress AI requests
     cancel_tokens: HashMap<ChatId, Arc<CancelToken>>,
+    /// Synchronous mirror of active request tokens for drop-time cleanup.
+    request_tokens: RequestTokens,
+    /// Request-level tasks spawned below chat workers/scheduler.
+    request_tasks: RequestTasks,
     /// Message ID of the "Stopping..." message sent by /stop, so the polling loop can update it
     stop_message_ids: HashMap<ChatId, teloxide::types::MessageId>,
     /// Per-chat timestamp of the last Telegram API call (for rate limiting)
@@ -3300,10 +3304,267 @@ enum DispatchUnit {
 /// long-lived worker task that consumes a FIFO mpsc; this guarantees
 /// strict-arrival-order processing **across** `getUpdates` batches, not
 /// just within one batch. Different chats keep running in parallel.
-type ChatWorkers = Arc<Mutex<HashMap<ChatId, tokio::sync::mpsc::UnboundedSender<DispatchUnit>>>>;
+struct ChatWorkerEntry {
+    tx: tokio::sync::mpsc::UnboundedSender<DispatchUnit>,
+    abort: tokio::task::AbortHandle,
+}
+
+impl Drop for ChatWorkerEntry {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
+}
+
+type ChatWorkers = Arc<Mutex<HashMap<ChatId, ChatWorkerEntry>>>;
+type RequestTasks = Arc<std::sync::Mutex<HashMap<u64, tokio::task::AbortHandle>>>;
+type RequestTokens = Arc<std::sync::Mutex<HashMap<ChatId, Arc<CancelToken>>>>;
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct RunBotCleanup {
+    state: SharedState,
+    request_tokens: RequestTokens,
+    request_tasks: RequestTasks,
+}
+
+impl Drop for RunBotCleanup {
+    fn drop(&mut self) {
+        cancel_request_tokens(&self.request_tokens);
+        if let Ok(data) = self.state.try_lock() {
+            for token in data.cancel_tokens.values() {
+                cancel_token_now(token);
+            }
+        }
+        abort_request_tasks(&self.request_tasks);
+        let state = self.state.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let data = state.lock().await;
+                for token in data.cancel_tokens.values() {
+                    cancel_token_now(token);
+                }
+            });
+        }
+    }
+}
 
 fn new_chat_workers() -> ChatWorkers {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+fn new_request_tasks() -> RequestTasks {
+    Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
+fn new_request_tokens() -> RequestTokens {
+    Arc::new(std::sync::Mutex::new(HashMap::new()))
+}
+
+static NEXT_DISPATCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_REQUEST_TASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+tokio::task_local! {
+    static CURRENT_DISPATCH_ID: u64;
+}
+
+fn next_dispatch_id() -> u64 {
+    NEXT_DISPATCH_ID.fetch_add(1, Ordering::Relaxed).max(1)
+}
+
+fn current_dispatch_id() -> u64 {
+    CURRENT_DISPATCH_ID.try_with(|id| *id).unwrap_or(0)
+}
+
+fn new_cancel_token() -> Arc<CancelToken> {
+    new_cancel_token_for_owner(current_dispatch_id())
+}
+
+fn new_cancel_token_for_owner(owner_dispatch_id: u64) -> Arc<CancelToken> {
+    let token = Arc::new(CancelToken::new());
+    token.owner_dispatch_id.store(owner_dispatch_id, Ordering::Relaxed);
+    token
+}
+
+fn cancel_token_now(token: &Arc<CancelToken>) {
+    token.cancelled.store(true, Ordering::Relaxed);
+    if let Ok(guard) = token.child_pid.lock() {
+        if let Some(pid) = *guard {
+            #[cfg(unix)]
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output();
+            }
+        }
+    }
+}
+
+fn insert_cancel_token_locked(data: &mut SharedData, chat_id: ChatId, token: Arc<CancelToken>) {
+    data.cancel_tokens.insert(chat_id, token.clone());
+    if let Ok(mut tokens) = data.request_tokens.lock() {
+        tokens.insert(chat_id, token);
+    }
+}
+
+fn remove_cancel_token_locked(data: &mut SharedData, chat_id: ChatId) -> Option<Arc<CancelToken>> {
+    if let Ok(mut tokens) = data.request_tokens.lock() {
+        tokens.remove(&chat_id);
+    }
+    data.cancel_tokens.remove(&chat_id)
+}
+
+fn cancel_request_tokens(tokens: &RequestTokens) {
+    let snapshot = if let Ok(tokens) = tokens.lock() {
+        tokens.values().cloned().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    for token in snapshot {
+        cancel_token_now(&token);
+    }
+}
+
+async fn reclaim_panicked_dispatch_token(
+    state: &SharedState,
+    chat_id: ChatId,
+    dispatch_id: u64,
+    context: &str,
+) {
+    let leaked: Option<Arc<CancelToken>> = {
+        let mut data = state.lock().await;
+        let reclaim = match data.cancel_tokens.get(&chat_id) {
+            Some(post) => {
+                let owner = post.owner_dispatch_id.load(Ordering::Relaxed);
+                if owner != dispatch_id {
+                    msg_debug(&format!(
+                        "[{} {}] panic recovery: token owner={} does not match dispatch={}, no cleanup",
+                        context, chat_id.0, owner, dispatch_id
+                    ));
+                }
+                owner == dispatch_id
+            }
+            None => false,
+        };
+        if reclaim {
+            remove_cancel_token_locked(&mut data, chat_id)
+        } else {
+            None
+        }
+    };
+
+    if let Some(tok) = leaked {
+        cancel_token_now(&tok);
+        msg_debug(&format!("[{} {}] reset busy slot after panic", context, chat_id.0));
+    }
+}
+
+struct RequestTaskGuard {
+    tasks: RequestTasks,
+    id: u64,
+}
+
+impl Drop for RequestTaskGuard {
+    fn drop(&mut self) {
+        if let Ok(mut tasks) = self.tasks.lock() {
+            tasks.remove(&self.id);
+        }
+    }
+}
+
+fn abort_request_tasks(tasks: &RequestTasks) {
+    let handles = if let Ok(mut tasks) = tasks.lock() {
+        tasks.drain().map(|(_, handle)| handle).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    for handle in handles {
+        handle.abort();
+    }
+}
+
+fn spawn_tracked_request_task<F, T>(tasks: RequestTasks, fut: F)
+    -> tokio::task::JoinHandle<T>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let id = NEXT_REQUEST_TASK_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<RequestTaskGuard>();
+    let handle = tokio::spawn(async move {
+        let _guard = ready_rx.await.expect("request task guard dropped before start");
+        fut.await
+    });
+    let abort = handle.abort_handle();
+    let guard = RequestTaskGuard { tasks: tasks.clone(), id };
+    if let Ok(mut task_map) = tasks.lock() {
+        task_map.insert(id, abort);
+    }
+    let _ = ready_tx.send(guard);
+    handle
+}
+
+/// Spawn a tracked blocking task. NOTE: `AbortHandle::abort()` only signals
+/// cancellation on the JoinHandle side — the blocking thread itself runs `f`
+/// to completion (a tokio limitation for `spawn_blocking`). Real shutdown of
+/// the blocking work must come from the `CancelToken` (cancelled flag +
+/// SIGTERM to the child PID) carried in by the caller, not from this map's
+/// abort handle.
+fn spawn_tracked_blocking_task<F>(tasks: RequestTasks, f: F)
+    -> tokio::task::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let id = NEXT_REQUEST_TASK_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<RequestTaskGuard>(1);
+    let handle = tokio::task::spawn_blocking(move || {
+        let Ok(_guard) = ready_rx.recv() else {
+            return;
+        };
+        f();
+    });
+    let abort = handle.abort_handle();
+    let guard = RequestTaskGuard { tasks: tasks.clone(), id };
+    if let Ok(mut task_map) = tasks.lock() {
+        task_map.insert(id, abort);
+    }
+    let _ = ready_tx.send(guard);
+    handle
+}
+
+/// Variant of `spawn_tracked_blocking_task` that returns `f`'s result. The
+/// outer `Option` is `None` only if the guard channel closed before `f` ran
+/// (e.g. the spawning future was dropped between spawn and send). The same
+/// abort caveat applies: cancelling the JoinHandle does not preempt the
+/// blocking thread; rely on the `CancelToken` carried by `f` for shutdown.
+fn spawn_tracked_blocking_result<F, T>(tasks: RequestTasks, f: F)
+    -> tokio::task::JoinHandle<Option<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let id = NEXT_REQUEST_TASK_ID.fetch_add(1, Ordering::Relaxed).max(1);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<RequestTaskGuard>(1);
+    let handle = tokio::task::spawn_blocking(move || {
+        let Ok(_guard) = ready_rx.recv() else {
+            return None;
+        };
+        Some(f())
+    });
+    let abort = handle.abort_handle();
+    let guard = RequestTaskGuard { tasks: tasks.clone(), id };
+    if let Ok(mut task_map) = tasks.lock() {
+        task_map.insert(id, abort);
+    }
+    let _ = ready_tx.send(guard);
+    handle
 }
 
 /// Result of `polling_loop`. `Fatal` means the loop must NOT be restarted
@@ -3362,16 +3623,17 @@ async fn ensure_chat_worker(
     bot_username: &str,
 ) -> tokio::sync::mpsc::UnboundedSender<DispatchUnit> {
     let mut guard = workers.lock().await;
-    if let Some(tx) = guard.get(&cid) {
-        return tx.clone();
+    if let Some(entry) = guard.get(&cid) {
+        return entry.tx.clone();
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let bot_owned = bot.clone();
     let state_owned = state.clone();
     let token_owned = token.to_string();
     let username_owned = bot_username.to_string();
-    tokio::spawn(run_chat_worker(rx, bot_owned, state_owned, token_owned, username_owned, cid));
-    guard.insert(cid, tx.clone());
+    let handle = tokio::spawn(run_chat_worker(rx, bot_owned, state_owned, token_owned, username_owned, cid));
+    let abort = handle.abort_handle();
+    guard.insert(cid, ChatWorkerEntry { tx: tx.clone(), abort });
     tx
 }
 
@@ -3388,12 +3650,24 @@ async fn run_chat_worker(
     cid: ChatId,
 ) {
     while let Some(unit) = rx.recv().await {
+        let dispatch_id = next_dispatch_id();
         let bot_c = bot.clone();
         let state_c = state.clone();
         let token_c = token.clone();
         let username_c = bot_username.clone();
+        // This per-unit spawn is intentionally not inserted into `request_tasks`:
+        // its lifecycle is bound to the chat_worker via the `join.await` below,
+        // and the chat_worker itself is tracked in `ChatWorkerEntry` (whose Drop
+        // aborts it). Aborting a tracked async parent does not kill blocking
+        // descendants anyway — child processes are reaped via the cancel_token's
+        // SIGTERM path during run_bot shutdown, which is the correctness boundary
+        // that actually matters.
         let join = tokio::spawn(async move {
-            process_unit(unit, bot_c, state_c, &token_c, &username_c).await
+            CURRENT_DISPATCH_ID
+                .scope(dispatch_id, async move {
+                    process_unit(unit, bot_c, state_c, &token_c, &username_c).await
+                })
+                .await
         });
         match join.await {
             Ok(Ok(())) => {}
@@ -3409,84 +3683,42 @@ async fn run_chat_worker(
                     "  ⚠ Chat {} handler panicked: {} — recovering",
                     cid.0, panic_str
                 );
-                // Recover the busy-slot lock held by the panicked task.
-                // `/stop` and `/stopall` only set `cancelled=true` — they do
-                // NOT remove the entry from `cancel_tokens`, deferring the
-                // actual removal to the task's normal cleanup path. When
-                // the task panics that cleanup never runs, leaving the
-                // slot held forever and the chat permanently "busy".
-                //
-                // Reclaim only when `Arc::strong_count == 1` — i.e. the
-                // map's entry is the **only** live reference to this
-                // `CancelToken`. Every still-running owner of this slot
-                // (the handler itself before unwind, a fire-and-forget
-                // child it spawned with a clone, a scheduler-side
-                // `execute_schedule` / `process_bot_message`, or any
-                // foreign task that inserted before this dispatch) holds
-                // an extra `Arc` clone in its stack — `strong_count`
-                // therefore observes ≥ 2 while any of them are alive,
-                // and we leave the entry for the real owner to clean up.
-                //
-                // We hold the state lock across both the count check and
-                // the `remove`, so the count cannot increase between the
-                // two: a new clone can only be obtained by reading the
-                // map, and the lock blocks that. If the count is 1 here,
-                // it stays 1 until we remove. Conversely, if it is ≥ 2
-                // here, dropping a foreign owner's clone afterwards
-                // brings it back to 1 — but at that point a future
-                // dispatch's recovery (or that owner's own cleanup
-                // path) handles it; we never falsely reclaim a token
-                // that any task is still using.
-                //
-                // This is the strictly safer replacement for the prior
-                // `Arc::ptr_eq(pre, post)` snapshot check, which had a
-                // narrow race where a foreign owner inserted between
-                // the pre-snapshot and the handler's first lock would
-                // be falsely reclaimed (and its child SIGTERMed). The
-                // identity check could not distinguish "foreign just
-                // arrived" from "panicked handler inserted"; the
-                // strong-count check distinguishes by observing whether
-                // anyone else still holds the token, which is the
-                // actual property we care about for safe cleanup.
+                // Recover only the busy slot owned by this dispatch. Scheduler
+                // reservations, queued feedback, and later handlers have
+                // different owner ids, so panic cleanup must not use Arc counts.
+                // A matching owner id means the panicked dispatch inserted
+                // the currently active token and no foreign reservation has
+                // replaced it. Mismatched owner ids are left for their owner.
                 let leaked: Option<Arc<CancelToken>> = {
                     let mut data = state.lock().await;
                     let reclaim = match data.cancel_tokens.get(&cid) {
                         Some(post) => {
-                            let count = Arc::strong_count(post);
-                            if count != 1 {
+                            let owner = post.owner_dispatch_id.load(Ordering::Relaxed);
+                            if owner != dispatch_id {
                                 msg_debug(&format!(
-                                    "[chat_worker {}] panic recovery: token still held by {} ref(s) (foreign owner or surviving sub-task), no cleanup",
-                                    cid.0, count
+                                    "[chat_worker {}] panic recovery: token owner={} does not match dispatch={}, no cleanup",
+                                    cid.0, owner, dispatch_id
                                 ));
                             }
-                            count == 1
+                            owner == dispatch_id
                         }
                         None => false,
                     };
                     if reclaim {
-                        data.cancel_tokens.remove(&cid)
+                        remove_cancel_token_locked(&mut data, cid)
                     } else {
                         None
                     }
                 };
                 if let Some(tok) = leaked {
-                    // Best-effort: kill the AI child process if it's still
-                    // alive (the parent task panicked but the child may
-                    // have outlived it via process group inheritance).
-                    // The strong_count==1 check above guarantees no other
-                    // task is using this token, so SIGTERMing the PID
-                    // recorded inside it cannot affect a running foreign
-                    // task's child.
-                    if let Ok(guard) = tok.child_pid.lock() {
-                        if let Some(pid) = *guard {
-                            #[cfg(unix)]
-                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
-                            #[cfg(windows)]
-                            { let _ = std::process::Command::new("taskkill")
-                                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                                .output(); }
-                        }
-                    }
+                    // Best-effort cleanup: set cancelled=true AND SIGTERM the child
+                    // PID. The cancelled flag matters when a sibling thread (e.g. an
+                    // exec polling loop on a blocking thread that survived the async
+                    // parent's panic) is still polling the token — it lets that
+                    // thread exit promptly instead of relying on signal delivery
+                    // alone. The owner check above prevents touching a child process
+                    // belonging to a scheduler or later handler.
+                    cancel_token_now(&tok);
                     msg_debug(&format!("[chat_worker {}] reset busy slot after panic", cid.0));
                     eprintln!("  ⚠ Chat {} busy slot reset (held by panicked task)", cid.0);
                 }
@@ -3686,6 +3918,8 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         sessions: HashMap::new(),
         settings: bot_settings,
         cancel_tokens: HashMap::new(),
+        request_tokens: new_request_tokens(),
+        request_tasks: new_request_tasks(),
         stop_message_ids: HashMap::new(),
         api_timestamps: HashMap::new(),
         polling_time_ms,
@@ -3698,6 +3932,15 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         loop_feedback: HashMap::new(),
         clear_epoch: HashMap::new(),
     }));
+    let (request_tokens, request_tasks) = {
+        let data = state.lock().await;
+        (data.request_tokens.clone(), data.request_tasks.clone())
+    };
+    let _run_bot_cleanup = RunBotCleanup {
+        state: state.clone(),
+        request_tokens: request_tokens.clone(),
+        request_tasks: request_tasks.clone(),
+    };
 
     println!("  ✓ Bot connected — Listening for messages");
     println!("  ✓ Scheduler started (5s interval)");
@@ -3742,6 +3985,8 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     let scheduler_bot_username = bot_username.clone();
     let scheduler_bot_display_name = bot_display_name.clone();
     let scheduler_handle = tokio::spawn(scheduler_loop(scheduler_bot, scheduler_state, scheduler_token, scheduler_bot_username, scheduler_bot_display_name));
+    let scheduler_abort = scheduler_handle.abort_handle();
+    let _scheduler_guard = AbortOnDrop(scheduler_abort);
 
     // Flush all pending updates so we don't process messages that arrived while
     // the bot was offline.
@@ -3815,10 +4060,11 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         let token_clone = token_for_loop.clone();
         let username_clone = username_for_loop.clone();
 
-        let task_result = tokio::spawn(async move {
+        let polling_handle = tokio::spawn(async move {
             polling_loop(bot_clone, state_clone, workers_clone, token_clone, username_clone).await
-        })
-        .await;
+        });
+        let _polling_guard = AbortOnDrop(polling_handle.abort_handle());
+        let task_result = polling_handle.await;
 
         match task_result {
             Ok(PollingExit::Fatal(reason)) => {
@@ -4227,14 +4473,14 @@ async fn handle_album_batch(
     // already held by another in-flight AI request, we don't reserve and
     // fall through to `dispatch_album_caption`, which queues/redirects
     // this album normally.
-    let placeholder_token = Arc::new(CancelToken::new());
+    let placeholder_token = new_cancel_token();
     let reserved_slot = {
         let mut data = state.lock().await;
         if data.cancel_tokens.contains_key(&chat_id) {
             msg_debug(&format!("[album_batch] chat_id={}, slot busy at admission → will queue/redirect at dispatch", chat_id.0));
             false
         } else {
-            data.cancel_tokens.insert(chat_id, placeholder_token.clone());
+            insert_cancel_token_locked(&mut data, chat_id, placeholder_token.clone());
             msg_debug(&format!("[album_batch] chat_id={}, reserved AI slot (placeholder)", chat_id.0));
             true
         }
@@ -4266,7 +4512,7 @@ async fn handle_album_batch(
             // pop racing with us).
             if let Some(t) = data.cancel_tokens.get(&chat_id) {
                 if Arc::ptr_eq(t, &placeholder_token) {
-                    data.cancel_tokens.remove(&chat_id);
+                    remove_cancel_token_locked(&mut data, chat_id);
                 }
             }
         }
@@ -4299,7 +4545,7 @@ async fn handle_album_batch(
                 let mut data = state.lock().await;
                 if let Some(t) = data.cancel_tokens.get(&chat_id) {
                     if Arc::ptr_eq(t, &placeholder_token) {
-                        data.cancel_tokens.remove(&chat_id);
+                        remove_cancel_token_locked(&mut data, chat_id);
                     }
                 }
             }
@@ -7429,7 +7675,7 @@ async fn handle_shell_command(
     }
 
     // Register cancel token early (prevents duplicate requests while waiting for group lock)
-    let cancel_token = Arc::new(CancelToken::new());
+    let cancel_token = new_cancel_token();
     {
         let mut data = state.lock().await;
         if data.cancel_tokens.contains_key(&chat_id) {
@@ -7440,7 +7686,7 @@ async fn handle_shell_command(
                 .await)?;
             return Ok(());
         }
-        data.cancel_tokens.insert(chat_id, cancel_token.clone());
+        insert_cancel_token_locked(&mut data, chat_id, cancel_token.clone());
     }
 
     // Acquire group chat lock (serializes processing across bots in the same group chat)
@@ -7449,7 +7695,7 @@ async fn handle_shell_command(
     // Check if cancelled during lock wait
     if cancel_token.cancelled.load(Ordering::Relaxed) {
         msg_debug(&format!("[queue:trigger] chat_id={}, source=query_cancelled_during_lock", chat_id.0));
-        { let mut data = state.lock().await; data.cancel_tokens.remove(&chat_id); }
+        { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
         drop(group_lock); // release before queue processing to avoid deadlock
         process_next_queued_message(bot, chat_id, state).await;
         return Ok(());
@@ -7476,7 +7722,7 @@ async fn handle_shell_command(
         Ok(m) => m,
         Err(e) => {
             msg_debug(&format!("[queue:trigger] chat_id={}, source=query_placeholder_error", chat_id.0));
-            { let mut data = state.lock().await; data.cancel_tokens.remove(&chat_id); }
+            { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
             drop(group_lock); // release before queue processing to avoid deadlock
             process_next_queued_message(bot, chat_id, state).await;
             return Err(e);
@@ -7490,9 +7736,13 @@ async fn handle_shell_command(
     let cmd_owned = cmd_str.to_string();
     let working_dir_clone = working_dir.clone();
     let cancel_token_clone = cancel_token.clone();
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
 
     // Spawn blocking thread for shell command execution
-    tokio::task::spawn_blocking(move || {
+    let _ = spawn_tracked_blocking_task(request_tasks, move || {
         #[cfg(unix)]
         let child = std::process::Command::new("bash")
             .args(["-c", &cmd_owned])
@@ -7571,7 +7821,11 @@ async fn handle_shell_command(
         (data.bot_username.clone(), data.bot_display_name.clone())
     };
     let shell_user_display_name = user_display_name.to_string();
-    tokio::spawn(async move {
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let _ = spawn_tracked_request_task(request_tasks, async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
             "🕐 P",           "🕑 Pr",          "🕒 Pro",
@@ -7829,7 +8083,7 @@ async fn handle_shell_command(
             }
 
             let mut data = state_owned.lock().await;
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             data.stop_message_ids.remove(&chat_id);
             drop(data);
             msg_debug(&format!("[queue:trigger] chat_id={}, source=query_poll_cancelled", chat_id.0));
@@ -7851,7 +8105,7 @@ async fn handle_shell_command(
         // Release lock
         {
             let mut data = state_owned.lock().await;
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
         }
         msg_debug(&format!("[queue:trigger] chat_id={}, source=query_poll_completed", chat_id.0));
         drop(_group_lock); // release group chat lock before processing queue
@@ -8749,17 +9003,69 @@ async fn handle_model_command(
     Ok(())
 }
 
+async fn run_inline_text_dispatch(
+    bot: Bot,
+    chat_id: ChatId,
+    state: SharedState,
+    text: String,
+    user_display_name: String,
+    from_queue: bool,
+    dispatch_id: u64,
+    context: &'static str,
+) {
+    let state_for_task = state.clone();
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let join = spawn_tracked_request_task(request_tasks, async move {
+        CURRENT_DISPATCH_ID
+            .scope(dispatch_id, async move {
+                handle_text_message(
+                    &bot,
+                    chat_id,
+                    &text,
+                    &state_for_task,
+                    &user_display_name,
+                    from_queue,
+                )
+                .await
+            })
+            .await
+    });
+
+    match join.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => msg_debug(&format!(
+            "[{}] chat_id={}, handle_text_message FAILED: {}",
+            context, chat_id.0, e
+        )),
+        Err(join_err) => {
+            let panic_str = redact_known_tokens(&join_err.to_string());
+            msg_debug(&format!(
+                "[{}] chat_id={}, inline dispatch PANICKED: {}",
+                context, chat_id.0, panic_str
+            ));
+            eprintln!(
+                "  ⚠ Chat {} {} dispatch panicked: {} — recovering",
+                chat_id.0, context, panic_str
+            );
+            reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, context).await;
+        }
+    }
+}
+
 /// Dispatch pending loop feedback (stored in loop_feedback HashMap).
 /// Called after loop verification determines the task is incomplete.
 /// Uses the same boxed-future pattern as process_next_queued_message
-/// to satisfy Send bounds (handle_text_message's future is not Send
-/// in the outer tokio::spawn context).
+/// to avoid a recursive async type between queue and feedback dispatch.
 fn dispatch_loop_feedback<'a>(
     bot: &'a Bot,
     chat_id: ChatId,
     state: &'a SharedState,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
+        let dispatch_id = next_dispatch_id();
         let feedback = {
             let mut data = state.lock().await;
             let fb = data.loop_feedback.remove(&chat_id);
@@ -8767,7 +9073,7 @@ fn dispatch_loop_feedback<'a>(
             // during the gap before handle_text_message creates its own token.
             // Same pattern as process_next_queued_message (line 6628).
             if fb.is_some() {
-                data.cancel_tokens.insert(chat_id, Arc::new(CancelToken::new()));
+                insert_cancel_token_locked(&mut data, chat_id, new_cancel_token_for_owner(dispatch_id));
                 msg_debug(&format!("[loop:dispatch] chat_id={}, placeholder cancel_token inserted", chat_id.0));
             }
             fb
@@ -8776,9 +9082,16 @@ fn dispatch_loop_feedback<'a>(
             msg_debug(&format!("[loop:dispatch] chat_id={}, feedback_len={}", chat_id.0, text.len()));
             // from_queue=true: handle_text_message will overwrite the placeholder
             // cancel_token instead of treating it as "another task active".
-            if let Err(e) = handle_text_message(bot, chat_id, &text, state, &user_display_name, true).await {
-                msg_debug(&format!("[loop:dispatch] chat_id={}, handle_text_message FAILED: {}", chat_id.0, e));
-            }
+            run_inline_text_dispatch(
+                bot.clone(),
+                chat_id,
+                state.clone(),
+                text,
+                user_display_name,
+                true,
+                dispatch_id,
+                "loop:dispatch",
+            ).await;
         } else {
             msg_debug(&format!("[loop:dispatch] chat_id={}, no feedback found (may have been cleared by /stop)", chat_id.0));
             // Fall through to normal queue processing
@@ -8797,6 +9110,7 @@ fn process_next_queued_message<'a>(
     state: &'a SharedState,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
+        let dispatch_id = next_dispatch_id();
         msg_debug(&format!("[queue:next] chat_id={}, checking for next queued message", chat_id.0));
         let next_msg = {
             let mut data = state.lock().await;
@@ -8828,7 +9142,7 @@ fn process_next_queued_message<'a>(
                 // Without this, messages arriving between pop and handle_text_message's cancel_token insert
                 // would see "not busy" and bypass the queue (FIFO violation).
                 // handle_text_message will overwrite this with its own real cancel_token.
-                data.cancel_tokens.insert(chat_id, Arc::new(CancelToken::new()));
+                insert_cancel_token_locked(&mut data, chat_id, new_cancel_token_for_owner(dispatch_id));
                 msg_debug(&format!("[queue:next] chat_id={}, placeholder cancel_token inserted", chat_id.0));
             } else {
                 msg_debug(&format!("[queue:next] chat_id={}, queue empty (len was {})", chat_id.0, queue_len_before));
@@ -8846,11 +9160,17 @@ fn process_next_queued_message<'a>(
             shared_rate_limit_wait(state, chat_id).await;
             let _ = tg!("send_message", bot.send_message(chat_id, &format!("Dequeued ({})", queued.id)).await);
 
-            if let Err(e) = handle_text_message(bot, chat_id, &queued.text, state, &queued.user_display_name, true).await {
-                msg_debug(&format!("[queue:next] chat_id={}, id={}, handle_text_message FAILED: {}", chat_id.0, queued.id, e));
-            } else {
-                msg_debug(&format!("[queue:next] chat_id={}, id={}, handle_text_message completed OK", chat_id.0, queued.id));
-            }
+            run_inline_text_dispatch(
+                bot.clone(),
+                chat_id,
+                state.clone(),
+                queued.text,
+                queued.user_display_name,
+                true,
+                dispatch_id,
+                "queue:next",
+            ).await;
+            msg_debug(&format!("[queue:next] chat_id={}, id={}, inline dispatch returned", chat_id.0, queued.id));
         }
     })
 }
@@ -8869,7 +9189,7 @@ async fn handle_text_message(
     ai_trace(&format!("[START] chat_id={}, user_text={:?}, from_queue={}", chat_id.0, truncate_str(user_text, 100), from_queue));
 
     // Register cancel token early (prevents duplicate requests while waiting for group lock)
-    let cancel_token = Arc::new(CancelToken::new());
+    let cancel_token = new_cancel_token();
     // busy_notify: (queue_enabled, queued_id, redirect_info)
     //   queue_enabled: ON/OFF mode
     //   queued_id:     ON mode push id (Some=queued, None=full)
@@ -8890,7 +9210,7 @@ async fn handle_text_message(
                         session.pending_uploads.clear();
                     }
                 }
-                data.cancel_tokens.remove(&chat_id);
+                remove_cancel_token_locked(&mut data, chat_id);
                 // Clean up orphaned "Stopping..." message from /stop during dequeue window
                 let stop_msg = data.stop_message_ids.remove(&chat_id);
                 drop(data);
@@ -8941,7 +9261,7 @@ async fn handle_text_message(
             };
             Some((qmode, qid, redirect))
         } else {
-            data.cancel_tokens.insert(chat_id, cancel_token.clone());
+            insert_cancel_token_locked(&mut data, chat_id, cancel_token.clone());
             None
         }
     };
@@ -8977,7 +9297,7 @@ async fn handle_text_message(
     // Check if cancelled during lock wait (e.g., user sent /stop)
     if cancel_token.cancelled.load(Ordering::Relaxed) {
         msg_debug(&format!("[queue:trigger] chat_id={}, source=text_cancelled_during_lock", chat_id.0));
-        { let mut data = state.lock().await; data.cancel_tokens.remove(&chat_id); }
+        { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
         drop(group_lock); // release before queue processing to avoid deadlock
         process_next_queued_message(bot, chat_id, state).await;
         return Ok(());
@@ -9017,7 +9337,7 @@ async fn handle_text_message(
             let Some((auto_sid, auto_current)) = auto_create_workspace_session(bot, state, chat_id, bot.token()).await else {
                 {
                     let mut data = state.lock().await;
-                    data.cancel_tokens.remove(&chat_id);
+                    remove_cancel_token_locked(&mut data, chat_id);
                 }
                 shared_rate_limit_wait(state, chat_id).await;
                 let _ = tg!("send_message", bot.send_message(chat_id, "Failed to create workspace.")
@@ -9040,7 +9360,7 @@ async fn handle_text_message(
         Ok(m) => m,
         Err(e) => {
             msg_debug(&format!("[queue:trigger] chat_id={}, source=text_placeholder_error", chat_id.0));
-            { let mut data = state.lock().await; data.cancel_tokens.remove(&chat_id); }
+            { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
             drop(group_lock); // release before queue processing to avoid deadlock
             process_next_queued_message(bot, chat_id, state).await;
             return Err(e);
@@ -9107,9 +9427,13 @@ async fn handle_text_message(
     // Run AI backend in a blocking thread
     let model_clone = model.clone();
     let history_clone = history;
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
     msg_debug(&format!("[handle_text_message] prompt_len={}, system_prompt_len={}, session_id={:?}, path={}, history_len={}",
         context_prompt.len(), system_prompt_owned.len(), session_id_clone, current_path_clone, history_clone.len()));
-    tokio::task::spawn_blocking(move || {
+    let _ = spawn_tracked_blocking_task(request_tasks, move || {
         let provider = detect_provider(model_clone.as_deref());
         msg_debug(&format!("[handle_text_message] provider={}, model={:?}", provider, model_clone));
         ai_trace(&format!("[EXEC] provider={}, model={:?}, prompt_len={}, system_prompt_len={}, history_len={}, session={:?}, path={}",
@@ -9250,7 +9574,11 @@ async fn handle_text_message(
         let data = state.lock().await;
         data.clear_epoch.get(&chat_id).copied().unwrap_or(0)
     };
-    tokio::spawn(async move {
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let _ = spawn_tracked_request_task(request_tasks, async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
             "🕐 P",           "🕑 Pr",          "🕒 Pro",
@@ -9757,7 +10085,11 @@ async fn handle_text_message(
                                 let bot_anim = bot_owned.clone();
                                 let state_anim = state_owned.clone();
                                 let stop_flag = verify_anim_stop.clone();
-                                Some(tokio::spawn(async move {
+                                let request_tasks = {
+                                    let data = state_owned.lock().await;
+                                    data.request_tasks.clone()
+                                };
+                                Some(spawn_tracked_request_task(request_tasks, async move {
                                     let mut idx: usize = 1;
                                     let mut last_text = VERIFY_SPINNER[0].to_string();
                                     while !stop_flag.load(Ordering::Relaxed) {
@@ -9795,7 +10127,11 @@ async fn handle_text_message(
                             if provider_for_verify == "codex" {
                                 let sid_refresh = sid_clone.clone();
                                 let cwd_refresh = cwd_clone.clone();
-                                tokio::task::spawn_blocking(move || {
+                                let request_tasks = {
+                                    let data = state_owned.lock().await;
+                                    data.request_tasks.clone()
+                                };
+                                spawn_tracked_blocking_task(request_tasks, move || {
                                     match resolve_codex_by_id(&sid_refresh) {
                                         Some(info) => {
                                             msg_debug(&format!(
@@ -9818,7 +10154,11 @@ async fn handle_text_message(
                                     }
                                 }).await.ok();
                             }
-                            let verify_result = tokio::task::spawn_blocking(move || {
+                            let request_tasks = {
+                                let data = state_owned.lock().await;
+                                data.request_tasks.clone()
+                            };
+                            let verify_result = spawn_tracked_blocking_result(request_tasks, move || {
                                 match provider_for_verify {
                                     "codex" => crate::services::codex::verify_completion_codex(&sid_clone, &cwd_clone),
                                     "opencode" => crate::services::opencode::verify_completion_opencode(&sid_clone, &cwd_clone),
@@ -9853,7 +10193,7 @@ async fn handle_text_message(
                                 msg_debug("[loop] loop_states removed during verification — skip post-verify outcome");
                             } else {
                             match verify_result {
-                                Ok(Ok(result)) => {
+                                Ok(Some(Ok(result))) => {
                                     if result.complete {
                                         msg_debug("[loop] mission_complete — loop finished");
                                         // Re-check loop_states under the lock: /clear or /model
@@ -9932,7 +10272,7 @@ async fn handle_text_message(
                                         }
                                     }
                                 }
-                                Ok(Err(e)) => {
+                                Ok(Some(Err(e))) => {
                                     msg_debug(&format!("[loop] verify_completion error: {}", e));
                                     {
                                         let mut data = state_owned.lock().await;
@@ -9941,6 +10281,13 @@ async fn handle_text_message(
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
                                     let _ = tg!("send_message", bot_owned.send_message(chat_id,
                                         &format!("⚠️ Loop verification failed: {}", e)).await);
+                                }
+                                Ok(None) => {
+                                    msg_debug("[loop] verify task aborted before start");
+                                    {
+                                        let mut data = state_owned.lock().await;
+                                        data.loop_states.remove(&chat_id);
+                                    }
                                 }
                                 Err(e) => {
                                     msg_debug(&format!("[loop] spawn_blocking error: {}", e));
@@ -10129,7 +10476,7 @@ async fn handle_text_message(
                     msg_debug(&format!("[polling] JSONL stopped: user entry written, assistant SKIPPED (raw_entries is empty)"));
                 }
             }
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             data.stop_message_ids.remove(&chat_id);
             drop(data);
             msg_debug(&format!("[queue:trigger] chat_id={}, source=text_poll_cancelled", chat_id.0));
@@ -10145,7 +10492,7 @@ async fn handle_text_message(
             msg_debug("[queue:trigger] loop_reinjected — dispatching loop feedback");
             let orphan_stop_msg = {
                 let mut data = state_owned.lock().await;
-                data.cancel_tokens.remove(&chat_id);
+                remove_cancel_token_locked(&mut data, chat_id);
                 data.stop_message_ids.remove(&chat_id)
             };
             if let Some(msg_id) = orphan_stop_msg {
@@ -10162,7 +10509,7 @@ async fn handle_text_message(
         let orphan_stop_msg = {
             let mut data = state_owned.lock().await;
             let msg_id = data.stop_message_ids.remove(&chat_id);
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             msg_id
         };
         if let Some(msg_id) = orphan_stop_msg {
@@ -11356,7 +11703,7 @@ async fn execute_schedule(
             if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
                 set.remove(&entry.id);
             }
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             if let Some(prev) = prev_session {
                 data.sessions.insert(chat_id, prev);
             } else {
@@ -11401,7 +11748,7 @@ async fn execute_schedule(
             if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
                 set.remove(&schedule_id);
             }
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             if let Some(prev) = prev_session {
                 data.sessions.insert(chat_id, prev);
             } else {
@@ -11424,7 +11771,7 @@ async fn execute_schedule(
             if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
                 set.remove(&schedule_id);
             }
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             if let Some(prev) = prev_session {
                 data.sessions.insert(chat_id, prev);
             } else {
@@ -11458,7 +11805,7 @@ async fn execute_schedule(
                 if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
                     set.remove(&schedule_id);
                 }
-                data.cancel_tokens.remove(&chat_id);
+                remove_cancel_token_locked(&mut data, chat_id);
                 if let Some(prev) = prev_session {
                     data.sessions.insert(chat_id, prev);
                 } else {
@@ -11528,8 +11875,8 @@ async fn execute_schedule(
         if let Some(existing) = data.cancel_tokens.get(&chat_id) {
             existing.clone()
         } else {
-            let token = Arc::new(CancelToken::new());
-            data.cancel_tokens.insert(chat_id, token.clone());
+            let token = new_cancel_token();
+            insert_cancel_token_locked(&mut data, chat_id, token.clone());
             token
         }
     };
@@ -11544,7 +11891,11 @@ async fn execute_schedule(
     let workspace_path_for_claude = workspace_path.clone();
     let model_clone_for_exec = model.clone();
     let bot_key_for_codex = bot_key.clone();
-    tokio::task::spawn_blocking(move || {
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let _ = spawn_tracked_blocking_task(request_tasks, move || {
         let provider = detect_provider(model_clone_for_exec.as_deref());
         sched_debug(&format!("[execute_schedule:spawn_blocking] provider={}, model={:?}",
             provider, model_clone_for_exec));
@@ -11630,7 +11981,11 @@ async fn execute_schedule(
     // "task is running" window.
     let history_start = std::time::Instant::now();
     let history_bot_key = bot_key.clone();
-    tokio::spawn(async move {
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let _ = spawn_tracked_request_task(request_tasks, async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
             "🕐 P",           "🕑 Pr",          "🕒 Pro",
@@ -12026,7 +12381,11 @@ async fn execute_schedule(
                 let sid = sid.clone();
                 let path = workspace_path_owned.clone();
                 let model = model_for_summary.clone();
-                let summary_result = tokio::task::spawn_blocking(move || {
+                let request_tasks = {
+                    let data = state_owned.lock().await;
+                    data.request_tasks.clone()
+                };
+                let summary_result = spawn_tracked_blocking_result(request_tasks, move || {
                     let claude_model = model.as_deref().and_then(claude::strip_claude_prefix);
                     claude::extract_result_summary(
                         &sid,
@@ -12035,7 +12394,7 @@ async fn execute_schedule(
                     )
                 }).await;
                 match summary_result {
-                    Ok(Ok(ref summary)) => {
+                    Ok(Some(Ok(ref summary))) => {
                         sched_debug(&format!("[execute_schedule] id={}, new context summary: {} chars", schedule_id, summary.len()));
                         Some(summary.clone())
                     }
@@ -12142,7 +12501,7 @@ async fn execute_schedule(
             schedule_id, prev_session.is_some()));
         {
             let mut data = state_owned.lock().await;
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
                 set.remove(&schedule_id);
             }
@@ -12184,7 +12543,7 @@ async fn process_bot_message(
         msg.id, msg.from, msg.to, chat_id.0, msg.content.len(), bot_username));
 
     // Register cancel token early (prevents duplicate requests while waiting for group lock)
-    let cancel_token = Arc::new(CancelToken::new());
+    let cancel_token = new_cancel_token();
     {
         let mut data = state.lock().await;
         if data.cancel_tokens.contains_key(&chat_id) {
@@ -12196,7 +12555,7 @@ async fn process_bot_message(
             // before claim, claim fails, no retry path).
             return;
         }
-        data.cancel_tokens.insert(chat_id, cancel_token.clone());
+        insert_cancel_token_locked(&mut data, chat_id, cancel_token.clone());
     }
 
     // Claim succeeded — now safe to delete the on-disk message file.
@@ -12217,7 +12576,7 @@ async fn process_bot_message(
     if cancel_token.cancelled.load(Ordering::Relaxed) {
         msg_debug(&format!("[process_bot_message] cancelled during lock wait, id={}", msg.id));
         msg_debug(&format!("[queue:trigger] chat_id={}, source=botmsg_cancelled_during_lock", chat_id.0));
-        { let mut data = state.lock().await; data.cancel_tokens.remove(&chat_id); }
+        { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
         drop(group_lock); // release before queue processing to avoid deadlock
         process_next_queued_message(bot, chat_id, state).await;
         return;
@@ -12258,7 +12617,7 @@ async fn process_bot_message(
             msg_debug(&format!("[process_bot_message] no session for chat_id={}, sending error response", chat_id.0));
             {
                 let mut data = state.lock().await;
-                data.cancel_tokens.remove(&chat_id);
+                remove_cancel_token_locked(&mut data, chat_id);
                 let cleared = data.message_queues.remove(&chat_id).map(|q| q.len()).unwrap_or(0);
                 if cleared > 0 {
                     msg_debug(&format!("[queue:clear] chat_id={}, no session (bot msg), cleared {} queued messages", chat_id.0, cleared));
@@ -12284,7 +12643,7 @@ async fn process_bot_message(
         Err(e) => {
             msg_debug(&format!("[process_bot_message] failed to send placeholder: {}, aborting", e));
             msg_debug(&format!("[queue:trigger] chat_id={}, source=botmsg_placeholder_error", chat_id.0));
-            { let mut data = state.lock().await; data.cancel_tokens.remove(&chat_id); }
+            { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
             drop(group_lock); // release before queue processing to avoid deadlock
             process_next_queued_message(bot, chat_id, state).await;
             return;
@@ -12352,7 +12711,11 @@ async fn process_bot_message(
     let bot_key_for_codex = bot_key.clone();
     msg_debug(&format!("[process_bot_message] spawning AI backend: model={:?}, history_len={}, prompt_len={}",
         model_clone, history_clone.len(), prompt_for_ai.len()));
-    tokio::task::spawn_blocking(move || {
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let _ = spawn_tracked_blocking_task(request_tasks, move || {
         let provider = detect_provider(model_clone.as_deref());
         msg_debug(&format!("[process_bot_message:spawn_blocking] provider={}, model={:?}", provider, model_clone));
         let result = if provider == "opencode" {
@@ -12476,7 +12839,11 @@ async fn process_bot_message(
     let from_bot_for_log = msg.from.clone();
     msg_debug(&format!("[process_bot_message] spawning polling loop: provider={}, msg_id={}, placeholder_msg_id={}",
         provider_str, bmsg_id_for_log, placeholder_msg_id));
-    tokio::spawn(async move {
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let _ = spawn_tracked_request_task(request_tasks, async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
             "🕐 P",           "🕑 Pr",          "🕒 Pro",
@@ -13033,7 +13400,7 @@ async fn process_bot_message(
                     msg_debug(&format!("[botmsg_poll:{}] JSONL stopped: user entry written, assistant SKIPPED (raw_entries is empty)", bmsg_id_for_log));
                 }
             }
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             let stop_msg_id = data.stop_message_ids.remove(&chat_id);
             drop(data);
             if let Some(msg_id) = stop_msg_id {
@@ -13052,7 +13419,7 @@ async fn process_bot_message(
         let orphan_stop_msg = {
             let mut data = state_owned.lock().await;
             let msg_id = data.stop_message_ids.remove(&chat_id);
-            data.cancel_tokens.remove(&chat_id);
+            remove_cancel_token_locked(&mut data, chat_id);
             msg_debug(&format!("[botmsg_poll:{}] cleaned up: orphan_stop_msg={:?}", bmsg_id_for_log, msg_id));
             msg_id
         };
@@ -13077,6 +13444,38 @@ async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_usernam
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
+        // Each cycle runs in its own child task so any panic inside the cycle
+        // (chrono parse, Telegram API call, file IO, etc.) only kills that
+        // cycle. The scheduler keeps running on the next 5-second tick. Per-
+        // dispatch state (busy slots, sessions, pending) is already protected
+        // by the inner `execute_schedule` / `process_bot_message` recovery
+        // paths, so a cycle-level panic mostly affects in-progress logging
+        // and the current iteration of the entries/messages loops.
+        let bot_c = bot.clone();
+        let state_c = state.clone();
+        let token_c = token.clone();
+        let bot_key_c = bot_key.clone();
+        let bot_username_c = bot_username.clone();
+        let bot_display_name_c = bot_display_name.clone();
+        let cycle_join = tokio::spawn(async move {
+            scheduler_cycle(bot_c, state_c, token_c, bot_key_c, bot_username_c, bot_display_name_c).await
+        });
+        if let Err(join_err) = cycle_join.await {
+            let panic_str = redact_known_tokens(&join_err.to_string());
+            msg_debug(&format!("[scheduler_loop] cycle PANICKED: {}", panic_str));
+            eprintln!("  ⚠ Scheduler cycle panicked: {} — continuing on next tick", panic_str);
+        }
+    }
+}
+
+async fn scheduler_cycle(
+    bot: Bot,
+    state: SharedState,
+    token: String,
+    bot_key: String,
+    bot_username: String,
+    bot_display_name: String,
+) {
         // Scan schedule directory
         let entries = list_schedule_entries(&bot_key, None);
 
@@ -13104,7 +13503,7 @@ async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_usernam
             enum SchedAction {
                 Skip,
                 DiscardExpired,
-                Execute(Option<ChatSession>),
+                Execute(Option<ChatSession>, u64),
             }
 
             let action = {
@@ -13156,7 +13555,8 @@ async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_usernam
                     } else {
                         // Not busy — backup session, replace with schedule-specific session, and execute
                         let prev = data.sessions.get(&chat_id).cloned();
-                        sched_debug(&format!("[scheduler_loop] id={}, not busy → execute (has_prev_session={})", entry.id, prev.is_some()));
+                        let dispatch_id = next_dispatch_id();
+                        sched_debug(&format!("[scheduler_loop] id={}, not busy → execute (has_prev_session={}, dispatch_id={})", entry.id, prev.is_some(), dispatch_id));
                         data.sessions.insert(chat_id, ChatSession {
                             session_id: None,
                             current_path: Some(entry.current_path.clone()),
@@ -13164,10 +13564,12 @@ async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_usernam
                             pending_uploads: Vec::new(),
                         });
                         data.pending_schedules.entry(chat_id).or_default().insert(entry.id.clone());
-                        // Pre-insert cancel_token to prevent race with incoming user messages
-                        let cancel_token = Arc::new(CancelToken::new());
-                        data.cancel_tokens.insert(chat_id, cancel_token);
-                        SchedAction::Execute(prev)
+                        // Pre-insert cancel_token tagged with this dispatch_id so a panic
+                        // inside execute_schedule can be safely reclaimed by the owner
+                        // check in reclaim_panicked_dispatch_token.
+                        let cancel_token = new_cancel_token_for_owner(dispatch_id);
+                        insert_cancel_token_locked(&mut data, chat_id, cancel_token);
+                        SchedAction::Execute(prev, dispatch_id)
                     }
                 }
             };
@@ -13181,9 +13583,55 @@ async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_usernam
                     sched_debug(&format!("[scheduler_loop] id={}, discarded expired", entry.id));
                     continue;
                 }
-                SchedAction::Execute(prev_session) => {
-                    sched_debug(&format!("[scheduler_loop] id={}, calling execute_schedule", entry.id));
-                    execute_schedule(&bot, chat_id, entry, &state, &token, prev_session).await;
+                SchedAction::Execute(prev_session, dispatch_id) => {
+                    sched_debug(&format!("[scheduler_loop] id={}, calling execute_schedule (dispatch_id={})", entry.id, dispatch_id));
+                    // Run inside CURRENT_DISPATCH_ID scope and inside a child spawn so
+                    // a panic inside execute_schedule kills only that one task — the
+                    // scheduler keeps running and the busy slot is reclaimed via the
+                    // owner_id check. Session and pending_schedules state inserted
+                    // by the pre-execute lock above are also restored on panic so
+                    // the chat does not see an empty session or a stuck pending id.
+                    let bot_c = bot.clone();
+                    let state_c = state.clone();
+                    let token_c = token.clone();
+                    let entry_c = entry.clone();
+                    let entry_id_for_log = entry.id.clone();
+                    let prev_for_recover = prev_session.clone();
+                    let join = tokio::spawn(async move {
+                        CURRENT_DISPATCH_ID
+                            .scope(dispatch_id, async move {
+                                execute_schedule(&bot_c, chat_id, &entry_c, &state_c, &token_c, prev_session).await
+                            })
+                            .await
+                    });
+                    if let Err(join_err) = join.await {
+                        let panic_str = redact_known_tokens(&join_err.to_string());
+                        msg_debug(&format!(
+                            "[scheduler_loop] id={}, execute_schedule PANICKED: {}",
+                            entry_id_for_log, panic_str
+                        ));
+                        eprintln!(
+                            "  ⚠ Chat {} schedule {} panicked: {} — recovering",
+                            chat_id.0, entry_id_for_log, panic_str
+                        );
+                        reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:execute").await;
+                        // Restore session/pending state that the pre-execute lock
+                        // had mutated on this dispatch's behalf. If the panic
+                        // happened after execute_schedule already restored these
+                        // (e.g. very late in cleanup), the writes here are
+                        // overwriting equivalent state — safe and idempotent.
+                        let mut data = state.lock().await;
+                        match prev_for_recover {
+                            Some(prev) => { data.sessions.insert(chat_id, prev); }
+                            None => { data.sessions.remove(&chat_id); }
+                        }
+                        if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
+                            set.remove(&entry_id_for_log);
+                            if set.is_empty() {
+                                data.pending_schedules.remove(&chat_id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -13225,14 +13673,42 @@ async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_usernam
                 // own claim — leaving the file deleted but the message unprocessed.
                 msg_debug(&format!("[scheduler_loop] processing bot message: {} (from={}, to={}, chat_id={})", msg.id, msg.from, msg.to, chat_id_num));
 
-                // Process the message (will delete the file iff its claim succeeds)
-                process_bot_message(&bot, chat_id, msg, &state, &token, &bot_username, &bot_display_name).await;
-                msg_debug(&format!("[scheduler_loop] process_bot_message returned for msg: {}", msg.id));
+                // Process the message (will delete the file iff its claim succeeds).
+                // Run inside CURRENT_DISPATCH_ID scope and a child spawn so a panic
+                // inside process_bot_message does not take down the scheduler — the
+                // owner_id check then reclaims the busy slot inserted by this dispatch.
+                let dispatch_id = next_dispatch_id();
+                let bot_c = bot.clone();
+                let state_c = state.clone();
+                let token_c = token.clone();
+                let bot_username_c = bot_username.clone();
+                let bot_display_name_c = bot_display_name.clone();
+                let msg_c = msg.clone();
+                let msg_id_for_log = msg.id.clone();
+                let join = tokio::spawn(async move {
+                    CURRENT_DISPATCH_ID
+                        .scope(dispatch_id, async move {
+                            process_bot_message(&bot_c, chat_id, &msg_c, &state_c, &token_c, &bot_username_c, &bot_display_name_c).await
+                        })
+                        .await
+                });
+                if let Err(join_err) = join.await {
+                    let panic_str = redact_known_tokens(&join_err.to_string());
+                    msg_debug(&format!(
+                        "[scheduler_loop] process_bot_message id={} PANICKED: {}",
+                        msg_id_for_log, panic_str
+                    ));
+                    eprintln!(
+                        "  ⚠ Chat {} bot-message {} panicked: {} — recovering",
+                        chat_id.0, msg_id_for_log, panic_str
+                    );
+                    reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:botmsg").await;
+                }
+                msg_debug(&format!("[scheduler_loop] process_bot_message returned for msg: {}", msg_id_for_log));
             }
 
             // Check for timed-out sent messages
             msg_debug("[scheduler_loop] checking message timeouts");
             check_message_timeouts(&bot, &bot_username, &state).await;
         }
-    }
 }

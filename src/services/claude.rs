@@ -300,6 +300,7 @@ pub enum StreamMessage {
 pub struct CancelToken {
     pub cancelled: std::sync::atomic::AtomicBool,
     pub child_pid: std::sync::Mutex<Option<u32>>,
+    pub owner_dispatch_id: std::sync::atomic::AtomicU64,
 }
 
 impl CancelToken {
@@ -307,6 +308,7 @@ impl CancelToken {
         Self {
             cancelled: std::sync::atomic::AtomicBool::new(false),
             child_pid: std::sync::Mutex::new(None),
+            owner_dispatch_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
