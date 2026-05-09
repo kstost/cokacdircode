@@ -1130,11 +1130,14 @@ IMPORTANT: Format your responses using Markdown for better readability:
         })?;
     debug_log(&format!("Claude process spawned successfully in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
 
-    // Store child PID in cancel token so the caller can kill it externally
+    // Store child PID in cancel token so the caller can kill it externally.
+    // Recover from a poisoned mutex (a prior holder panicked) instead of
+    // silently dropping the PID — without the PID stored, /stop cannot
+    // signal this child and it would leak as an orphan.
     if let Some(ref token) = cancel_token {
-        if let Ok(mut guard) = token.child_pid.lock() {
-            *guard = Some(child.id());
-        }
+        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(child.id());
+        drop(guard);
         // If /stop arrived before PID was stored, kill immediately
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             kill_child_tree(&mut child);

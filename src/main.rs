@@ -910,8 +910,14 @@ fn handle_ccserver(tokens: Vec<String>) {
     println!();
 
     if total == 1 && discord_tokens.is_empty() && slack_tokens.is_empty() {
-        // Single Telegram bot — run directly
-        rt.block_on(services::telegram::run_bot(&tg_tokens[0], None));
+        // Single Telegram bot — run directly. A `BotExit::Fatal`
+        // (revoked token, persistent Conflict) maps to exit code 1 so
+        // the supervisor (systemd, docker) restarts cokacdir instead of
+        // observing a clean exit and leaving the bot dead.
+        let exit = rt.block_on(services::telegram::run_bot(&tg_tokens[0], None));
+        if matches!(exit, services::telegram::BotExit::Fatal) {
+            std::process::exit(1);
+        }
     } else if total == 1 && tg_tokens.is_empty() && slack_tokens.is_empty() {
         // Single Discord bot — run bridge directly. A `BridgeExit::Fatal`
         // (backend death, init failure) maps to exit code 1 here so
@@ -943,8 +949,12 @@ fn handle_ccserver(tokens: Vec<String>) {
             let any_fatal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let mut handles = Vec::new();
             for token in tg_tokens {
+                let any_fatal = any_fatal.clone();
                 handles.push(tokio::spawn(async move {
-                    services::telegram::run_bot(&token, None).await;
+                    let exit = services::telegram::run_bot(&token, None).await;
+                    if matches!(exit, services::telegram::BotExit::Fatal) {
+                        any_fatal.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }));
             }
             for dt in discord_tokens {

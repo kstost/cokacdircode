@@ -1308,11 +1308,13 @@ fn execute_command_streaming_legacy(
     })?;
     opencode_debug(&format!("[stream] spawned PID={}", child.id()));
 
-    // Store PID for cancel
+    // Store PID for cancel. Recover from a poisoned mutex (a prior holder
+    // panicked) instead of silently dropping the PID — without it stored,
+    // /stop cannot signal this child.
     if let Some(ref token) = cancel_token {
-        if let Ok(mut guard) = token.child_pid.lock() {
-            *guard = Some(child.id());
-        }
+        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(child.id());
+        drop(guard);
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             opencode_debug("[stream] cancelled before stdin write, killing");
             kill_child_tree(&mut child);
@@ -1801,12 +1803,12 @@ async fn execute_command_streaming_serve(
     };
     opencode_debug(&format!("[serve] ready at {}", base_url));
 
-    // Register PID for external cancel
+    // Register PID for external cancel. Recover from a poisoned mutex
+    // (a prior holder panicked) instead of silently dropping the PID.
     if let Some(ref token) = cancel_token {
         if let Some(pid) = serve_child.id() {
-            if let Ok(mut guard) = token.child_pid.lock() {
-                *guard = Some(pid);
-            }
+            let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(pid);
         }
     }
 

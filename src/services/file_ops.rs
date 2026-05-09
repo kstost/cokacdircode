@@ -302,134 +302,146 @@ fn copy_dir_recursive_with_progress_inner(
         ));
     }
 
-    // Detect symlink loops via canonicalised path.
+    // Detect symlink loops via canonicalised path. `visited` tracks only
+    // the *current recursion stack* (DFS path), not every directory ever
+    // seen — otherwise two siblings whose symlinks resolve to the same
+    // physical directory would be falsely reported as a cycle. We insert
+    // here and remove on exit (after the body, regardless of error).
     let canonical_src = src.canonicalize().map(strip_unc_prefix).unwrap_or_else(|_| src.to_path_buf());
     if visited.contains(&canonical_src) {
         return Err(io::Error::other(
             format!("Circular symlink detected: {}", src.display()),
         ));
     }
-    visited.insert(canonical_src);
+    visited.insert(canonical_src.clone());
 
-    // Check for cancellation
-    if cancel_flag.load(Ordering::Relaxed) {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
-    }
-
-    fs::create_dir_all(dest)?;
-
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-
+    // Run the body inside an IIFE so any early return (`?`, explicit
+    // `return Err`) still goes through the `visited.remove` cleanup
+    // below — that's what enforces stack-only semantics.
+    let result: io::Result<()> = (|| {
         // Check for cancellation
         if cancel_flag.load(Ordering::Relaxed) {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
         }
 
-        let metadata = fs::symlink_metadata(&src_path)?;
+        fs::create_dir_all(dest)?;
 
-        if metadata.is_symlink() {
-            // Reject symlinks pointing to sensitive system paths
-            #[cfg(unix)]
-            if let Ok(resolved) = src_path.canonicalize().map(strip_unc_prefix) {
-                let resolved_str = resolved.to_string_lossy();
-                if target_is_sensitive(&resolved_str) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "Symlink '{}' points to sensitive system path: {}",
-                            src_path.display(),
-                            resolved_str
-                        ),
-                    ));
-                }
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dest_path = dest.join(entry.file_name());
+
+            // Check for cancellation
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
             }
-            // Copy symlink as-is
-            #[cfg(unix)]
-            {
-                let link_target = fs::read_link(&src_path)?;
-                std::os::unix::fs::symlink(&link_target, &dest_path)?;
-            }
-            #[cfg(not(unix))]
-            {
-                if src_path.is_file() {
-                    fs::copy(&src_path, &dest_path)?;
-                    if let Ok(target_meta) = fs::metadata(&src_path) {
-                        let _ = preserve_timestamps(&dest_path, &target_meta);
+
+            let metadata = fs::symlink_metadata(&src_path)?;
+
+            if metadata.is_symlink() {
+                // Reject symlinks pointing to sensitive system paths
+                #[cfg(unix)]
+                if let Ok(resolved) = src_path.canonicalize().map(strip_unc_prefix) {
+                    let resolved_str = resolved.to_string_lossy();
+                    if target_is_sensitive(&resolved_str) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Symlink '{}' points to sensitive system path: {}",
+                                src_path.display(),
+                                resolved_str
+                            ),
+                        ));
                     }
                 }
-            }
-
-            *completed_files += 1;
-            let _ = progress_tx.send(ProgressMessage::TotalProgress(
-                *completed_files,
-                total_files,
-                *completed_bytes,
-                total_bytes,
-            ));
-        } else if metadata.is_dir() {
-            copy_dir_recursive_with_progress_inner(
-                &src_path,
-                &dest_path,
-                cancel_flag,
-                progress_tx,
-                completed_bytes,
-                completed_files,
-                total_bytes,
-                total_files,
-                visited,
-                depth + 1,
-            )?;
-        } else {
-            // Regular file - copy with progress
-            let filename = src_path.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-
-            let _ = progress_tx.send(ProgressMessage::FileStarted(filename.clone()));
-
-            let file_size = metadata.len();
-            let file_completed_bytes = *completed_bytes;
-
-            let result = copy_file_with_progress(
-                &src_path,
-                &dest_path,
-                cancel_flag,
-                |copied, total| {
-                    let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
-                    let _ = progress_tx.send(ProgressMessage::TotalProgress(
-                        *completed_files,
-                        total_files,
-                        file_completed_bytes + copied,
-                        total_bytes,
-                    ));
-                },
-            );
-
-            match result {
-                Ok(_) => {
-                    *completed_bytes += file_size;
-                    *completed_files += 1;
-                    let _ = progress_tx.send(ProgressMessage::FileCompleted(filename));
+                // Copy symlink as-is
+                #[cfg(unix)]
+                {
+                    let link_target = fs::read_link(&src_path)?;
+                    std::os::unix::fs::symlink(&link_target, &dest_path)?;
                 }
-                Err(e) => {
-                    if e.kind() == io::ErrorKind::Interrupted {
-                        return Err(e);
+                #[cfg(not(unix))]
+                {
+                    if src_path.is_file() {
+                        fs::copy(&src_path, &dest_path)?;
+                        if let Ok(target_meta) = fs::metadata(&src_path) {
+                            let _ = preserve_timestamps(&dest_path, &target_meta);
+                        }
                     }
-                    let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+                }
+
+                *completed_files += 1;
+                let _ = progress_tx.send(ProgressMessage::TotalProgress(
+                    *completed_files,
+                    total_files,
+                    *completed_bytes,
+                    total_bytes,
+                ));
+            } else if metadata.is_dir() {
+                copy_dir_recursive_with_progress_inner(
+                    &src_path,
+                    &dest_path,
+                    cancel_flag,
+                    progress_tx,
+                    completed_bytes,
+                    completed_files,
+                    total_bytes,
+                    total_files,
+                    visited,
+                    depth + 1,
+                )?;
+            } else {
+                // Regular file - copy with progress
+                let filename = src_path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+
+                let _ = progress_tx.send(ProgressMessage::FileStarted(filename.clone()));
+
+                let file_size = metadata.len();
+                let file_completed_bytes = *completed_bytes;
+
+                let result = copy_file_with_progress(
+                    &src_path,
+                    &dest_path,
+                    cancel_flag,
+                    |copied, total| {
+                        let _ = progress_tx.send(ProgressMessage::FileProgress(copied, total));
+                        let _ = progress_tx.send(ProgressMessage::TotalProgress(
+                            *completed_files,
+                            total_files,
+                            file_completed_bytes + copied,
+                            total_bytes,
+                        ));
+                    },
+                );
+
+                match result {
+                    Ok(_) => {
+                        *completed_bytes += file_size;
+                        *completed_files += 1;
+                        let _ = progress_tx.send(ProgressMessage::FileCompleted(filename));
+                    }
+                    Err(e) => {
+                        if e.kind() == io::ErrorKind::Interrupted {
+                            return Err(e);
+                        }
+                        let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+                    }
                 }
             }
         }
-    }
 
-    // Preserve directory timestamps (must be done after all contents are copied)
-    if let Ok(src_metadata) = fs::metadata(src) {
-        let _ = preserve_timestamps(dest, &src_metadata);
-    }
+        // Preserve directory timestamps (must be done after all contents are copied)
+        if let Ok(src_metadata) = fs::metadata(src) {
+            let _ = preserve_timestamps(dest, &src_metadata);
+        }
 
-    Ok(())
+        Ok(())
+    })();
+
+    visited.remove(&canonical_src);
+    result
 }
 
 /// Copy files with progress reporting (main entry point for progress-enabled copy)
@@ -863,74 +875,85 @@ fn copy_dir_recursive_inner(
         ));
     }
 
-    // Get canonical path to detect symlink loops
+    // Detect symlink loops via canonicalised path. `visited` tracks only
+    // the *current recursion stack* (DFS path), not every directory ever
+    // seen — otherwise two siblings whose canonical paths resolve to the
+    // same physical directory (bind mount, BTRFS subvolume, etc.) would
+    // be falsely reported as a cycle. We insert here and remove on exit
+    // (after the body, regardless of error).
     let canonical_src = src.canonicalize().map(strip_unc_prefix).unwrap_or_else(|_| src.to_path_buf());
-
-    // Check for circular symlink
     if visited.contains(&canonical_src) {
         return Err(io::Error::other(
             format!("Circular symlink detected: {}", src.display()),
         ));
     }
-    visited.insert(canonical_src);
+    visited.insert(canonical_src.clone());
 
-    fs::create_dir_all(dest)?;
+    // Run the body inside an IIFE so any early return (`?`, explicit
+    // `return Err`) still goes through the `visited.remove` cleanup
+    // below — that's what enforces stack-only semantics.
+    let result: io::Result<()> = (|| {
+        fs::create_dir_all(dest)?;
 
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let src_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let src_path = entry.path();
+            let dest_path = dest.join(entry.file_name());
 
-        // Get metadata without following symlinks
-        let metadata = fs::symlink_metadata(&src_path)?;
+            // Get metadata without following symlinks
+            let metadata = fs::symlink_metadata(&src_path)?;
 
-        if metadata.is_symlink() {
-            // Reject symlinks pointing to sensitive system paths
-            #[cfg(unix)]
-            if let Ok(resolved) = src_path.canonicalize().map(strip_unc_prefix) {
-                let resolved_str = resolved.to_string_lossy();
-                if target_is_sensitive(&resolved_str) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "Symlink '{}' points to sensitive system path: {}",
-                            src_path.display(),
-                            resolved_str
-                        ),
-                    ));
-                }
-            }
-            // Copy symlink as-is (don't follow it)
-            #[cfg(unix)]
-            {
-                let link_target = fs::read_link(&src_path)?;
-                std::os::unix::fs::symlink(&link_target, &dest_path)?;
-            }
-            #[cfg(not(unix))]
-            {
-                // On non-Unix, just skip symlinks or copy as regular file
-                if src_path.is_file() {
-                    fs::copy(&src_path, &dest_path)?;
-                    if let Ok(target_meta) = fs::metadata(&src_path) {
-                        let _ = preserve_timestamps(&dest_path, &target_meta);
+            if metadata.is_symlink() {
+                // Reject symlinks pointing to sensitive system paths
+                #[cfg(unix)]
+                if let Ok(resolved) = src_path.canonicalize().map(strip_unc_prefix) {
+                    let resolved_str = resolved.to_string_lossy();
+                    if target_is_sensitive(&resolved_str) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "Symlink '{}' points to sensitive system path: {}",
+                                src_path.display(),
+                                resolved_str
+                            ),
+                        ));
                     }
                 }
+                // Copy symlink as-is (don't follow it)
+                #[cfg(unix)]
+                {
+                    let link_target = fs::read_link(&src_path)?;
+                    std::os::unix::fs::symlink(&link_target, &dest_path)?;
+                }
+                #[cfg(not(unix))]
+                {
+                    // On non-Unix, just skip symlinks or copy as regular file
+                    if src_path.is_file() {
+                        fs::copy(&src_path, &dest_path)?;
+                        if let Ok(target_meta) = fs::metadata(&src_path) {
+                            let _ = preserve_timestamps(&dest_path, &target_meta);
+                        }
+                    }
+                }
+            } else if metadata.is_dir() {
+                copy_dir_recursive_inner(&src_path, &dest_path, visited, depth + 1)?;
+            } else {
+                fs::copy(&src_path, &dest_path)?;
+                // Preserve file timestamps
+                let _ = preserve_timestamps(&dest_path, &metadata);
             }
-        } else if metadata.is_dir() {
-            copy_dir_recursive_inner(&src_path, &dest_path, visited, depth + 1)?;
-        } else {
-            fs::copy(&src_path, &dest_path)?;
-            // Preserve file timestamps
-            let _ = preserve_timestamps(&dest_path, &metadata);
         }
-    }
 
-    // Preserve directory timestamps (must be done after all contents are copied)
-    if let Ok(src_metadata) = fs::metadata(src) {
-        let _ = preserve_timestamps(dest, &src_metadata);
-    }
+        // Preserve directory timestamps (must be done after all contents are copied)
+        if let Ok(src_metadata) = fs::metadata(src) {
+            let _ = preserve_timestamps(dest, &src_metadata);
+        }
 
-    Ok(())
+        Ok(())
+    })();
+
+    visited.remove(&canonical_src);
+    result
 }
 
 /// Move a file or directory

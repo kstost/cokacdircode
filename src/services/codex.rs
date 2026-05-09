@@ -453,11 +453,13 @@ pub fn execute_command_streaming(
         })?;
     codex_debug_log(&format!("Codex process spawned in {:?}, pid={:?}", spawn_start.elapsed(), child.id()));
 
-    // Store child PID in cancel token
+    // Store child PID in cancel token. Recover from a poisoned mutex
+    // (a prior holder panicked) instead of silently dropping the PID —
+    // without the PID stored, /stop cannot signal this child.
     if let Some(ref token) = cancel_token {
-        if let Ok(mut guard) = token.child_pid.lock() {
-            *guard = Some(child.id());
-        }
+        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(child.id());
+        drop(guard);
         // If /stop arrived before PID was stored, kill immediately
         if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
             kill_child_tree(&mut child);

@@ -16,7 +16,12 @@ const READ_BUF_SIZE: usize = 64 * 1024; // 64KB
 /// `read` calls — `Read::read` is allowed to short-read, and the previous
 /// implementation could compare two slices of unequal length and falsely
 /// report identical files as different.
-fn files_byte_equal(a: &Path, b: &Path) -> io::Result<bool> {
+///
+/// Polls `cancel_flag` between chunks so a `/stop` during a multi-GB
+/// compare returns promptly instead of waiting for the file pair to
+/// finish. Cancellation is reported as `io::ErrorKind::Interrupted` so
+/// the caller can distinguish it from a real I/O error.
+fn files_byte_equal(a: &Path, b: &Path, cancel_flag: &Arc<AtomicBool>) -> io::Result<bool> {
     let fa = File::open(a)?;
     let fb = File::open(b)?;
     let len_a = fa.metadata()?.len();
@@ -30,6 +35,9 @@ fn files_byte_equal(a: &Path, b: &Path) -> io::Result<bool> {
     let mut buf_b = [0u8; READ_BUF_SIZE];
     let mut remaining = len_a;
     while remaining > 0 {
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
         let chunk = std::cmp::min(remaining, READ_BUF_SIZE as u64) as usize;
         ra.read_exact(&mut buf_a[..chunk])?;
         rb.read_exact(&mut buf_b[..chunk])?;
@@ -311,13 +319,19 @@ pub fn run_dedup(
             }
 
             // Verify byte-level equality before destructive deletion (guard against MD5 collision)
-            match files_byte_equal(keep_path, dup_path) {
+            match files_byte_equal(keep_path, dup_path, &cancel_flag) {
                 Ok(true) => {}
                 Ok(false) => {
                     let _ = tx.send(DedupMessage::Log(format!(
                         "SKIP (hash collision; contents differ): {}",
                         dup_path.display()
                     )));
+                    continue;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    // Cancelled mid-compare. Outer cancel check on the next
+                    // iteration emits the standard "Cancelled" summary; just
+                    // skip this pair without logging a verify-failure error.
                     continue;
                 }
                 Err(e) => {

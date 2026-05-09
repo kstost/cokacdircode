@@ -644,6 +644,48 @@ struct ChatSession {
     /// File upload records not yet sent to Claude AI.
     /// Drained and prepended to the next user prompt so Claude knows about uploaded files.
     pending_uploads: Vec<String>,
+    /// Wall-clock instant of the most recent push to `pending_uploads`.
+    /// Used to expire stale `;`-prefixed broadcast uploads in group chats
+    /// when no addressed message arrives within `PENDING_UPLOAD_STALE_TTL`.
+    /// Invariant: `Some` iff `pending_uploads` is non-empty (maintained by
+    /// helper methods on this struct).
+    pending_uploads_added_at: Option<std::time::Instant>,
+}
+
+/// Maximum age for `pending_uploads` before they are considered stale and
+/// dropped on the next unrelated message. 5 minutes balances "user finished
+/// their photo burst and is now typing the addressed message" against
+/// "user moved on hours ago, don't surprise them by re-attaching old data".
+const PENDING_UPLOAD_STALE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl ChatSession {
+    /// Push a new upload record and refresh the freshness timestamp.
+    fn push_pending_upload(&mut self, record: String) {
+        self.pending_uploads.push(record);
+        self.pending_uploads_added_at = Some(std::time::Instant::now());
+    }
+
+    /// Append upload records (e.g. restoring queued uploads on dequeue) and
+    /// refresh the freshness timestamp if any were added.
+    fn extend_pending_uploads<I: IntoIterator<Item = String>>(&mut self, iter: I) {
+        let before = self.pending_uploads.len();
+        self.pending_uploads.extend(iter);
+        if self.pending_uploads.len() > before {
+            self.pending_uploads_added_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Drain pending uploads and reset the freshness timestamp.
+    fn take_pending_uploads(&mut self) -> Vec<String> {
+        self.pending_uploads_added_at = None;
+        std::mem::take(&mut self.pending_uploads)
+    }
+
+    /// Empty pending uploads and reset the freshness timestamp.
+    fn clear_pending_uploads(&mut self) {
+        self.pending_uploads.clear();
+        self.pending_uploads_added_at = None;
+    }
 }
 
 /// Bot-level settings persisted to disk
@@ -2689,6 +2731,7 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
         current_path: None,
         history: Vec::new(),
         pending_uploads: Vec::new(),
+        pending_uploads_added_at: None,
     });
     session.current_path = Some(last_path.clone());
     if let Some((session_data, _)) = existing {
@@ -2777,6 +2820,7 @@ async fn auto_create_workspace_session(
                 current_path: None,
                 history: Vec::new(),
                 pending_uploads: Vec::new(),
+                pending_uploads_added_at: None,
             });
             session.current_path = Some(auto_path.clone());
             session.session_id = None;
@@ -3071,18 +3115,46 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
     json[key] = entry;
     if let Ok(s) = serde_json::to_string_pretty(&json) {
         let tmp_path = path.with_extension("json.tmp");
-        if fs::write(&tmp_path, &s).is_ok() {
+        // Create tmp with 0o600 *atomically* on unix so the post-write
+        // window between fs::write (defaulting to 0o644 minus umask) and
+        // a follow-up set_permissions cannot expose the bot token to
+        // another local user. We remove any leftover tmp from a prior
+        // crash first, because `OpenOptions::mode` only applies to
+        // newly-created files — re-opening a stale tmp with looser
+        // permissions would silently keep them.
+        let write_ok = {
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600));
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let _ = fs::remove_file(&tmp_path);
+                let mut opts = fs::OpenOptions::new();
+                opts.write(true).create_new(true).mode(0o600);
+                match opts.open(&tmp_path) {
+                    Ok(mut f) => f.write_all(s.as_bytes()).is_ok(),
+                    Err(_) => false,
+                }
             }
+            #[cfg(not(unix))]
+            {
+                fs::write(&tmp_path, &s).is_ok()
+            }
+        };
+        if write_ok {
+            // Rename preserves the 0o600 bits set above. The follow-up
+            // set_permissions is retained as a safety net for the rare
+            // case where `path` already existed with looser permissions
+            // and was hardlinked somewhere — rename replaces the inode,
+            // but `set_permissions` here is harmless and self-documenting.
             let _ = fs::rename(&tmp_path, &path);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
             }
+        } else {
+            // Best-effort cleanup of partial tmp file on write failure.
+            let _ = fs::remove_file(&tmp_path);
         }
     }
     // lock released when lock_file is dropped
@@ -3234,8 +3306,16 @@ fn is_owner_only_command(text: &str) -> bool {
     let Some(name) = command_name(text) else { return false; };
     matches!(
         name,
-        "start"
-            | "clear"
+        // `start` is intentionally NOT owner-only. Once a group is set to
+        // `/public on`, any member can already run arbitrary shell
+        // commands through the `!` prefix (`handle_shell_command`),
+        // which is strictly more powerful than what `/start` does
+        // (switching the bot's working directory). Blocking `/start`
+        // while leaving `!` open would be security theater. `/public
+        // off` groups already silent-reject every non-owner message
+        // upstream (see the imprinting check), so dropping `start`
+        // here does not weaken the closed-group case either.
+        "clear"
             | "public"
             | "setpollingtime"
             | "model"
@@ -3393,16 +3473,20 @@ fn new_cancel_token_for_owner(owner_dispatch_id: u64) -> Arc<CancelToken> {
 
 fn cancel_token_now(token: &Arc<CancelToken>) {
     token.cancelled.store(true, Ordering::Relaxed);
-    if let Ok(guard) = token.child_pid.lock() {
-        if let Some(pid) = *guard {
-            #[cfg(unix)]
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
-            #[cfg(windows)]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/PID", &pid.to_string(), "/T", "/F"])
-                    .output();
-            }
+    // Recover from a poisoned mutex (a prior holder panicked) instead of
+    // silently skipping the kill — without SIGTERM the streaming reader
+    // stays blocked on stdout until the child exits naturally, defeating
+    // the whole point of /stop. Mirrors the writer-side recovery in the
+    // PID-store paths.
+    let guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(pid) = *guard {
+        #[cfg(unix)]
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .output();
         }
     }
 }
@@ -3574,6 +3658,17 @@ enum PollingExit {
     Fatal(String),
 }
 
+/// Outcome of a `run_bot` invocation, surfaced to the caller in `main` so
+/// that `Fatal` (revoked token, persistent Conflict, or other
+/// non-recoverable polling condition) can map to a non-zero process exit
+/// code. Mirrors the role of `BridgeExit` for Discord/Slack — without
+/// this, a Telegram-only deployment whose token gets revoked would exit
+/// with status 0 and a supervisor (systemd, docker) would not restart it.
+pub enum BotExit {
+    Graceful,
+    Fatal,
+}
+
 /// Classify a `getUpdates` error as a non-recoverable misconfiguration we
 /// must surface to the user instead of silently retrying. Returns `Some`
 /// with a human-readable label only for cases where retrying cannot help.
@@ -3731,6 +3826,15 @@ async fn run_chat_worker(
 /// Dispatch a single unit to its real handler. Album fragments (size 1)
 /// fall through to the regular text path; size ≥ 2 albums hit the atomic
 /// album handler.
+///
+/// FIFO invariant: this function is awaited inline by `run_chat_worker`,
+/// which is single-consumer per chat. Long-running work (AI streaming,
+/// shell commands, etc.) MUST be spawned via `spawn_tracked_request_task`
+/// / `spawn_tracked_blocking_task` so the handler returns promptly and
+/// the worker can pull the next unit. Awaiting a slow operation directly
+/// here head-of-line-blocks every subsequent message in the same chat —
+/// including `/stop`, `/queue`, and other fast commands. See 0.6.1
+/// changelog for the original per-chat FIFO design.
 async fn process_unit(
     unit: DispatchUnit,
     bot: Bot,
@@ -3812,7 +3916,7 @@ async fn get_updates_with_retry(
 /// Entry point: start the Telegram bot with long polling.
 /// `api_url`: Optional API base URL override (used by messenger bridge proxy).
 ///            When None, connects to the real Telegram API.
-pub async fn run_bot(token: &str, api_url: Option<&str>) {
+pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
     // Register before any debug logging so a startup failure log still gets
     // its token redacted.
     register_token_for_redaction(token);
@@ -4012,7 +4116,17 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
                     Err(e) => {
                         eprintln!("  ✗ FATAL: failed to confirm pending updates after {} attempts: {}", FLUSH_MAX_ATTEMPTS, redact_err(&e));
                         eprintln!("    Aborting to prevent processing stale messages.");
-                        std::process::exit(1);
+                        // Return Fatal instead of `process::exit(1)` so the
+                        // RAII guards installed earlier in this function run:
+                        // `_scheduler_guard` aborts the already-spawned
+                        // scheduler, and `_run_bot_cleanup` SIGTERMs any
+                        // child process the scheduler may have launched
+                        // during the gap between its spawn and this flush
+                        // failure. Direct `process::exit` skipped both,
+                        // orphaning children and — in multi-bot mode —
+                        // tearing down healthy sibling bots (Discord/Slack)
+                        // that were running in the same runtime.
+                        return BotExit::Fatal;
                     }
                 }
             } else {
@@ -4023,7 +4137,9 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         Err(e) => {
             eprintln!("  ✗ FATAL: failed to fetch pending updates after {} attempts: {}", FLUSH_MAX_ATTEMPTS, redact_err(&e));
             eprintln!("    Cannot safely start polling without flushing — aborting.");
-            std::process::exit(1);
+            // See comment on the symmetric path above: return Fatal so the
+            // RAII guards run and sibling bots survive in multi-bot mode.
+            return BotExit::Fatal;
         }
     }
 
@@ -4051,6 +4167,11 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
     let token_for_loop = token.to_string();
     let username_for_loop = bot_username;
     let mut reconnect_backoff_secs = 5u64;
+    // Tracks why the loop exits so the caller can map it to a process
+    // exit code. The only break path today is `PollingExit::Fatal`; any
+    // future graceful-shutdown signal that breaks the loop without
+    // setting this stays `Graceful` by default.
+    let mut bot_exit = BotExit::Graceful;
 
     loop {
         let loop_start = std::time::Instant::now();
@@ -4071,6 +4192,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
                 eprintln!("  ✗ Bot @{} stopped: {}", username_for_loop, reason);
                 eprintln!("    No reconnect — fix the underlying issue and restart cokacdir.");
                 msg_debug(&format!("[run_bot] polling exited fatally: {}", reason));
+                bot_exit = BotExit::Fatal;
                 break;
             }
             Err(e) => {
@@ -4092,10 +4214,19 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) {
         }
     }
 
-    // Drop chat-worker senders so the worker tasks observe channel closure
-    // and exit on their own (no abort needed; each is between units).
+    // Tear down per-chat workers. Clearing the map drops each
+    // `ChatWorkerEntry`, which (a) drops the stored `tx` so workers waiting
+    // on `recv().await` observe channel closure and exit, and (b) fires
+    // `abort()` on the worker's outer task via `ChatWorkerEntry::Drop` —
+    // necessary to wake a worker stuck on `join.await` for an in-flight
+    // unit. The per-unit handler is spawned as a separate child task whose
+    // `JoinHandle` drop does NOT abort it, so the handler runs to
+    // completion and is never killed mid-execution. Any cancel_token left
+    // in the map by a panicked handler whose worker was aborted before its
+    // match arm could reclaim it is reaped by `_run_bot_cleanup`'s Drop.
     chat_workers.lock().await.clear();
     scheduler_handle.abort();
+    bot_exit
 }
 
 /// Long-poll `getUpdates` and dispatch each batch via `process_batch`.
@@ -4308,7 +4439,7 @@ async fn dispatch_album_caption(
                 None
             } else {
                 let uploads = data.sessions.get_mut(&chat_id)
-                    .map(|s| std::mem::take(&mut s.pending_uploads))
+                    .map(|s| s.take_pending_uploads())
                     .unwrap_or_default();
                 let qid = generate_queue_id();
                 let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
@@ -4324,7 +4455,7 @@ async fn dispatch_album_caption(
             (qr, None)
         } else if busy && !qmode {
             let uploads = data.sessions.get_mut(&chat_id)
-                .map(|s| std::mem::take(&mut s.pending_uploads))
+                .map(|s| s.take_pending_uploads())
                 .unwrap_or_default();
             let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, text.clone(), user_name.clone(), uploads);
             msg_debug(&format!("[album:dispatch] chat_id={}, REDIRECT id={}, replaced={}", chat_id.0, qid, replaced));
@@ -4732,7 +4863,7 @@ async fn handle_message(
                             } else {
                                 // Capture pending_uploads so they stay associated with this caption
                                 let uploads = data.sessions.get_mut(&chat_id)
-                                    .map(|s| std::mem::take(&mut s.pending_uploads))
+                                    .map(|s| s.take_pending_uploads())
                                     .unwrap_or_default();
                                 let qid = generate_queue_id();
                                 let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
@@ -4749,7 +4880,7 @@ async fn handle_message(
                         } else if busy && !qmode {
                             // OFF mode: caption with text is always redirect-eligible
                             let uploads = data.sessions.get_mut(&chat_id)
-                                .map(|s| std::mem::take(&mut s.pending_uploads))
+                                .map(|s| s.take_pending_uploads())
                                 .unwrap_or_default();
                             let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, text.to_string(), user_name.clone(), uploads);
                             msg_debug(&format!("[queue:media] chat_id={}, REDIRECT id={}, replaced={}, text={:?}", chat_id.0, qid, replaced, truncate_str(text, 60)));
@@ -4805,7 +4936,7 @@ async fn handle_message(
         let stored = {
             let mut data = state.lock().await;
             if let Some(session) = data.sessions.get_mut(&chat_id) {
-                session.pending_uploads.push(location_record.clone());
+                session.push_pending_upload(location_record.clone());
                 true
             } else {
                 false
@@ -4836,7 +4967,7 @@ async fn handle_message(
         let stored = {
             let mut data = state.lock().await;
             if let Some(session) = data.sessions.get_mut(&chat_id) {
-                session.pending_uploads.push(location_record.clone());
+                session.push_pending_upload(location_record.clone());
                 true
             } else {
                 false
@@ -4974,11 +5105,26 @@ async fn handle_message(
     msg_debug(&format!("[prefix_filter] text={:?}, require_prefix={}, has_valid_prefix={}, direct_mode={}", truncate_str(&text, 100), require_prefix, has_valid_prefix, !require_prefix));
     if require_prefix && !has_valid_prefix {
         msg_debug(&format!("[prefix_filter] IGNORED: require_prefix=true (direct mode OFF), no valid prefix in text={:?}", truncate_str(&text, 80)));
-        // Don't touch `pending_uploads` here. A previous `;`-prefixed photo
-        // upload (addressed to all bots) may be waiting for the next text
-        // message; wiping it because of an unrelated message to a sibling
-        // bot would silently lose the user's data. Uploads are consumed
-        // when an addressed message actually arrives.
+        // A previous `;`-prefixed photo upload (addressed to all bots) may be
+        // waiting for the next addressed text message; wiping it because of
+        // an unrelated message to a sibling bot would silently lose the
+        // user's data. So we keep recent uploads — but expire ones older than
+        // PENDING_UPLOAD_STALE_TTL so they don't re-attach hours later when
+        // the user has clearly moved on.
+        {
+            let mut data = state.lock().await;
+            if let Some(session) = data.sessions.get_mut(&chat_id) {
+                if let Some(added_at) = session.pending_uploads_added_at {
+                    if added_at.elapsed() > PENDING_UPLOAD_STALE_TTL {
+                        let n = session.pending_uploads.len();
+                        if n > 0 {
+                            msg_debug(&format!("[prefix_filter] expiring {} stale pending_uploads (age > {}s)", n, PENDING_UPLOAD_STALE_TTL.as_secs()));
+                            session.clear_pending_uploads();
+                        }
+                    }
+                }
+            }
+        }
         return Ok(());
     }
 
@@ -5040,7 +5186,7 @@ async fn handle_message(
                         } else {
                             // Capture pending_uploads so they stay associated with this message
                             let uploads = data.sessions.get_mut(&chat_id)
-                                .map(|s| std::mem::take(&mut s.pending_uploads))
+                                .map(|s| s.take_pending_uploads())
                                 .unwrap_or_default();
                             let qid = generate_queue_id();
                             let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
@@ -5063,7 +5209,7 @@ async fn handle_message(
                     // the next dispatch target (latest-wins). Slash/shell commands stay rejected.
                     let rr = if let Some(qt) = queue_text {
                         let uploads = data.sessions.get_mut(&chat_id)
-                            .map(|s| std::mem::take(&mut s.pending_uploads))
+                            .map(|s| s.take_pending_uploads())
                             .unwrap_or_default();
                         let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, qt.to_string(), user_name.clone(), uploads);
                         msg_debug(&format!("[queue:text] chat_id={}, REDIRECT id={}, replaced={}, text={:?}", chat_id.0, qid, replaced, truncate_str(qt, 60)));
@@ -5648,7 +5794,7 @@ async fn handle_start_command(
                         session.session_id = None;
                         session.current_path = None;
                         session.history.clear();
-                        session.pending_uploads.clear();
+                        session.clear_pending_uploads();
                     } else {
                         msg_debug(&format!("[handle_start_command] cross-provider: no existing session to clear (queue={})", dropped_queue));
                     }
@@ -5768,6 +5914,7 @@ async fn handle_start_command(
             current_path: None,
             history: Vec::new(),
             pending_uploads: Vec::new(),
+            pending_uploads_added_at: None,
         });
         session.session_id = None; // Clear stale session_id from previous workspace
         // Drop uploads only when the workspace path changed — upload paths point at
@@ -5775,7 +5922,7 @@ async fn handle_start_command(
         // (mode C, session-identifier swap), uploads still reference valid files in
         // the current workspace and remain relevant to the user's next message.
         if path_changed {
-            session.pending_uploads.clear();
+            session.clear_pending_uploads();
         }
 
         if let Some((session_data, _)) = &existing {
@@ -6856,13 +7003,14 @@ async fn handle_workspace_resume(
             current_path: None,
             history: Vec::new(),
             pending_uploads: Vec::new(),
+            pending_uploads_added_at: None,
         });
         session.session_id = None; // Clear stale session_id from previous workspace
         // Drop uploads only when the workspace path changed — upload paths point at
         // the old workspace's files. Re-resuming the same workspace (same path) keeps
         // uploads since they reference valid files the user just sent.
         if path_changed {
-            session.pending_uploads.clear();
+            session.clear_pending_uploads();
         }
 
         if let Some((session_data, _)) = &existing {
@@ -6943,7 +7091,7 @@ async fn handle_clear_command(
         if let Some(session) = data.sessions.get_mut(&chat_id) {
             session.session_id = None;
             session.history.clear();
-            session.pending_uploads.clear();
+            session.clear_pending_uploads();
         }
         let mdl = get_model(&data.settings, chat_id);
         let prov = provider_from_model(mdl.as_deref());
@@ -7098,18 +7246,20 @@ fn cancel_in_progress_task_locked(data: &SharedData, chat_id: ChatId) {
     if let Some(token) = data.cancel_tokens.get(&chat_id).cloned() {
         if !token.cancelled.load(Ordering::Relaxed) {
             token.cancelled.store(true, Ordering::Relaxed);
-            if let Ok(guard) = token.child_pid.lock() {
-                if let Some(pid) = *guard {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    #[cfg(windows)]
-                    {
-                        let _ = std::process::Command::new("taskkill")
-                            .args(["/PID", &pid.to_string(), "/T", "/F"])
-                            .output();
-                    }
+            // See `cancel_token_now`: recover from poison so SIGTERM is
+            // still sent. Silently skipping the kill leaves the blocking
+            // reader stuck on stdout.
+            let guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(pid) = *guard {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .output();
                 }
             }
         }
@@ -7189,8 +7339,11 @@ async fn handle_stop_command(
             }
 
             // Kill child process directly to unblock reader.lines()
-            // When the child dies, its stdout pipe closes → reader returns EOF → blocking thread exits
-            if let Ok(guard) = token.child_pid.lock() {
+            // When the child dies, its stdout pipe closes → reader returns EOF → blocking thread exits.
+            // Recover from a poisoned mutex so the SIGTERM still goes out
+            // — silently skipping leaves the reader blocked indefinitely.
+            {
+                let guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(pid) = *guard {
                     #[cfg(unix)]
                     unsafe {
@@ -7332,8 +7485,10 @@ async fn handle_stopall_command(
 
             // Cancellation flag already set above inside the lock
 
-            // Kill child process
-            if let Ok(guard) = token.child_pid.lock() {
+            // Kill child process. Recover from a poisoned mutex so the
+            // SIGTERM still goes out — see `cancel_token_now`.
+            {
+                let guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(pid) = *guard {
                     #[cfg(unix)]
                     unsafe {
@@ -7627,7 +7782,7 @@ async fn handle_file_upload(
                 item_type: HistoryType::User,
                 content: upload_record.clone(),
             });
-            session.pending_uploads.push(upload_record.clone());
+            session.push_pending_upload(upload_record.clone());
             save_session_to_file(session, &save_dir, provider);
         }
         // Write file upload to group chat shared log
@@ -7689,17 +7844,12 @@ async fn handle_shell_command(
         insert_cancel_token_locked(&mut data, chat_id, cancel_token.clone());
     }
 
-    // Acquire group chat lock (serializes processing across bots in the same group chat)
-    let group_lock = acquire_group_chat_lock(chat_id.0).await;
-
-    // Check if cancelled during lock wait
-    if cancel_token.cancelled.load(Ordering::Relaxed) {
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=query_cancelled_during_lock", chat_id.0));
-        { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
-        drop(group_lock); // release before queue processing to avoid deadlock
-        process_next_queued_message(bot, chat_id, state).await;
-        return Ok(());
-    }
+    // Group chat lock acquisition is deferred into the spawned polling task
+    // below so the per-chat FIFO worker can pull the next message (e.g.
+    // `/stop`) immediately instead of waiting for cross-bot lock contention.
+    // The cancel_token reservation above already guards this bot's per-chat
+    // slot. Placeholder send is also deferred so a `/stop` arriving during
+    // lock wait does not leave an orphan "Processing ..." message.
 
     // Get current_path for working directory (default to home directory)
     let working_dir = {
@@ -7713,22 +7863,7 @@ async fn handle_shell_command(
             })
     };
 
-    // Send placeholder message
     let cmd_display = cmd_str.to_string();
-    shared_rate_limit_wait(state, chat_id).await;
-    let placeholder = match tg!("send_message", bot.send_message(chat_id, format!("Processing <code>{}</code>", html_escape(&cmd_display)))
-        .parse_mode(ParseMode::Html).await)
-    {
-        Ok(m) => m,
-        Err(e) => {
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=query_placeholder_error", chat_id.0));
-            { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
-            drop(group_lock); // release before queue processing to avoid deadlock
-            process_next_queued_message(bot, chat_id, state).await;
-            return Err(e);
-        }
-    };
-    let placeholder_msg_id = placeholder.id;
 
     // Create channel
     let (tx, rx) = mpsc::channel();
@@ -7736,81 +7871,12 @@ async fn handle_shell_command(
     let cmd_owned = cmd_str.to_string();
     let working_dir_clone = working_dir.clone();
     let cancel_token_clone = cancel_token.clone();
-    let request_tasks = {
-        let data = state.lock().await;
-        data.request_tasks.clone()
-    };
 
-    // Spawn blocking thread for shell command execution
-    let _ = spawn_tracked_blocking_task(request_tasks, move || {
-        #[cfg(unix)]
-        let child = std::process::Command::new("bash")
-            .args(["-c", &cmd_owned])
-            .current_dir(&working_dir_clone)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        #[cfg(windows)]
-        let ps_command = format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {}; exit $LASTEXITCODE", cmd_owned);
-        #[cfg(windows)]
-        let child = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
-            .current_dir(&working_dir_clone)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-
-        let mut child = match child {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(ShellOutput::Error(format!("Failed to execute: {}", e)));
-                return;
-            }
-        };
-
-        // Store PID for /stop kill
-        if let Ok(mut guard) = cancel_token_clone.child_pid.lock() {
-            *guard = Some(child.id());
-        }
-
-        // Read stderr in a separate thread
-        let stderr_handle = child.stderr.take();
-        let stderr_thread = std::thread::spawn(move || {
-            let mut buf = String::new();
-            if let Some(se) = stderr_handle {
-                use std::io::BufRead;
-                for line in std::io::BufReader::new(se).lines().flatten() {
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-            }
-            buf
-        });
-
-        // Read stdout line by line with cancel checks
-        if let Some(stdout) = child.stdout.take() {
-            use std::io::BufRead;
-            for line in std::io::BufReader::new(stdout).lines().flatten() {
-                if cancel_token_clone.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
-                    claude::kill_child_tree(&mut child);
-                    let _ = child.wait();
-                    return;
-                }
-                let _ = tx.send(ShellOutput::Line(line));
-            }
-        }
-
-        let stderr_output = stderr_thread.join().unwrap_or_default();
-        if !stderr_output.is_empty() {
-            let _ = tx.send(ShellOutput::Line(format!("[stderr]\n{}", stderr_output.trim_end())));
-        }
-
-        let status = child.wait();
-        let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
-        let _ = tx.send(ShellOutput::Done { exit_code });
-    });
+    // Shell child spawn is deferred into the polling task below — it runs
+    // only after the cross-bot group_lock is acquired. Variables prepared
+    // here (cmd_owned, working_dir_clone, cancel_token_clone, tx) are
+    // captured by the polling task's `async move` closure and consumed by
+    // the inner `spawn_tracked_blocking_task` call.
 
     // Spawn polling loop (same pattern as AI streaming)
     let bot_owned = bot.clone();
@@ -7825,8 +7891,135 @@ async fn handle_shell_command(
         let data = state.lock().await;
         data.request_tasks.clone()
     };
+    // Cloned for the inner shell-exec spawn (the outer call below consumes
+    // the original).
+    let request_tasks_for_shell = request_tasks.clone();
     let _ = spawn_tracked_request_task(request_tasks, async move {
+        // Acquire the cross-bot group chat lock here (was previously inline,
+        // which head-of-line-blocked the per-chat FIFO worker — see
+        // `run_chat_worker`). Placeholder send and shell-child spawn are
+        // also deferred until after the lock so (a) `/stop` during lock
+        // wait does not leave an orphan "Processing ..." message and
+        // (b) two bots in the same group chat do not run shell children
+        // concurrently.
+        let group_lock = acquire_group_chat_lock(chat_id.0).await;
+
+        // Shell child has not been spawned yet (we spawn it below, after the
+        // lock is acquired and the placeholder is sent), so cleanup is just
+        // state + queue processing; no child process to SIGTERM.
+        if cancel_token.cancelled.load(Ordering::Relaxed) {
+            msg_debug(&format!("[queue:trigger] chat_id={}, source=query_cancelled_during_lock", chat_id.0));
+            { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+            drop(group_lock);
+            process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
+            return;
+        }
         let _group_lock = group_lock; // hold group chat lock until task ends
+
+        // Send placeholder message (was previously inline before this spawn).
+        // Shell child is spawned only after the placeholder succeeds, so a
+        // network error here means no child to clean up.
+        shared_rate_limit_wait(&state_owned, chat_id).await;
+        let placeholder = match tg!("send_message", bot_owned.send_message(chat_id, format!("Processing <code>{}</code>", html_escape(&cmd_display_owned)))
+            .parse_mode(ParseMode::Html).await)
+        {
+            Ok(m) => m,
+            Err(e) => {
+                msg_debug(&format!("[queue:trigger] chat_id={}, source=query_placeholder_error: {}", chat_id.0, e));
+                { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+                process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
+                return;
+            }
+        };
+        let placeholder_msg_id = placeholder.id;
+
+        // Spawn the shell child now that the lock is held and the placeholder
+        // is up. This was previously inline in `handle_shell_command`, but
+        // running it before the lock meant two bots in the same group chat
+        // could both spawn shell processes simultaneously and `/stop` during
+        // lock wait could not prevent execution.
+        let _ = spawn_tracked_blocking_task(request_tasks_for_shell, move || {
+            #[cfg(unix)]
+            let child = std::process::Command::new("bash")
+                .args(["-c", &cmd_owned])
+                .current_dir(&working_dir_clone)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            #[cfg(windows)]
+            let ps_command = format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {}; exit $LASTEXITCODE", cmd_owned);
+            #[cfg(windows)]
+            let child = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
+                .current_dir(&working_dir_clone)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(ShellOutput::Error(format!("Failed to execute: {}", e)));
+                    return;
+                }
+            };
+
+            // Store PID for /stop kill. Recover from a poisoned mutex (a prior
+            // holder panicked) instead of silently dropping the PID — without
+            // it stored, /stop cannot signal this child.
+            {
+                let mut guard = cancel_token_clone.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(child.id());
+            }
+            // /stop landing between `cancel_token_clone.cancelled = true` and
+            // PID storage above would leave the child alive. Re-check after
+            // storing so the cancel observer in this thread kills the child
+            // even if /stop fired in that narrow window.
+            if cancel_token_clone.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                claude::kill_child_tree(&mut child);
+                let _ = child.wait();
+                return;
+            }
+
+            // Read stderr in a separate thread
+            let stderr_handle = child.stderr.take();
+            let stderr_thread = std::thread::spawn(move || {
+                let mut buf = String::new();
+                if let Some(se) = stderr_handle {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(se).lines().flatten() {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                }
+                buf
+            });
+
+            // Read stdout line by line with cancel checks
+            if let Some(stdout) = child.stdout.take() {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stdout).lines().flatten() {
+                    if cancel_token_clone.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                        claude::kill_child_tree(&mut child);
+                        let _ = child.wait();
+                        return;
+                    }
+                    let _ = tx.send(ShellOutput::Line(line));
+                }
+            }
+
+            let stderr_output = stderr_thread.join().unwrap_or_default();
+            if !stderr_output.is_empty() {
+                let _ = tx.send(ShellOutput::Line(format!("[stderr]\n{}", stderr_output.trim_end())));
+            }
+
+            let status = child.wait();
+            let exit_code = status.map(|s| s.code().unwrap_or(-1)).unwrap_or(-1);
+            let _ = tx.send(ShellOutput::Done { exit_code });
+        });
+
         const SPINNER: &[&str] = &[
             "🕐 P",           "🕑 Pr",          "🕒 Pro",
             "🕓 Proc",        "🕔 Proce",       "🕕 Proces",
@@ -8030,7 +8223,10 @@ async fn handle_shell_command(
 
         // Post-loop: cancel handling
         if cancelled {
-            if let Ok(guard) = cancel_token.child_pid.lock() {
+            // Recover from a poisoned mutex so SIGTERM still goes out — see
+            // `cancel_token_now` for rationale.
+            {
+                let guard = cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(pid) = *guard {
                     #[cfg(unix)]
                     unsafe {
@@ -8939,7 +9135,7 @@ async fn handle_model_command(
                         session.session_id = None;
                         session.current_path = None;
                         session.history.clear();
-                        session.pending_uploads.clear();
+                        session.clear_pending_uploads();
                         (had, prev_path, dropped_queue)
                     } else {
                         (dropped_queue > 0, None, dropped_queue)
@@ -9132,7 +9328,7 @@ fn process_next_queued_message<'a>(
                 msg_debug(&format!("[queue:next] chat_id={}, popped message: text={:?}, user={:?}, uploads={}, queue_before={}", chat_id.0, truncate_str(&m.text, 60), m.user_display_name, m.pending_uploads.len(), queue_len_before));
                 if !m.pending_uploads.is_empty() {
                     if let Some(session) = data.sessions.get_mut(&chat_id) {
-                        session.pending_uploads.extend(m.pending_uploads.iter().cloned());
+                        session.extend_pending_uploads(m.pending_uploads.iter().cloned());
                         msg_debug(&format!("[queue:next] chat_id={}, restored {} pending_uploads to session", chat_id.0, m.pending_uploads.len()));
                     } else {
                         msg_debug(&format!("[queue:next] chat_id={}, WARNING: no session to restore uploads to", chat_id.0));
@@ -9207,7 +9403,7 @@ async fn handle_text_message(
                 if let Some(session) = data.sessions.get_mut(&chat_id) {
                     if !session.pending_uploads.is_empty() {
                         msg_debug(&format!("[handle_text_message] chat_id={}, clearing {} pending_uploads from cancelled dequeue", chat_id.0, session.pending_uploads.len()));
-                        session.pending_uploads.clear();
+                        session.clear_pending_uploads();
                     }
                 }
                 remove_cancel_token_locked(&mut data, chat_id);
@@ -9231,7 +9427,7 @@ async fn handle_text_message(
                 let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
                 let qid = if cur_len < MAX_QUEUE_SIZE {
                     let uploads = data.sessions.get_mut(&chat_id)
-                        .map(|s| std::mem::take(&mut s.pending_uploads))
+                        .map(|s| s.take_pending_uploads())
                         .unwrap_or_default();
                     let id = generate_queue_id();
                     data.message_queues.entry(chat_id)
@@ -9253,7 +9449,7 @@ async fn handle_text_message(
                 // OFF mode: messages reaching handle_text_message are user-prompt-style (slash
                 // commands are routed elsewhere in handle_message), so redirect them.
                 let uploads = data.sessions.get_mut(&chat_id)
-                    .map(|s| std::mem::take(&mut s.pending_uploads))
+                    .map(|s| s.take_pending_uploads())
                     .unwrap_or_default();
                 let (rid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, user_text.to_string(), user_display_name.to_string(), uploads);
                 msg_debug(&format!("[handle_text_message] chat_id={}, REDIRECT id={}, replaced={}", chat_id.0, rid, replaced));
@@ -9291,17 +9487,11 @@ async fn handle_text_message(
         return Ok(());
     }
 
-    // Acquire group chat lock (serializes processing across bots in the same group chat)
-    let group_lock = acquire_group_chat_lock(chat_id.0).await;
-
-    // Check if cancelled during lock wait (e.g., user sent /stop)
-    if cancel_token.cancelled.load(Ordering::Relaxed) {
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=text_cancelled_during_lock", chat_id.0));
-        { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
-        drop(group_lock); // release before queue processing to avoid deadlock
-        process_next_queued_message(bot, chat_id, state).await;
-        return Ok(());
-    }
+    // Group chat lock acquisition is deferred into the spawned polling task
+    // below so the per-chat FIFO worker can pull the next message (e.g.
+    // `/stop`) immediately instead of waiting for cross-bot lock contention.
+    // The cancel_token reservation above already prevents a duplicate AI
+    // request on this bot for this chat.
 
     // Get session info, allowed tools, model, pending uploads, history, instruction, and bot_username (drop lock before any await)
     let (session_info, allowed_tools, pending_uploads, model, history, instruction, context_count, bot_username_for_prompt, bot_display_name_for_prompt, chrome_enabled) = {
@@ -9318,7 +9508,7 @@ async fn handle_text_message(
             .unwrap_or_default();
         // Drain pending uploads so they are sent to Claude exactly once
         let uploads = data.sessions.get_mut(&chat_id)
-            .map(|s| std::mem::take(&mut s.pending_uploads))
+            .map(|s| s.take_pending_uploads())
             .unwrap_or_default();
         let instr = data.settings.instructions.get(&chat_id.0.to_string()).cloned();
         let ctx_count = data.settings.context.get(&chat_id.0.to_string()).copied().unwrap_or(12);
@@ -9342,7 +9532,6 @@ async fn handle_text_message(
                 shared_rate_limit_wait(state, chat_id).await;
                 let _ = tg!("send_message", bot.send_message(chat_id, "Failed to create workspace.")
                     .await);
-                drop(group_lock);
                 process_next_queued_message(bot, chat_id, state).await;
                 return Ok(());
             };
@@ -9354,19 +9543,11 @@ async fn handle_text_message(
     // It will be added together with the assistant response in the spawned task,
     // only on successful completion. On cancel, nothing is recorded.
 
-    // Send placeholder message (update shared timestamp so spawned task knows)
-    shared_rate_limit_wait(state, chat_id).await;
-    let placeholder = match tg!("send_message", bot.send_message(chat_id, "...").await) {
-        Ok(m) => m,
-        Err(e) => {
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=text_placeholder_error", chat_id.0));
-            { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
-            drop(group_lock); // release before queue processing to avoid deadlock
-            process_next_queued_message(bot, chat_id, state).await;
-            return Err(e);
-        }
-    };
-    let placeholder_msg_id = placeholder.id;
+    // Placeholder send is deferred into the spawned polling task — it happens
+    // after the group_lock is acquired there, matching the prior ordering
+    // (placeholder appears once cross-bot serialization permits this bot to
+    // start). This also avoids leaving an orphan placeholder if `/stop`
+    // arrives during lock wait.
 
     // Sanitize input
     let sanitized_input = ai_screen::sanitize_user_input(user_text);
@@ -9424,136 +9605,16 @@ async fn handle_text_message(
     let current_path_clone = current_path.clone();
     let cancel_token_clone = cancel_token.clone();
 
-    // Run AI backend in a blocking thread
+    // AI backend spawn is deferred into the polling task below — it runs only
+    // after the cross-bot group_lock is acquired, preserving the original
+    // semantic that two bots in the same group chat do not run AI concurrently.
+    // Variables prepared here (model_clone, history_clone, context_prompt,
+    // system_prompt_owned, allowed_tools, chrome_enabled, bot_key_for_prompt,
+    // session_id_clone, current_path_clone, cancel_token_clone, tx) are
+    // captured by the polling task's `async move` closure and consumed by the
+    // inner `spawn_tracked_blocking_task` call.
     let model_clone = model.clone();
     let history_clone = history;
-    let request_tasks = {
-        let data = state.lock().await;
-        data.request_tasks.clone()
-    };
-    msg_debug(&format!("[handle_text_message] prompt_len={}, system_prompt_len={}, session_id={:?}, path={}, history_len={}",
-        context_prompt.len(), system_prompt_owned.len(), session_id_clone, current_path_clone, history_clone.len()));
-    let _ = spawn_tracked_blocking_task(request_tasks, move || {
-        let provider = detect_provider(model_clone.as_deref());
-        msg_debug(&format!("[handle_text_message] provider={}, model={:?}", provider, model_clone));
-        ai_trace(&format!("[EXEC] provider={}, model={:?}, prompt_len={}, system_prompt_len={}, history_len={}, session={:?}, path={}",
-            provider, model_clone, context_prompt.len(), system_prompt_owned.len(), history_clone.len(), session_id_clone, current_path_clone));
-        let result = if provider == "opencode" {
-            let opencode_model = model_clone.as_deref().and_then(opencode::strip_opencode_prefix);
-            msg_debug(&format!("[handle_text_message] → opencode::execute, opencode_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
-                opencode_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()));
-            opencode::execute_command_streaming(
-                &context_prompt,
-                session_id_clone.as_deref(),
-                &current_path_clone,
-                tx.clone(),
-                Some(&system_prompt_owned),
-                Some(&allowed_tools),
-                Some(cancel_token_clone),
-                opencode_model,
-                false,
-            )
-        } else if provider == "gemini" {
-            let gemini_model = model_clone.as_deref().and_then(gemini::strip_gemini_prefix);
-            msg_debug(&format!("[handle_text_message] → gemini::execute, gemini_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
-                gemini_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()));
-            gemini::execute_command_streaming(
-                &context_prompt,
-                session_id_clone.as_deref(),
-                &current_path_clone,
-                tx.clone(),
-                Some(&system_prompt_owned),
-                Some(&allowed_tools),
-                Some(cancel_token_clone),
-                gemini_model,
-                false,
-            )
-        } else if provider == "codex" {
-            let codex_model = model_clone.as_deref().and_then(codex::strip_codex_prefix);
-            // System prompt is always passed via -c model_instructions_file (handles both new & resume).
-            // For new sessions without session_id, inject conversation history into the prompt.
-            let codex_system_prompt = format!("{}{}", system_prompt_owned, codex_extra_instructions());
-            let is_resume = session_id_clone.is_some();
-            let has_history = !history_clone.is_empty();
-            msg_debug(&format!("[handle_text_message] codex: is_resume={}, has_history={}, history_len={}, sp_len={}",
-                is_resume, has_history, history_clone.len(), codex_system_prompt.len()));
-            // Inject conversation history only for new sessions (no session_id) with prior history.
-            // Resumed sessions rely on Codex's native conversation management.
-            let codex_prompt = if session_id_clone.is_none() && !history_clone.is_empty() {
-                msg_debug("[handle_text_message] codex: INJECTING history into prompt (new session with history)");
-                let mut conv = String::new();
-                conv.push_str("<conversation_history>\n");
-                for item in &history_clone {
-                    let role = match item.item_type {
-                        HistoryType::User => "User",
-                        HistoryType::Assistant => "Assistant",
-                        HistoryType::ToolUse => "ToolUse",
-                        HistoryType::ToolResult => "ToolResult",
-                        _ => continue,  // skip Error, System
-                    };
-                    conv.push_str(&format!("[{}]: {}\n", role, item.content));
-                }
-                conv.push_str("</conversation_history>\n\n");
-                conv.push_str(&context_prompt);
-                conv
-            } else {
-                if is_resume {
-                    msg_debug("[handle_text_message] codex: RESUME path — no history injection, sp via -c file");
-                } else {
-                    msg_debug("[handle_text_message] codex: NEW session, no history — sp via -c file");
-                }
-                context_prompt.clone()
-            };
-            msg_debug(&format!("[handle_text_message] → codex::execute, codex_model={:?}, codex_prompt_len={}, resume={}, system_prompt_passed=true",
-                codex_model, codex_prompt.len(), is_resume));
-            let codex_auto_send = codex::CodexAutoSendCtx {
-                cokacdir_bin: crate::bin_path().to_string(),
-                chat_id: chat_id.0,
-                bot_key: bot_key_for_prompt.clone(),
-            };
-            codex::execute_command_streaming(
-                &codex_prompt,
-                session_id_clone.as_deref(),
-                &current_path_clone,
-                tx.clone(),
-                Some(&codex_system_prompt),
-                Some(&allowed_tools),
-                Some(cancel_token_clone),
-                codex_model,
-                false,
-                Some(&codex_auto_send),
-            )
-        } else {
-            let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
-            msg_debug(&format!("[handle_text_message] → claude::execute, claude_model={:?}", claude_model));
-            claude::execute_command_streaming(
-                &context_prompt,
-                session_id_clone.as_deref(),
-                &current_path_clone,
-                tx.clone(),
-                Some(&system_prompt_owned),
-                Some(&allowed_tools),
-                Some(cancel_token_clone),
-                claude_model,
-                false,
-                chrome_enabled,
-            )
-        };
-
-        match &result {
-            Ok(()) => {
-                msg_debug("[handle_text_message] execute completed OK");
-                ai_trace("[EXEC] completed OK");
-            }
-            Err(e) => {
-                msg_debug(&format!("[handle_text_message] execute error: {}", e));
-                ai_trace(&format!("[EXEC] ERROR: {}", e));
-            }
-        }
-        if let Err(e) = result {
-            let _ = tx.send(StreamMessage::Error { message: e, stdout: String::new(), stderr: String::new(), exit_code: None });
-        }
-    });
 
     // Spawn the polling loop as a separate task so the handler returns immediately.
     // This allows teloxide's per-chat worker to process subsequent messages (e.g. /stop).
@@ -9578,8 +9639,171 @@ async fn handle_text_message(
         let data = state.lock().await;
         data.request_tasks.clone()
     };
+    // Cloned for the inner AI spawn (the outer call below consumes the original).
+    let request_tasks_for_ai = request_tasks.clone();
     let _ = spawn_tracked_request_task(request_tasks, async move {
+        // Acquire the cross-bot group chat lock here (was previously inline,
+        // which head-of-line-blocked the per-chat FIFO worker — see
+        // `run_chat_worker`). The cancel_token reservation in the inline
+        // section already guards this bot's per-chat slot, so doing the wait
+        // here only delays the placeholder send, not subsequent messages.
+        let group_lock = acquire_group_chat_lock(chat_id.0).await;
+
+        // /stop arriving while we waited for the group lock sets cancelled=true.
+        // AI has not been spawned yet (we spawn it below, after the lock is
+        // acquired and the placeholder is sent), so cleanup is just state +
+        // queue processing; no child to SIGTERM, no API calls billed.
+        if cancel_token.cancelled.load(Ordering::Relaxed) {
+            msg_debug(&format!("[queue:trigger] chat_id={}, source=text_cancelled_during_lock", chat_id.0));
+            { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+            drop(group_lock);
+            process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
+            return;
+        }
         let _group_lock = group_lock; // hold group chat lock until task ends
+
+        // Send placeholder message (was previously inline before this spawn).
+        // AI is spawned only after the placeholder succeeds, so a network
+        // error here means no AI subprocess to clean up.
+        shared_rate_limit_wait(&state_owned, chat_id).await;
+        let placeholder = match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
+            Ok(m) => m,
+            Err(e) => {
+                msg_debug(&format!("[queue:trigger] chat_id={}, source=text_placeholder_error: {}", chat_id.0, e));
+                { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+                process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
+                return;
+            }
+        };
+        let mut placeholder_msg_id = placeholder.id;
+
+        // Now that the lock is held and the placeholder is up, spawn the AI
+        // backend. This was previously inline in `handle_text_message`, but
+        // running it before the lock was held meant that two bots in the
+        // same group chat could both have their AI subprocesses running
+        // simultaneously (the lock only serialized the *output* path), and
+        // that `/stop` arriving during lock wait could no longer prevent
+        // billing because the API call had already started.
+        msg_debug(&format!("[handle_text_message] prompt_len={}, system_prompt_len={}, session_id={:?}, path={}, history_len={}",
+            context_prompt.len(), system_prompt_owned.len(), session_id_clone, current_path_clone, history_clone.len()));
+        let _ = spawn_tracked_blocking_task(request_tasks_for_ai, move || {
+            let provider = detect_provider(model_clone.as_deref());
+            msg_debug(&format!("[handle_text_message] provider={}, model={:?}", provider, model_clone));
+            ai_trace(&format!("[EXEC] provider={}, model={:?}, prompt_len={}, system_prompt_len={}, history_len={}, session={:?}, path={}",
+                provider, model_clone, context_prompt.len(), system_prompt_owned.len(), history_clone.len(), session_id_clone, current_path_clone));
+            let result = if provider == "opencode" {
+                let opencode_model = model_clone.as_deref().and_then(opencode::strip_opencode_prefix);
+                msg_debug(&format!("[handle_text_message] → opencode::execute, opencode_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                    opencode_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()));
+                opencode::execute_command_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&system_prompt_owned),
+                    Some(&allowed_tools),
+                    Some(cancel_token_clone),
+                    opencode_model,
+                    false,
+                )
+            } else if provider == "gemini" {
+                let gemini_model = model_clone.as_deref().and_then(gemini::strip_gemini_prefix);
+                msg_debug(&format!("[handle_text_message] → gemini::execute, gemini_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
+                    gemini_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()));
+                gemini::execute_command_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&system_prompt_owned),
+                    Some(&allowed_tools),
+                    Some(cancel_token_clone),
+                    gemini_model,
+                    false,
+                )
+            } else if provider == "codex" {
+                let codex_model = model_clone.as_deref().and_then(codex::strip_codex_prefix);
+                let codex_system_prompt = format!("{}{}", system_prompt_owned, codex_extra_instructions());
+                let is_resume = session_id_clone.is_some();
+                let has_history = !history_clone.is_empty();
+                msg_debug(&format!("[handle_text_message] codex: is_resume={}, has_history={}, history_len={}, sp_len={}",
+                    is_resume, has_history, history_clone.len(), codex_system_prompt.len()));
+                let codex_prompt = if session_id_clone.is_none() && !history_clone.is_empty() {
+                    msg_debug("[handle_text_message] codex: INJECTING history into prompt (new session with history)");
+                    let mut conv = String::new();
+                    conv.push_str("<conversation_history>\n");
+                    for item in &history_clone {
+                        let role = match item.item_type {
+                            HistoryType::User => "User",
+                            HistoryType::Assistant => "Assistant",
+                            HistoryType::ToolUse => "ToolUse",
+                            HistoryType::ToolResult => "ToolResult",
+                            _ => continue,
+                        };
+                        conv.push_str(&format!("[{}]: {}\n", role, item.content));
+                    }
+                    conv.push_str("</conversation_history>\n\n");
+                    conv.push_str(&context_prompt);
+                    conv
+                } else {
+                    if is_resume {
+                        msg_debug("[handle_text_message] codex: RESUME path — no history injection, sp via -c file");
+                    } else {
+                        msg_debug("[handle_text_message] codex: NEW session, no history — sp via -c file");
+                    }
+                    context_prompt.clone()
+                };
+                msg_debug(&format!("[handle_text_message] → codex::execute, codex_model={:?}, codex_prompt_len={}, resume={}, system_prompt_passed=true",
+                    codex_model, codex_prompt.len(), is_resume));
+                let codex_auto_send = codex::CodexAutoSendCtx {
+                    cokacdir_bin: crate::bin_path().to_string(),
+                    chat_id: chat_id.0,
+                    bot_key: bot_key_for_prompt.clone(),
+                };
+                codex::execute_command_streaming(
+                    &codex_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&codex_system_prompt),
+                    Some(&allowed_tools),
+                    Some(cancel_token_clone),
+                    codex_model,
+                    false,
+                    Some(&codex_auto_send),
+                )
+            } else {
+                let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
+                msg_debug(&format!("[handle_text_message] → claude::execute, claude_model={:?}", claude_model));
+                claude::execute_command_streaming(
+                    &context_prompt,
+                    session_id_clone.as_deref(),
+                    &current_path_clone,
+                    tx.clone(),
+                    Some(&system_prompt_owned),
+                    Some(&allowed_tools),
+                    Some(cancel_token_clone),
+                    claude_model,
+                    false,
+                    chrome_enabled,
+                )
+            };
+
+            match &result {
+                Ok(()) => {
+                    msg_debug("[handle_text_message] execute completed OK");
+                    ai_trace("[EXEC] completed OK");
+                }
+                Err(e) => {
+                    msg_debug(&format!("[handle_text_message] execute error: {}", e));
+                    ai_trace(&format!("[EXEC] ERROR: {}", e));
+                }
+            }
+            if let Err(e) = result {
+                let _ = tx.send(StreamMessage::Error { message: e, stdout: String::new(), stderr: String::new(), exit_code: None });
+            }
+        });
+
         const SPINNER: &[&str] = &[
             "🕐 P",           "🕑 Pr",          "🕒 Pro",
             "🕓 Proc",        "🕔 Proce",       "🕕 Proces",
@@ -9597,7 +9821,6 @@ async fn handle_text_message(
         let mut pending_cokacdir = false;
         let mut suppress_tool_display = false;
         let mut last_tool_name: String = String::new();
-        let mut placeholder_msg_id = placeholder_msg_id;
         let mut last_confirmed_len: usize = 0;
 
         let (polling_time_ms, silent_mode) = {
@@ -10323,7 +10546,10 @@ async fn handle_text_message(
 
         // === Post-loop: cancelled handling or lock release ===
         if cancelled {
-            if let Ok(guard) = cancel_token.child_pid.lock() {
+            // Recover from a poisoned mutex so SIGTERM still goes out — see
+            // `cancel_token_now` for rationale.
+            {
+                let guard = cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(pid) = *guard {
                     #[cfg(unix)]
                     unsafe {
@@ -12259,7 +12485,10 @@ async fn execute_schedule(
             schedule_id, cancelled, had_error, full_response.len()));
         if cancelled {
             sched_debug(&format!("[execute_schedule] id={}, cancelled — killing child process", schedule_id));
-            if let Ok(guard) = cancel_token.child_pid.lock() {
+            // Recover from a poisoned mutex so SIGTERM still goes out — see
+            // `cancel_token_now` for rationale.
+            {
+                let guard = cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(pid) = *guard {
                     #[cfg(unix)]
                     unsafe {
@@ -12418,6 +12647,7 @@ async fn execute_schedule(
                 current_path: Some(workspace_path_owned.clone()),
                 history: Vec::new(),
                 pending_uploads: Vec::new(),
+                pending_uploads_added_at: None,
             };
             // Add user prompt and AI response to history for session continuity
             sched_session.history.push(HistoryItem {
@@ -12558,23 +12788,27 @@ async fn process_bot_message(
         insert_cancel_token_locked(&mut data, chat_id, cancel_token.clone());
     }
 
-    // Claim succeeded — now safe to delete the on-disk message file.
-    // Doing this here (post-claim) instead of in `scheduler_loop` closes
-    // the prior TOCTOU window where a concurrent claim by another task
-    // would cause this function to return early with the file already
-    // gone, dropping the bot-to-bot message silently.
-    let remove_result = fs::remove_file(&msg.file_path);
-    msg_debug(&format!(
-        "[process_bot_message] deleted message file post-claim: id={}, path={}, ok={}",
-        msg.id, msg.file_path.display(), remove_result.is_ok()
-    ));
+    // File deletion is deferred until the placeholder send succeeds (see the
+    // delete site after `placeholder_msg_id`). Deleting here would lose the
+    // message on every failure path between claim and placeholder —
+    // cancellation during lock wait, panic in session lookup, placeholder
+    // network error — because none of those branches have a re-queue path.
+    // The cancel_token holds the per-chat slot until removed, so the
+    // scheduler's busy-check still skips this file on subsequent ticks
+    // (preventing the original TOCTOU where a sibling claim left a deleted
+    // file unprocessed).
 
     // Acquire group chat lock (serializes processing across bots in the same group chat)
     let group_lock = acquire_group_chat_lock(chat_id.0).await;
 
     // Check if cancelled during lock wait
     if cancel_token.cancelled.load(Ordering::Relaxed) {
-        msg_debug(&format!("[process_bot_message] cancelled during lock wait, id={}", msg.id));
+        // File is intentionally NOT deleted here: removing the cancel_token
+        // below frees the busy slot, so the next scheduler tick re-discovers
+        // this file via scan_messages and re-runs process_bot_message. This
+        // is the recovery path for /stop landing while we waited for the
+        // group lock — without it the message vanishes silently.
+        msg_debug(&format!("[process_bot_message] cancelled during lock wait, id={} (file preserved for retry)", msg.id));
         msg_debug(&format!("[queue:trigger] chat_id={}, source=botmsg_cancelled_during_lock", chat_id.0));
         { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
         drop(group_lock); // release before queue processing to avoid deadlock
@@ -12615,6 +12849,14 @@ async fn process_bot_message(
         None => {
             // No active session — create an error response
             msg_debug(&format!("[process_bot_message] no session for chat_id={}, sending error response", chat_id.0));
+            // Discard the on-disk file: re-queueing would loop the same
+            // "no session" error every scheduler tick. The user has been
+            // (best-effort) notified via the send_message below.
+            let remove_result = fs::remove_file(&msg.file_path);
+            msg_debug(&format!(
+                "[process_bot_message] deleted message file (no session): id={}, ok={}",
+                msg.id, remove_result.is_ok()
+            ));
             {
                 let mut data = state.lock().await;
                 remove_cancel_token_locked(&mut data, chat_id);
@@ -12644,12 +12886,43 @@ async fn process_bot_message(
             msg_debug(&format!("[process_bot_message] failed to send placeholder: {}, aborting", e));
             msg_debug(&format!("[queue:trigger] chat_id={}, source=botmsg_placeholder_error", chat_id.0));
             { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+            // Discard the on-disk file: leaving it would let the scheduler
+            // re-attempt every 5s, which for a permanent failure (bot kicked,
+            // chat closed, token revoked) becomes log spam with the same
+            // error class. A transient failure forces the user to manually
+            // re-send, but that matches the "Please try again" notice below.
+            let remove_result = fs::remove_file(&msg.file_path);
+            msg_debug(&format!(
+                "[process_bot_message] deleted message file (placeholder failed): id={}, ok={}",
+                msg.id, remove_result.is_ok()
+            ));
+            // Best-effort surface the dropped bot-to-bot message. The notice
+            // itself may also fail (the original placeholder error was likely
+            // a network / rate-limit / permissions issue affecting all
+            // outbound messages in this chat) — that's why this is `let _ =`.
+            shared_rate_limit_wait(state, chat_id).await;
+            let _ = tg!("send_message", bot.send_message(chat_id,
+                format!("📨 @{}: {}\n\n⚠️ Failed to deliver bot message ({}). Please try again.",
+                    msg.from, truncate_str(&msg.content, 200), e)).await);
             drop(group_lock); // release before queue processing to avoid deadlock
             process_next_queued_message(bot, chat_id, state).await;
             return;
         }
     };
     let placeholder_msg_id = placeholder.id;
+
+    // Placeholder is visible to the user — processing has visibly started.
+    // This is the safe point to delete the on-disk message file:
+    //   • Earlier (at claim) lost the message on cancel-during-lock-wait,
+    //     no-session, or placeholder-send failure paths.
+    //   • Later (after AI completes) would risk replay if the bot restarts
+    //     mid-turn — the user has already seen "..." and would receive the
+    //     same prompt again on next startup.
+    let remove_result = fs::remove_file(&msg.file_path);
+    msg_debug(&format!(
+        "[process_bot_message] deleted message file post-placeholder: id={}, path={}, ok={}",
+        msg.id, msg.file_path.display(), remove_result.is_ok()
+    ));
 
     // Build disabled tools notice
     let default_tools: std::collections::HashSet<&str> = DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
@@ -13276,7 +13549,10 @@ async fn process_bot_message(
         // Handle cancellation
         if cancelled {
             msg_debug(&format!("[botmsg_poll:{}] handling cancellation: response_len={}", bmsg_id_for_log, full_response.len()));
-            if let Ok(guard) = cancel_token.child_pid.lock() {
+            // Recover from a poisoned mutex so SIGTERM still goes out — see
+            // `cancel_token_now` for rationale.
+            {
+                let guard = cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(pid) = *guard {
                     msg_debug(&format!("[botmsg_poll:{}] killing child process: pid={}", bmsg_id_for_log, pid));
                     #[cfg(unix)]
@@ -13562,6 +13838,7 @@ async fn scheduler_cycle(
                             current_path: Some(entry.current_path.clone()),
                             history: Vec::new(),
                             pending_uploads: Vec::new(),
+                            pending_uploads_added_at: None,
                         });
                         data.pending_schedules.entry(chat_id).or_default().insert(entry.id.clone());
                         // Pre-insert cancel_token tagged with this dispatch_id so a panic
@@ -13667,10 +13944,11 @@ async fn scheduler_cycle(
                     }
                 }
 
-                // Note: file deletion moved into `process_bot_message` (post-claim)
-                // to close the TOCTOU window where a concurrent task could claim
-                // the slot between the busy-check above and process_bot_message's
-                // own claim — leaving the file deleted but the message unprocessed.
+                // Note: file deletion happens inside `process_bot_message` only
+                // after the placeholder send succeeds. Deleting here (or at claim
+                // time) lost the message on every interim failure path
+                // (cancel-during-lock-wait, no-session, placeholder send error)
+                // because none of those branches re-queue the file.
                 msg_debug(&format!("[scheduler_loop] processing bot message: {} (from={}, to={}, chat_id={})", msg.id, msg.from, msg.to, chat_id_num));
 
                 // Process the message (will delete the file iff its claim succeeds).

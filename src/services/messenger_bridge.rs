@@ -3436,12 +3436,20 @@ pub async fn run_bridge(backend_name: &str, args: &[String]) -> BridgeExit {
     // process-exit decision is deferred to `main` so a sibling bot in
     // a multi-bot run is not killed by one backend's death.
     let exit = tokio::select! {
-        _ = crate::services::telegram::run_bot(&bridge_token, Some(&api_url)) => {
-            // Bot exited (Telegram-side fatal via PollingExit::Fatal, or
-            // graceful shutdown). `backend_handle` is dropped by the
-            // select but that does NOT abort the underlying task — the
-            // explicit `backend_aborter.abort()` below does.
-            BridgeExit::Graceful
+        bot_exit = crate::services::telegram::run_bot(&bridge_token, Some(&api_url)) => {
+            // Bot exited. Forward `BotExit::Fatal` (revoked token,
+            // persistent `Conflict`) as `BridgeExit::Fatal` so the
+            // outermost caller surfaces a non-zero process exit and the
+            // supervisor restarts us — without this mapping, run_bot's
+            // fatal signal is silently lost on the bridge path and the
+            // bot stays dead with exit code 0. `backend_handle` is
+            // dropped by the select but that does NOT abort the
+            // underlying task — the explicit `backend_aborter.abort()`
+            // below does.
+            match bot_exit {
+                crate::services::telegram::BotExit::Fatal => BridgeExit::Fatal,
+                crate::services::telegram::BotExit::Graceful => BridgeExit::Graceful,
+            }
         }
         res = backend_handle => {
             eprintln!("  ✗ Backend listener stopped — bot can no longer receive messages.");
