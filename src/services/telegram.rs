@@ -3583,8 +3583,8 @@ where
 /// cancellation on the JoinHandle side — the blocking thread itself runs `f`
 /// to completion (a tokio limitation for `spawn_blocking`). Real shutdown of
 /// the blocking work must come from the `CancelToken` (cancelled flag +
-/// SIGTERM to the child PID) carried in by the caller, not from this map's
-/// abort handle.
+/// SIGKILL to the child PID's process group) carried in by the caller, not
+/// from this map's abort handle.
 fn spawn_tracked_blocking_task<F>(tasks: RequestTasks, f: F)
     -> tokio::task::JoinHandle<()>
 where
@@ -3739,7 +3739,7 @@ async fn run_chat_worker(
         // and the chat_worker itself is tracked in `ChatWorkerEntry` (whose Drop
         // aborts it). Aborting a tracked async parent does not kill blocking
         // descendants anyway — child processes are reaped via the cancel_token's
-        // SIGTERM path during run_bot shutdown, which is the correctness boundary
+        // SIGKILL path during run_bot shutdown, which is the correctness boundary
         // that actually matters.
         let join = tokio::spawn(async move {
             CURRENT_DISPATCH_ID
@@ -3790,8 +3790,9 @@ async fn run_chat_worker(
                     }
                 };
                 if let Some(tok) = leaked {
-                    // Best-effort cleanup: set cancelled=true AND SIGTERM the child
-                    // PID. The cancelled flag matters when a sibling thread (e.g. an
+                    // Best-effort cleanup: set cancelled=true AND SIGKILL the child
+                    // PID's process group. The cancelled flag matters when a sibling
+                    // thread (e.g. an
                     // exec polling loop on a blocking thread that survived the async
                     // parent's panic) is still polling the token — it lets that
                     // thread exit promptly instead of relying on signal delivery
@@ -4103,7 +4104,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
                         // Return Fatal instead of `process::exit(1)` so the
                         // RAII guards installed earlier in this function run:
                         // `_scheduler_guard` aborts the already-spawned
-                        // scheduler, and `_run_bot_cleanup` SIGTERMs any
+                        // scheduler, and `_run_bot_cleanup` SIGKILLs any
                         // child process the scheduler may have launched
                         // during the gap between its spawn and this flush
                         // failure. Direct `process::exit` skipped both,
@@ -7293,7 +7294,7 @@ async fn handle_stop_command(
                 return Ok(());
             }
 
-            // Set cancellation flag and SIGTERM the child IMMEDIATELY to
+            // Set cancellation flag and SIGKILL the child IMMEDIATELY to
             // prevent a race: without this, the window between receiving
             // /stop and setting cancelled (during rate_limit_wait +
             // "Stopping..." network call) allows a concurrent claude::execute
@@ -7437,7 +7438,8 @@ async fn handle_stopall_command(
             }
 
             // Cancellation flag already set above inside the lock; this
-            // SIGTERMs the child (cancel_now sets the flag again — idempotent).
+            // SIGKILLs the child's process group (cancel_now sets the flag
+            // again — idempotent).
             token.cancel_now();
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -7847,7 +7849,7 @@ async fn handle_shell_command(
 
         // Shell child has not been spawned yet (we spawn it below, after the
         // lock is acquired and the placeholder is sent), so cleanup is just
-        // state + queue processing; no child process to SIGTERM.
+        // state + queue processing; no child process to SIGKILL.
         if cancel_token.cancelled.load(Ordering::Relaxed) {
             msg_debug(&format!("[queue:trigger] chat_id={}, source=query_cancelled_during_lock", chat_id.0));
             { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
@@ -7903,7 +7905,7 @@ async fn handle_shell_command(
                 c
             };
             // Put the shell into its own process group so /stop's
-            // kill(-pid, SIGTERM) targets the bash/powershell tree —
+            // kill(-pid, SIGKILL) targets the bash/powershell tree —
             // and not the bot's own pgroup. No-op on Windows (taskkill /T).
             claude::detach_into_own_pgroup(&mut cmd);
             let child = cmd.spawn();
@@ -8173,7 +8175,7 @@ async fn handle_shell_command(
 
         // Post-loop: cancel handling
         if cancelled {
-            // Re-send SIGTERM as a safety belt (cancelled flag already true,
+            // Re-send SIGKILL as a safety belt (cancelled flag already true,
             // cancel_now is idempotent).
             cancel_token.cancel_now();
 
@@ -9592,7 +9594,7 @@ async fn handle_text_message(
         // /stop arriving while we waited for the group lock sets cancelled=true.
         // AI has not been spawned yet (we spawn it below, after the lock is
         // acquired and the placeholder is sent), so cleanup is just state +
-        // queue processing; no child to SIGTERM, no API calls billed.
+        // queue processing; no child to SIGKILL, no API calls billed.
         if cancel_token.cancelled.load(Ordering::Relaxed) {
             msg_debug(&format!("[queue:trigger] chat_id={}, source=text_cancelled_during_lock", chat_id.0));
             { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
@@ -10486,7 +10488,7 @@ async fn handle_text_message(
 
         // === Post-loop: cancelled handling or lock release ===
         if cancelled {
-            // Re-send SIGTERM as a safety belt (cancel_now is idempotent).
+            // Re-send SIGKILL as a safety belt (cancel_now is idempotent).
             cancel_token.cancel_now();
 
             // stopped_response (full) is used for session history
@@ -12414,7 +12416,7 @@ async fn execute_schedule(
             schedule_id, cancelled, had_error, full_response.len()));
         if cancelled {
             sched_debug(&format!("[execute_schedule] id={}, cancelled — killing child process", schedule_id));
-            // Re-send SIGTERM as a safety belt (cancel_now is idempotent).
+            // Re-send SIGKILL as a safety belt (cancel_now is idempotent).
             cancel_token.cancel_now();
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
@@ -13467,7 +13469,7 @@ async fn process_bot_message(
         // Handle cancellation
         if cancelled {
             msg_debug(&format!("[botmsg_poll:{}] handling cancellation: response_len={}", bmsg_id_for_log, full_response.len()));
-            // Peek the recorded PID for debug logging, then re-send SIGTERM
+            // Peek the recorded PID for debug logging, then re-send SIGKILL
             // as a safety belt (cancel_now is idempotent).
             {
                 let pid_opt = *cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());

@@ -367,7 +367,7 @@ pub struct AIScreenState {
     /// Whether AI screen is in fullscreen mode (toggle with Ctrl+F)
     pub ai_fullscreen: bool,
     /// Cancel token for the in-flight request. Set by `submit()` and
-    /// consumed by `cancel_processing()` to SIGTERM the child Claude
+    /// consumed by `cancel_processing()` to SIGKILL the child Claude
     /// process so it does not keep running in the background.
     cancel_token: Option<std::sync::Arc<CancelToken>>,
 }
@@ -905,7 +905,7 @@ Keep responses concise and terminal-friendly.",
         self.response_receiver = Some(rx);
         debug_log("submit: Channel created, receiver stored");
 
-        // Create a cancel token so ESC can SIGTERM the spawned Claude
+        // Create a cancel token so ESC can SIGKILL the spawned Claude
         // process; without it the child runs to completion in the
         // background and accumulates across cancel/resubmit cycles.
         let cancel_token = std::sync::Arc::new(CancelToken::new());

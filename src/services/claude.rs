@@ -319,17 +319,25 @@ impl CancelToken {
     /// naturally, defeating the purpose of cancellation. Mirrors the writer-
     /// side mutex recovery in `execute_command_streaming`.
     ///
-    /// Unix: SIGTERM the entire process group (negative PID). Requires that
-    /// the child was spawned with `detach_into_own_pgroup`, which makes it
-    /// the leader of a new group whose ID equals its PID; otherwise the
-    /// signal would target the wrong group (potentially the bot itself).
+    /// Unix: SIGKILL the entire process group (negative PID). SIGKILL (not
+    /// SIGTERM) because the AI CLIs we spawn (claude, codex, opencode) are
+    /// per-request throwaway processes with no client-side state to flush
+    /// on shutdown — and SIGTERM is catchable, so a CLI that traps it for
+    /// graceful shutdown could stop emitting stdout while it finishes
+    /// in-flight API requests, leaving the worker thread blocked on
+    /// `reader.lines()` and a billable subprocess still running in the
+    /// background. SIGKILL is uncatchable and bounds cleanup to a kernel
+    /// scheduler tick. Requires that the child was spawned with
+    /// `detach_into_own_pgroup`, which makes it the leader of a new group
+    /// whose ID equals its PID; otherwise the signal would target the
+    /// wrong group (potentially the bot itself).
     /// Windows: `taskkill /T /F` already kills the tree by PID.
     pub fn cancel_now(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         let guard = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pid) = *guard {
             #[cfg(unix)]
-            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM); }
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
             #[cfg(windows)]
             {
                 let _ = std::process::Command::new("taskkill")
