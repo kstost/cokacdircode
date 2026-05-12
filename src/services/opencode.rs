@@ -748,6 +748,7 @@ fn build_opencode_command(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::services::claude::detach_into_own_pgroup(&mut cmd);
 
     (cmd, sp_path)
 }

@@ -3472,23 +3472,7 @@ fn new_cancel_token_for_owner(owner_dispatch_id: u64) -> Arc<CancelToken> {
 }
 
 fn cancel_token_now(token: &Arc<CancelToken>) {
-    token.cancelled.store(true, Ordering::Relaxed);
-    // Recover from a poisoned mutex (a prior holder panicked) instead of
-    // silently skipping the kill — without SIGTERM the streaming reader
-    // stays blocked on stdout until the child exits naturally, defeating
-    // the whole point of /stop. Mirrors the writer-side recovery in the
-    // PID-store paths.
-    let guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(pid) = *guard {
-        #[cfg(unix)]
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM); }
-        #[cfg(windows)]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .output();
-        }
-    }
+    token.cancel_now();
 }
 
 fn insert_cancel_token_locked(data: &mut SharedData, chat_id: ChatId, token: Arc<CancelToken>) {
@@ -7245,23 +7229,7 @@ async fn handle_session_command(
 fn cancel_in_progress_task_locked(data: &SharedData, chat_id: ChatId) {
     if let Some(token) = data.cancel_tokens.get(&chat_id).cloned() {
         if !token.cancelled.load(Ordering::Relaxed) {
-            token.cancelled.store(true, Ordering::Relaxed);
-            // See `cancel_token_now`: recover from poison so SIGTERM is
-            // still sent. Silently skipping the kill leaves the blocking
-            // reader stuck on stdout.
-            let guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(pid) = *guard {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                }
-                #[cfg(windows)]
-                {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .output();
-                }
-            }
+            token.cancel_now();
         }
     }
 }
@@ -7325,33 +7293,18 @@ async fn handle_stop_command(
                 return Ok(());
             }
 
-            // Set cancellation flag IMMEDIATELY to prevent race condition:
-            // Without this, the window between receiving /stop and setting cancelled
-            // (during rate_limit_wait + "Stopping..." network call) allows a concurrent
-            // claude::execute to pass its cancelled check and start an API request.
-            token.cancelled.store(true, Ordering::Relaxed);
+            // Set cancellation flag and SIGTERM the child IMMEDIATELY to
+            // prevent a race: without this, the window between receiving
+            // /stop and setting cancelled (during rate_limit_wait +
+            // "Stopping..." network call) allows a concurrent claude::execute
+            // to pass its cancelled check and start an API request.
+            token.cancel_now();
 
             // Clear loop state so verification loop doesn't continue after stop
             {
                 let mut data = state.lock().await;
                 data.loop_states.remove(&chat_id);
                 data.loop_feedback.remove(&chat_id);
-            }
-
-            // Kill child process directly to unblock reader.lines()
-            // When the child dies, its stdout pipe closes → reader returns EOF → blocking thread exits.
-            // Recover from a poisoned mutex so the SIGTERM still goes out
-            // — silently skipping leaves the reader blocked indefinitely.
-            {
-                let guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(pid) = *guard {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    #[cfg(windows)]
-                    { let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output(); }
-                }
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -7483,21 +7436,9 @@ async fn handle_stopall_command(
                 return Ok(());
             }
 
-            // Cancellation flag already set above inside the lock
-
-            // Kill child process. Recover from a poisoned mutex so the
-            // SIGTERM still goes out — see `cancel_token_now`.
-            {
-                let guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(pid) = *guard {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    #[cfg(windows)]
-                    { let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output(); }
-                }
-            }
+            // Cancellation flag already set above inside the lock; this
+            // SIGTERMs the child (cancel_now sets the flag again — idempotent).
+            token.cancel_now();
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ Cancel signal sent (stopall, {} queued cleared)", queue_len);
@@ -7940,23 +7881,32 @@ async fn handle_shell_command(
         // lock wait could not prevent execution.
         let _ = spawn_tracked_blocking_task(request_tasks_for_shell, move || {
             #[cfg(unix)]
-            let child = std::process::Command::new("bash")
-                .args(["-c", &cmd_owned])
-                .current_dir(&working_dir_clone)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
+            let mut cmd = {
+                let mut c = std::process::Command::new("bash");
+                c.args(["-c", &cmd_owned])
+                    .current_dir(&working_dir_clone)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                c
+            };
             #[cfg(windows)]
             let ps_command = format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {}; exit $LASTEXITCODE", cmd_owned);
             #[cfg(windows)]
-            let child = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
-                .current_dir(&working_dir_clone)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
+            let mut cmd = {
+                let mut c = std::process::Command::new("powershell");
+                c.args(["-NoProfile", "-NonInteractive", "-Command", &ps_command])
+                    .current_dir(&working_dir_clone)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                c
+            };
+            // Put the shell into its own process group so /stop's
+            // kill(-pid, SIGTERM) targets the bash/powershell tree —
+            // and not the bot's own pgroup. No-op on Windows (taskkill /T).
+            claude::detach_into_own_pgroup(&mut cmd);
+            let child = cmd.spawn();
 
             let mut child = match child {
                 Ok(c) => c,
@@ -8223,19 +8173,9 @@ async fn handle_shell_command(
 
         // Post-loop: cancel handling
         if cancelled {
-            // Recover from a poisoned mutex so SIGTERM still goes out — see
-            // `cancel_token_now` for rationale.
-            {
-                let guard = cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(pid) = *guard {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    #[cfg(windows)]
-                    { let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output(); }
-                }
-            }
+            // Re-send SIGTERM as a safety belt (cancelled flag already true,
+            // cancel_now is idempotent).
+            cancel_token.cancel_now();
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
             let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, "[Stopped]").await);
@@ -10546,19 +10486,8 @@ async fn handle_text_message(
 
         // === Post-loop: cancelled handling or lock release ===
         if cancelled {
-            // Recover from a poisoned mutex so SIGTERM still goes out — see
-            // `cancel_token_now` for rationale.
-            {
-                let guard = cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(pid) = *guard {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    #[cfg(windows)]
-                    { let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output(); }
-                }
-            }
+            // Re-send SIGTERM as a safety belt (cancel_now is idempotent).
+            cancel_token.cancel_now();
 
             // stopped_response (full) is used for session history
             let stopped_response = if full_response.trim().is_empty() {
@@ -12485,19 +12414,8 @@ async fn execute_schedule(
             schedule_id, cancelled, had_error, full_response.len()));
         if cancelled {
             sched_debug(&format!("[execute_schedule] id={}, cancelled — killing child process", schedule_id));
-            // Recover from a poisoned mutex so SIGTERM still goes out — see
-            // `cancel_token_now` for rationale.
-            {
-                let guard = cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(pid) = *guard {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    #[cfg(windows)]
-                    { let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output(); }
-                }
-            }
+            // Re-send SIGTERM as a safety belt (cancel_now is idempotent).
+            cancel_token.cancel_now();
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
             // ── Show remaining delta + stopped (unified rolling placeholder) ──
@@ -13549,22 +13467,16 @@ async fn process_bot_message(
         // Handle cancellation
         if cancelled {
             msg_debug(&format!("[botmsg_poll:{}] handling cancellation: response_len={}", bmsg_id_for_log, full_response.len()));
-            // Recover from a poisoned mutex so SIGTERM still goes out — see
-            // `cancel_token_now` for rationale.
+            // Peek the recorded PID for debug logging, then re-send SIGTERM
+            // as a safety belt (cancel_now is idempotent).
             {
-                let guard = cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(pid) = *guard {
-                    msg_debug(&format!("[botmsg_poll:{}] killing child process: pid={}", bmsg_id_for_log, pid));
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                    #[cfg(windows)]
-                    { let _ = std::process::Command::new("taskkill").args(["/PID", &pid.to_string(), "/T", "/F"]).output(); }
-                } else {
-                    msg_debug(&format!("[botmsg_poll:{}] no child pid to kill", bmsg_id_for_log));
+                let pid_opt = *cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+                match pid_opt {
+                    Some(pid) => msg_debug(&format!("[botmsg_poll:{}] killing child process: pid={}", bmsg_id_for_log, pid)),
+                    None => msg_debug(&format!("[botmsg_poll:{}] no child pid to kill", bmsg_id_for_log)),
                 }
             }
+            cancel_token.cancel_now();
 
             // stopped_response (full) for session history
             let stopped_response = if full_response.trim().is_empty() {

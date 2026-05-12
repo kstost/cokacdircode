@@ -361,6 +361,10 @@ fn transfer_rsync(
             cmd
         };
 
+        // Place rsync in its own process group so kill_child_tree's
+        // group-targeted SIGKILL stays scoped to rsync (and any sshpass
+        // wrapper) — and never touches the cokacdir TUI process itself.
+        crate::services::claude::detach_into_own_pgroup(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("Failed to start rsync: {}", e))?;
 
         // Parse rsync progress output.

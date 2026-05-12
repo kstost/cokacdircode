@@ -5035,23 +5035,28 @@ impl App {
                 let _ = std::fs::remove_file(path);
             };
 
-            // Use stdbuf to disable buffering if available
+            // Use stdbuf to disable buffering if available. Each child is
+            // placed into its own process group so kill_child_tree's
+            // group-targeted SIGKILL stays scoped to tar (and never the
+            // cokacdir TUI process itself).
             let child = if has_stdbuf {
                 let mut args = vec!["-o0".to_string(), "-e0".to_string(), tar_cmd.clone()];
                 args.extend(tar_args);
-                Command::new("stdbuf")
-                    .current_dir(&current_dir)
+                let mut cmd = Command::new("stdbuf");
+                cmd.current_dir(&current_dir)
                     .args(&args)
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+                    .stderr(Stdio::piped());
+                crate::services::claude::detach_into_own_pgroup(&mut cmd);
+                cmd.spawn()
             } else {
-                Command::new(&tar_cmd)
-                    .current_dir(&current_dir)
+                let mut cmd = Command::new(&tar_cmd);
+                cmd.current_dir(&current_dir)
                     .args(&tar_args)
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+                    .stderr(Stdio::piped());
+                crate::services::claude::detach_into_own_pgroup(&mut cmd);
+                cmd.spawn()
             };
 
             match child {
@@ -5403,23 +5408,27 @@ impl App {
             let archive_path_str = archive_path_owned.to_string_lossy().to_string();
             let tar_args = vec![tar_options.to_string(), archive_path_str];
 
-            // Execute tar extraction
+            // Execute tar extraction. Each child is placed into its own
+            // process group so kill_child_tree's group-targeted SIGKILL
+            // stays scoped to tar (and never the cokacdir TUI process itself).
             let child = if has_stdbuf {
                 let mut args = vec!["-oL".to_string(), "-eL".to_string(), tar_cmd.clone()];
                 args.extend(tar_args);
-                Command::new("stdbuf")
-                    .current_dir(&extract_path_clone)
+                let mut cmd = Command::new("stdbuf");
+                cmd.current_dir(&extract_path_clone)
                     .args(&args)
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+                    .stderr(Stdio::piped());
+                crate::services::claude::detach_into_own_pgroup(&mut cmd);
+                cmd.spawn()
             } else {
-                Command::new(&tar_cmd)
-                    .current_dir(&extract_path_clone)
+                let mut cmd = Command::new(&tar_cmd);
+                cmd.current_dir(&extract_path_clone)
                     .args(&tar_args)
                     .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
+                    .stderr(Stdio::piped());
+                crate::services::claude::detach_into_own_pgroup(&mut cmd);
+                cmd.spawn()
             };
 
             // Cleanup helper for failed extraction

@@ -439,13 +439,15 @@ pub fn execute_command_streaming(
     let turn_started_at = std::time::SystemTime::now();
 
     let spawn_start = std::time::Instant::now();
-    let mut child = Command::new(codex_bin)
-        .args(&args)
+    let mut cmd = Command::new(codex_bin);
+    cmd.args(&args)
         .current_dir(working_dir)
         .env("PATH", crate::services::claude::enhanced_path_for_bin(codex_bin))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    crate::services::claude::detach_into_own_pgroup(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| {
             codex_debug_log(&format!("ERROR: Failed to spawn: {}", e));

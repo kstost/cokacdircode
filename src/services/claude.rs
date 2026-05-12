@@ -311,22 +311,69 @@ impl CancelToken {
             owner_dispatch_id: std::sync::atomic::AtomicU64::new(0),
         }
     }
+
+    /// Signal cancellation and immediately terminate the tracked child
+    /// process — including any subprocesses it spawned (e.g. Bash from a
+    /// tool call) — if its PID has been registered. Without the signal the
+    /// streaming reader would stay blocked on stdout until the child exits
+    /// naturally, defeating the purpose of cancellation. Mirrors the writer-
+    /// side mutex recovery in `execute_command_streaming`.
+    ///
+    /// Unix: SIGTERM the entire process group (negative PID). Requires that
+    /// the child was spawned with `detach_into_own_pgroup`, which makes it
+    /// the leader of a new group whose ID equals its PID; otherwise the
+    /// signal would target the wrong group (potentially the bot itself).
+    /// Windows: `taskkill /T /F` already kills the tree by PID.
+    pub fn cancel_now(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        let guard = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pid) = *guard {
+            #[cfg(unix)]
+            unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGTERM); }
+            #[cfg(windows)]
+            {
+                let _ = std::process::Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output();
+            }
+        }
+    }
+}
+
+/// Place a child into its own process group on Unix so that
+/// `cancel_now` / `kill_child_tree` can signal the entire group — the child
+/// plus any subprocesses it spawned (Bash from a tool call, the bun binary
+/// behind an npm-launcher CLI, etc.). Without this the kill targets only the
+/// immediate child and grandchildren are reparented to init as orphans.
+/// No-op on Windows where `taskkill /T /F` already kills the tree by PID.
+pub fn detach_into_own_pgroup(cmd: &mut std::process::Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd;
+    }
 }
 
 /// Kill a child process and its entire process tree.
-/// On Unix, uses SIGKILL. On Windows, uses `taskkill /PID /T /F` to kill the
-/// process tree so that child processes (bash.exe, node.exe, etc.) don't survive.
+/// On Unix, SIGKILLs the child's process group (requires the child was
+/// spawned with `detach_into_own_pgroup`). On Windows, uses `taskkill
+/// /PID /T /F` to kill the process tree so that child processes (bash.exe,
+/// node.exe, etc.) don't survive.
 pub fn kill_child_tree(child: &mut std::process::Child) {
+    let pid = child.id();
     #[cfg(windows)]
     {
-        let pid = child.id();
         let _ = std::process::Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
     }
     #[cfg(not(windows))]
     {
-        let _ = child.kill();
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
     }
 }
 
@@ -1112,8 +1159,8 @@ IMPORTANT: Format your responses using Markdown for better readability:
     debug_log("Env: BASH_MAX_TIMEOUT_MS=86400000");
 
     let spawn_start = std::time::Instant::now();
-    let mut child = Command::new(claude_bin)
-        .args(&args)
+    let mut cmd = Command::new(claude_bin);
+    cmd.args(&args)
         .current_dir(working_dir)
         .env("PATH", enhanced_path_for_bin(claude_bin))
         .env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "64000")
@@ -1122,7 +1169,9 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .env_remove("CLAUDECODE")  // Allow running from within Claude Code sessions
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    detach_into_own_pgroup(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| {
             debug_log(&format!("ERROR: Failed to spawn after {:?}: {}", spawn_start.elapsed(), e));

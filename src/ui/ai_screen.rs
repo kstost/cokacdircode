@@ -39,7 +39,7 @@ fn debug_log(msg: &str) {
 }
 
 use super::theme::Theme;
-use crate::services::claude::{self, StreamMessage};
+use crate::services::claude::{self, CancelToken, StreamMessage};
 use crate::utils::markdown::{is_line_empty, render_markdown, MarkdownTheme};
 
 /// Sanitize user input to prevent prompt injection attacks
@@ -366,6 +366,10 @@ pub struct AIScreenState {
     pub last_raw_lines: usize,
     /// Whether AI screen is in fullscreen mode (toggle with Ctrl+F)
     pub ai_fullscreen: bool,
+    /// Cancel token for the in-flight request. Set by `submit()` and
+    /// consumed by `cancel_processing()` to SIGTERM the child Claude
+    /// process so it does not keep running in the background.
+    cancel_token: Option<std::sync::Arc<CancelToken>>,
 }
 
 /// Maximum number of history items to retain
@@ -552,6 +556,7 @@ impl AIScreenState {
             last_visible_width: 0,
             last_raw_lines: 0,
             ai_fullscreen: false,
+            cancel_token: None,
         };
 
         // Add warning message first
@@ -595,6 +600,7 @@ impl AIScreenState {
             last_visible_width: 0,
             last_raw_lines: 0,
             ai_fullscreen: false,
+            cancel_token: None,
         };
 
         // Add warning message as first line
@@ -899,6 +905,12 @@ Keep responses concise and terminal-friendly.",
         self.response_receiver = Some(rx);
         debug_log("submit: Channel created, receiver stored");
 
+        // Create a cancel token so ESC can SIGTERM the spawned Claude
+        // process; without it the child runs to completion in the
+        // background and accumulates across cancel/resubmit cycles.
+        let cancel_token = std::sync::Arc::new(CancelToken::new());
+        self.cancel_token = Some(cancel_token.clone());
+
         // Spawn thread to execute Claude command with streaming
         debug_log("submit: Spawning worker thread...");
         thread::spawn(move || {
@@ -913,7 +925,7 @@ Keep responses concise and terminal-friendly.",
                 tx.clone(),
                 None,
                 None,
-                None,
+                Some(cancel_token),
                 None,
                 false,
                 false,
@@ -1054,6 +1066,7 @@ Keep responses concise and terminal-friendly.",
         if processing_done {
             self.is_processing = false;
             self.response_receiver = None;
+            self.cancel_token = None;
         }
 
         has_new_content
@@ -1117,6 +1130,9 @@ Keep responses concise and terminal-friendly.",
     /// Cancel the current processing request
     pub fn cancel_processing(&mut self) {
         if self.is_processing {
+            if let Some(token) = self.cancel_token.take() {
+                token.cancel_now();
+            }
             self.is_processing = false;
             self.response_receiver = None;
             self.add_to_history(HistoryItem {

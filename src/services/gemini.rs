@@ -317,6 +317,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::services::claude::detach_into_own_pgroup(&mut cmd);
 
     if gemini_supports_skip_trust() {
         cmd.env("COKAC_GEMINI_SKIP_TRUST", "1");
