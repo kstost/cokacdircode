@@ -297,10 +297,14 @@ pub enum StreamMessage {
 
 /// Token for cooperative cancellation of streaming requests.
 /// Holds a flag and the child process PID so the caller can kill it externally.
+/// On Linux, also optionally holds a per-spawn cgroup v2 handle whose
+/// `cgroup.kill` atomically kills every descendant — including ones the AI
+/// CLI detaches via setsid/double-fork that escape pgroup-based kills.
 pub struct CancelToken {
     pub cancelled: std::sync::atomic::AtomicBool,
     pub child_pid: std::sync::Mutex<Option<u32>>,
     pub owner_dispatch_id: std::sync::atomic::AtomicU64,
+    pub cgroup: std::sync::Mutex<Option<std::sync::Arc<crate::services::cgroup::KillCgroup>>>,
 }
 
 impl CancelToken {
@@ -309,31 +313,60 @@ impl CancelToken {
             cancelled: std::sync::atomic::AtomicBool::new(false),
             child_pid: std::sync::Mutex::new(None),
             owner_dispatch_id: std::sync::atomic::AtomicU64::new(0),
+            cgroup: std::sync::Mutex::new(None),
         }
     }
 
     /// Signal cancellation and immediately terminate the tracked child
-    /// process — including any subprocesses it spawned (e.g. Bash from a
-    /// tool call) — if its PID has been registered. Without the signal the
-    /// streaming reader would stay blocked on stdout until the child exits
-    /// naturally, defeating the purpose of cancellation. Mirrors the writer-
-    /// side mutex recovery in `execute_command_streaming`.
+    /// process — including any subprocesses it spawned (Bash from a tool
+    /// call, the bun binary behind opencode, etc.) — if its PID has been
+    /// registered. Without the signal the streaming reader would stay
+    /// blocked on stdout until the child exits naturally, defeating the
+    /// purpose of cancellation.
     ///
-    /// Unix: SIGKILL the entire process group (negative PID). SIGKILL (not
-    /// SIGTERM) because the AI CLIs we spawn (claude, codex, opencode) are
-    /// per-request throwaway processes with no client-side state to flush
-    /// on shutdown — and SIGTERM is catchable, so a CLI that traps it for
-    /// graceful shutdown could stop emitting stdout while it finishes
-    /// in-flight API requests, leaving the worker thread blocked on
-    /// `reader.lines()` and a billable subprocess still running in the
-    /// background. SIGKILL is uncatchable and bounds cleanup to a kernel
-    /// scheduler tick. Requires that the child was spawned with
-    /// `detach_into_own_pgroup`, which makes it the leader of a new group
-    /// whose ID equals its PID; otherwise the signal would target the
-    /// wrong group (potentially the bot itself).
-    /// Windows: `taskkill /T /F` already kills the tree by PID.
+    /// Linux: if a per-spawn cgroup v2 handle was attached
+    /// (`attach_cancel_cgroup` at spawn time), write "1" to its
+    /// `cgroup.kill` first — this is a kernel-atomic SIGKILL to every PID
+    /// in the cgroup including descendants the AI CLI moved into a new
+    /// session via `setsid()` (e.g. Claude Code's Bash tool spawns its
+    /// shell with `child_process.spawn({ detached: true })`, which puts it
+    /// outside any pgroup we can reach with `kill(-pgid, …)`). cgroup
+    /// membership is inherited at fork() and cannot be left by an
+    /// unprivileged process, so it catches setsid/setpgid/double-fork
+    /// alike. The pgroup kill that follows is kept as a fallback for
+    /// environments without cgroup v2 (older kernels, restrictive
+    /// sandboxes) where `KillCgroup::new` returns None and the token's
+    /// cgroup field stays empty.
+    ///
+    /// Unix pgroup fallback: SIGKILL the entire process group (negative
+    /// PID). SIGKILL (not SIGTERM) because the AI CLIs are per-request
+    /// throwaway processes with no client-side state to flush on shutdown,
+    /// and SIGTERM is catchable — a graceful-shutdown handler that stops
+    /// emitting stdout while in-flight API requests finish would leave the
+    /// worker thread blocked on `reader.lines()` indefinitely. SIGKILL is
+    /// uncatchable. Requires `detach_into_own_pgroup` at spawn so the
+    /// negative PID targets the child's group, not cokacdir's.
+    ///
+    /// Windows: `taskkill /T /F` already kills the process tree by PID, so
+    /// the cgroup path is unused.
     pub fn cancel_now(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+
+        // Preferred path: cgroup v2 atomic kill catches every descendant.
+        // Held in its own scope so the lock is released before we touch the
+        // PID mutex below — the two are independent and we don't want a
+        // poisoned pid mutex to skip the cgroup kill.
+        {
+            let cg_guard = self.cgroup.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref cg) = *cg_guard {
+                cg.kill_all();
+            }
+        }
+
+        // Fallback: pgroup-based kill of the immediate child. Harmless even
+        // when the cgroup path already fired — on Linux the descendants are
+        // already gone; this just hits the (probably already-dead) direct
+        // child a second time. On non-Linux this is the only mechanism.
         let guard = self.child_pid.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(pid) = *guard {
             #[cfg(unix)]
@@ -345,6 +378,50 @@ impl CancelToken {
                     .output();
             }
         }
+    }
+}
+
+/// Set up the optional cgroup v2 layer for cancellation on `cmd` and store
+/// the resulting cgroup in `token` so `cancel_now` can find it. The pgroup
+/// layer (`detach_into_own_pgroup`) should already have been applied by the
+/// caller; this is an additive enhancement that catches descendants the
+/// pgroup kill can't reach (setsid'd grandchildren etc.).
+///
+/// No-op if `token` is None, if not running on Linux, or if cgroup v2 is
+/// unavailable / sub-cgroup creation is denied — in those cases cancel
+/// behavior degrades to the pre-existing pgroup-only path.
+pub fn attach_cancel_cgroup(
+    cmd: &mut std::process::Command,
+    token: Option<&std::sync::Arc<CancelToken>>,
+) {
+    let token = match token {
+        Some(t) => t,
+        None => return,
+    };
+    if let Some(cg) = crate::services::cgroup::KillCgroup::new() {
+        cg.attach_command(cmd);
+        let arc = std::sync::Arc::new(cg);
+        let mut guard = token.cgroup.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(arc);
+    }
+}
+
+/// `attach_cancel_cgroup` variant for `tokio::process::Command` (used by the
+/// opencode serve path, which spawns asynchronously). Same semantics as the
+/// std-Command version — see `attach_cancel_cgroup` for details.
+pub fn attach_cancel_cgroup_tokio(
+    cmd: &mut tokio::process::Command,
+    token: Option<&std::sync::Arc<CancelToken>>,
+) {
+    let token = match token {
+        Some(t) => t,
+        None => return,
+    };
+    if let Some(cg) = crate::services::cgroup::KillCgroup::new() {
+        cg.attach_tokio_command(cmd);
+        let arc = std::sync::Arc::new(cg);
+        let mut guard = token.cgroup.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(arc);
     }
 }
 
@@ -1179,6 +1256,7 @@ IMPORTANT: Format your responses using Markdown for better readability:
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     detach_into_own_pgroup(&mut cmd);
+    attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
     let mut child = cmd
         .spawn()
         .map_err(|e| {

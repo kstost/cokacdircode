@@ -447,6 +447,7 @@ pub fn execute_command_streaming(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     crate::services::claude::detach_into_own_pgroup(&mut cmd);
+    crate::services::claude::attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
     let mut child = cmd
         .spawn()
         .map_err(|e| {

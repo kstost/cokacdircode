@@ -1302,6 +1302,7 @@ fn execute_command_streaming_legacy(
     opencode_debug(&format!("[stream] effective_prompt_len={} delivery={}", prompt.len(),
         if use_positional { "positional" } else { "stdin" }));
 
+    crate::services::claude::attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
     opencode_debug("[stream] spawning process...");
     let mut child = cmd.spawn().map_err(|e| {
         opencode_debug(&format!("[stream] spawn FAILED: {}", e));
@@ -1789,7 +1790,7 @@ async fn execute_command_streaming_serve(
     }
 
     // ---- 3. Spawn opencode serve and wait for readiness ----
-    let (mut serve_child, base_url) = match spawn_opencode_serve(working_dir).await {
+    let (mut serve_child, base_url) = match spawn_opencode_serve(working_dir, cancel_token.as_ref()).await {
         Ok(pair) => pair,
         Err(e) => {
             opencode_debug(&format!("[serve] spawn failed: {}", e));
@@ -2071,6 +2072,7 @@ async fn execute_command_streaming_serve(
 /// the child handle along with the parsed base URL.
 async fn spawn_opencode_serve(
     working_dir: &str,
+    cancel_token: Option<&Arc<CancelToken>>,
 ) -> Result<(ServeChild, String), String> {
     use tokio::io::AsyncBufReadExt;
     use tokio::io::BufReader as TokioBufReader;
@@ -2113,6 +2115,7 @@ async fn spawn_opencode_serve(
     {
         cmd.process_group(0);
     }
+    crate::services::claude::attach_cancel_cgroup_tokio(&mut cmd, cancel_token);
 
     let mut child = cmd
         .spawn()

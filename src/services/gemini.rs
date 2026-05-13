@@ -548,6 +548,7 @@ pub fn execute_command_streaming(
 
     let _default_sp_guard = SpGuard(default_sp_path);
 
+    crate::services::claude::attach_cancel_cgroup(&mut cmd, cancel_token.as_ref());
     gemini_debug("[stream] spawning process...");
     let mut child = cmd.spawn().map_err(|e| {
         gemini_debug(&format!("[stream] spawn FAILED: {}", e));
