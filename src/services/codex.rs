@@ -37,13 +37,15 @@ static CODEX_PATH: OnceLock<Option<String>> = OnceLock::new();
 #[cfg(unix)]
 fn resolve_codex_path() -> Option<String> {
     if let Ok(val) = std::env::var("COKAC_CODEX_PATH") {
-        if !val.is_empty() && std::path::Path::new(&val).exists() { return Some(val); }
+        if !val.is_empty() && codex_path_is_runnable(&val) {
+            return Some(val);
+        }
     }
 
     if let Ok(output) = Command::new("which").arg("codex").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && std::path::Path::new(&path).exists() {
+            if !path.is_empty() && codex_path_is_runnable(&path) {
                 return Some(path);
             }
         }
@@ -55,7 +57,7 @@ fn resolve_codex_path() -> Option<String> {
     {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() && std::path::Path::new(&path).exists() {
+            if !path.is_empty() && codex_path_is_runnable(&path) {
                 return Some(path);
             }
         }
@@ -67,7 +69,9 @@ fn resolve_codex_path() -> Option<String> {
 #[cfg(windows)]
 fn resolve_codex_path() -> Option<String> {
     if let Ok(val) = std::env::var("COKAC_CODEX_PATH") {
-        if !val.is_empty() && std::path::Path::new(&val).exists() { return Some(val); }
+        if !val.is_empty() && codex_path_is_runnable(&val) {
+            return Some(val);
+        }
     }
 
     // Use SearchPathW (UTF-16 native) — no code page issues with non-ASCII paths
@@ -79,6 +83,33 @@ fn resolve_codex_path() -> Option<String> {
         return Some(path);
     }
     None
+}
+
+fn codex_path_is_runnable(path: &str) -> bool {
+    let p = Path::new(path);
+    if !p.is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(ext.as_str(), "cmd" | "exe" | "bat" | "com")
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        p.metadata()
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        p.is_file()
+    }
 }
 
 /// Get the cached codex binary path, resolving it on first call.
@@ -1205,7 +1236,7 @@ fn parse_item_completed(json: &Value) -> Vec<StreamMessage> {
                     let url = action.and_then(|a| a.get("url")).and_then(|v| v.as_str()).unwrap_or("");
                     let pattern = action.and_then(|a| a.get("pattern")).and_then(|v| v.as_str()).unwrap_or("");
                     match (url.is_empty(), pattern.is_empty()) {
-                        (false, false) => format!("find “{}” in {}", pattern, url),
+                        (false, false) => format!("find: {} in {}", pattern, url),
                         (false, true) => format!("find_in_page: {}", url),
                         (true, false) => format!("find: {}", pattern),
                         (true, true) => top_query.to_string(),

@@ -190,49 +190,9 @@ static OPENCODE_AVAILABLE: OnceLock<bool> = OnceLock::new();
 fn check_opencode_available() -> bool {
     opencode_debug("[check_opencode_available] START");
 
-    #[cfg(windows)]
-    {
-        opencode_debug("[check_opencode_available] disabled on Windows");
-        return false;
-    }
-
-    if let Ok(val) = std::env::var("COKAC_OPENCODE_PATH") {
-        if !val.is_empty() && std::path::Path::new(&val).exists() {
-            opencode_debug(&format!("[check_opencode_available] found via COKAC_OPENCODE_PATH={}", val));
-            return true;
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        if let Ok(output) = Command::new("which").arg("opencode").output() {
-            if output.status.success() {
-                let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !p.is_empty() && std::path::Path::new(&p).exists() {
-                    opencode_debug(&format!("[check_opencode_available] found via which: {}", p));
-                    return true;
-                }
-            }
-        }
-        if let Ok(output) = Command::new("bash").args(["-lc", "which opencode"]).output() {
-            if output.status.success() {
-                let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !p.is_empty() && std::path::Path::new(&p).exists() {
-                    opencode_debug(&format!("[check_opencode_available] found via bash -lc which: {}", p));
-                    return true;
-                }
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        if let Ok(output) = Command::new("where").arg("opencode").output() {
-            if output.status.success() {
-                opencode_debug("[check_opencode_available] found via where");
-                return true;
-            }
-        }
+    if let Some(path) = resolve_opencode_path() {
+        opencode_debug(&format!("[check_opencode_available] found: {}", path));
+        return true;
     }
 
     opencode_debug("[check_opencode_available] NOT FOUND");
@@ -305,8 +265,13 @@ fn resolve_opencode_path() -> Option<String> {
     opencode_debug("[resolve_opencode_path] START");
 
     if let Ok(val) = std::env::var("COKAC_OPENCODE_PATH") {
-        if !val.is_empty() && std::path::Path::new(&val).exists() {
+        if !val.is_empty() && opencode_path_is_runnable(&val) {
             opencode_debug(&format!("[resolve_opencode_path] COKAC_OPENCODE_PATH={}", val));
+            #[cfg(windows)]
+            if let Some(path) = opencode_native_exe_for_wrapper(&val) {
+                opencode_debug(&format!("[resolve_opencode_path] env wrapper -> native exe {}", path));
+                return Some(path);
+            }
             return Some(val);
         }
     }
@@ -316,7 +281,7 @@ fn resolve_opencode_path() -> Option<String> {
         if let Ok(output) = Command::new("which").arg("opencode").output() {
             if output.status.success() {
                 let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !p.is_empty() && std::path::Path::new(&p).exists() {
+                if !p.is_empty() && opencode_path_is_runnable(&p) {
                     opencode_debug(&format!("[resolve_opencode_path] which → {}", p));
                     return Some(p);
                 }
@@ -325,7 +290,7 @@ fn resolve_opencode_path() -> Option<String> {
         if let Ok(output) = Command::new("bash").args(["-lc", "which opencode"]).output() {
             if output.status.success() {
                 let p = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !p.is_empty() && std::path::Path::new(&p).exists() {
+                if !p.is_empty() && opencode_path_is_runnable(&p) {
                     opencode_debug(&format!("[resolve_opencode_path] bash -lc which → {}", p));
                     return Some(p);
                 }
@@ -335,12 +300,52 @@ fn resolve_opencode_path() -> Option<String> {
 
     #[cfg(windows)]
     {
-        if let Ok(output) = Command::new("where").arg("opencode").output() {
+        // Prefer native executables over npm .cmd wrappers. Rust can run
+        // .cmd/.bat files, but doing so goes through cmd.exe and adds a batch
+        // argument-escaping layer for arbitrary user prompts.
+        if let Some(path) = crate::services::claude::search_path_wide("opencode", Some(".exe")) {
+            opencode_debug(&format!("[resolve_opencode_path] SearchPathW .exe -> {}", path));
+            return Some(path);
+        }
+        // npm also installs an extensionless POSIX shell script named
+        // `opencode`; CreateProcess cannot run it. The .cmd wrapper normally
+        // sits next to node_modules/opencode-ai/bin/opencode.exe, which is the
+        // safer target when present.
+        if let Some(path) = crate::services::claude::search_path_wide("opencode", Some(".cmd")) {
+            if let Some(native) = opencode_native_exe_for_wrapper(&path) {
+                opencode_debug(&format!("[resolve_opencode_path] SearchPathW .cmd -> native exe {}", native));
+                return Some(native);
+            }
+            opencode_debug(&format!("[resolve_opencode_path] SearchPathW .cmd -> {}", path));
+            return Some(path);
+        }
+        if let Ok(output) = Command::new("where.exe").arg("opencode").output() {
             if output.status.success() {
-                let p = String::from_utf8_lossy(&output.stdout).lines().next()
-                    .unwrap_or("").to_string();
-                if !p.is_empty() && std::path::Path::new(&p).exists() {
-                    opencode_debug(&format!("[resolve_opencode_path] where → {}", p));
+                let decoded = crate::services::claude::decode_windows_output(&output.stdout);
+                for p in decoded.lines().map(str::trim).filter(|p| !p.is_empty()) {
+                    if opencode_path_is_runnable(p) {
+                        if let Some(native) = opencode_native_exe_for_wrapper(p) {
+                            opencode_debug(&format!("[resolve_opencode_path] where -> native exe {}", native));
+                            return Some(native);
+                        }
+                        opencode_debug(&format!("[resolve_opencode_path] where -> {}", p));
+                        return Some(p.to_string());
+                    }
+                }
+            }
+        }
+        if let Ok(output) = Command::new("cmd").args(["/c", "npm root -g"]).output() {
+            if output.status.success() {
+                let npm_root = crate::services::claude::decode_windows_output(&output.stdout)
+                    .trim()
+                    .to_string();
+                let p = std::path::Path::new(&npm_root)
+                    .join("opencode-ai")
+                    .join("bin")
+                    .join("opencode.exe");
+                if p.exists() {
+                    let p = p.display().to_string();
+                    opencode_debug(&format!("[resolve_opencode_path] npm root fallback -> {}", p));
                     return Some(p);
                 }
             }
@@ -349,6 +354,57 @@ fn resolve_opencode_path() -> Option<String> {
 
     opencode_debug("[resolve_opencode_path] NOT FOUND, will use 'opencode'");
     None
+}
+
+fn opencode_path_is_runnable(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    if !p.is_file() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        matches!(ext.as_str(), "cmd" | "exe" | "bat" | "com")
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        p.metadata()
+            .map(|m| m.is_file() && (m.permissions().mode() & 0o111 != 0))
+            .unwrap_or(false)
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        true
+    }
+}
+
+#[cfg(windows)]
+fn opencode_native_exe_for_wrapper(path: &str) -> Option<String> {
+    let wrapper = std::path::Path::new(path);
+    let ext = wrapper
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext != "cmd" && ext != "bat" {
+        return None;
+    }
+    let parent = wrapper.parent()?;
+    let p = parent
+        .join("node_modules")
+        .join("opencode-ai")
+        .join("bin")
+        .join("opencode.exe");
+    if p.exists() {
+        Some(p.display().to_string())
+    } else {
+        None
+    }
 }
 
 // ============================================================

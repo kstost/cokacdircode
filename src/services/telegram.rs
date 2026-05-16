@@ -5312,7 +5312,7 @@ async fn handle_message(
         msg_debug("[handle_message] routing → /availabletools");
         println!("  [{timestamp}] ◀ [{user_name}] /availabletools");
         { let _m = get_model(&state.lock().await.settings, chat_id);
-        if provider_from_model(_m.as_deref()) != "claude" {
+        if detect_provider(_m.as_deref()) != "claude" {
             tg!("send_message", bot.send_message(chat_id, "Tool permissions are not supported in this mode.").await)?;
         } else {
             handle_availabletools_command(&bot, chat_id, &state).await?;
@@ -5321,7 +5321,7 @@ async fn handle_message(
         msg_debug("[handle_message] routing → /allowedtools");
         println!("  [{timestamp}] ◀ [{user_name}] /allowedtools");
         { let _m = get_model(&state.lock().await.settings, chat_id);
-        if provider_from_model(_m.as_deref()) != "claude" {
+        if detect_provider(_m.as_deref()) != "claude" {
             tg!("send_message", bot.send_message(chat_id, "Tool permissions are not supported in this mode.").await)?;
         } else {
             handle_allowedtools_command(&bot, chat_id, &state).await?;
@@ -5403,7 +5403,7 @@ async fn handle_message(
             // Claude (native --fork-session), Codex (ephemeral exec over the
             // full-fidelity session archive), and OpenCode (native --fork with
             // the `plan` agent). Other providers (currently Gemini) are rejected.
-            let provider = { let _m = get_model(&state.lock().await.settings, chat_id); provider_from_model(_m.as_deref()).to_string() };
+            let provider = { let _m = get_model(&state.lock().await.settings, chat_id); detect_provider(_m.as_deref()).to_string() };
             if provider != "claude" && provider != "codex" && provider != "opencode" {
                 shared_rate_limit_wait(&state, chat_id).await;
                 tg!("send_message", bot.send_message(chat_id, "/loop currently supports Claude, Codex, or OpenCode models only.").await)?;
@@ -5473,7 +5473,7 @@ async fn handle_message(
         msg_debug("[handle_message] routing → /allowed");
         println!("  [{timestamp}] ◀ [{user_name}] /allowed {}", text.strip_prefix("/allowed").unwrap_or("").trim());
         { let _m = get_model(&state.lock().await.settings, chat_id);
-        if provider_from_model(_m.as_deref()) != "claude" {
+        if detect_provider(_m.as_deref()) != "claude" {
             tg!("send_message", bot.send_message(chat_id, "Tool permissions are not supported in this mode.").await)?;
         } else {
             handle_allowed_command(&bot, chat_id, &text, &state, token).await?;
@@ -7051,7 +7051,7 @@ async fn handle_clear_command(
     state: &SharedState,
 ) -> ResponseResult<()> {
     msg_debug(&format!("[handle_clear] chat_id={}", chat_id.0));
-    let (current_path, provider, orphan_stop_msg, bot_username, bot_display_name) = {
+    let (current_path, model_for_provider, orphan_stop_msg, bot_username, bot_display_name) = {
         let mut data = state.lock().await;
         let path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
         let old_sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
@@ -7079,14 +7079,14 @@ async fn handle_clear_command(
             session.clear_pending_uploads();
         }
         let mdl = get_model(&data.settings, chat_id);
-        let prov = provider_from_model(mdl.as_deref());
         let stop_msg = data.stop_message_ids.remove(&chat_id);
         data.loop_states.remove(&chat_id);
         data.loop_feedback.remove(&chat_id);
         let uname = data.bot_username.clone();
         let dname = data.bot_display_name.clone();
-        (path, prov.to_string(), stop_msg, uname, dname)
+        (path, mdl, stop_msg, uname, dname)
     };
+    let provider = detect_provider(model_for_provider.as_deref()).to_string();
 
     // Delete orphaned "Stopping..." message if /stop raced with completion
     if let Some(msg_id) = orphan_stop_msg {
@@ -7191,14 +7191,14 @@ async fn handle_session_command(
     chat_id: ChatId,
     state: &SharedState,
 ) -> ResponseResult<()> {
-    let (session_id, current_path, session_prov) = {
+    let (session_id, current_path, model_for_provider) = {
         let data = state.lock().await;
         let sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
         let path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
         let mdl = get_model(&data.settings, chat_id);
-        let prov = provider_from_model(mdl.as_deref());
-        (sid, path, prov)
+        (sid, path, mdl)
     };
+    let session_prov = detect_provider(model_for_provider.as_deref());
 
     shared_rate_limit_wait(state, chat_id).await;
     match (session_id, current_path) {
