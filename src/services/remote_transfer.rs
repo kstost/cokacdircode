@@ -38,6 +38,29 @@ fn has_rsync() -> bool {
         .unwrap_or(false)
 }
 
+fn spawn_cancel_watchdog(
+    cancel_flag: Arc<AtomicBool>,
+    pid: u32,
+) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_thread = done.clone();
+    let token = Arc::new(crate::services::claude::CancelToken::new());
+    {
+        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(pid);
+    }
+    let handle = std::thread::spawn(move || {
+        while !done_for_thread.load(Ordering::Relaxed) {
+            if cancel_flag.load(Ordering::Relaxed) {
+                token.cancel_now();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    (done, handle)
+}
+
 /// Check if two remote profiles refer to the same server
 fn is_same_server(a: &RemoteProfile, b: &RemoteProfile) -> bool {
     a.host == b.host && a.port == b.port && a.user == b.user
@@ -60,7 +83,11 @@ impl SshExec {
         let profile = profile.clone();
         let handle = runtime.block_on(async {
             let config = client::Config {
-                inactivity_timeout: Some(std::time::Duration::from_secs(60)),
+                // Same-server cp/mv/rm commands can be silent for a long time
+                // while still making progress on the remote host.
+                inactivity_timeout: Some(std::time::Duration::from_secs(24 * 60 * 60)),
+                keepalive_interval: Some(std::time::Duration::from_secs(30)),
+                keepalive_max: 3,
                 ..Default::default()
             };
 
@@ -109,6 +136,17 @@ impl SshExec {
     /// Execute a command on the remote server.
     /// Returns (success, stderr_string).
     fn exec(&self, cmd: &str) -> Result<(bool, String), String> {
+        self.exec_cancelable(cmd, None)
+    }
+
+    /// Execute a command on the remote server, optionally aborting the SSH
+    /// session when the caller cancels a long silent command such as cp/mv/rm.
+    /// Returns (success, stderr_string).
+    fn exec_cancelable(
+        &self,
+        cmd: &str,
+        cancel_flag: Option<&Arc<AtomicBool>>,
+    ) -> Result<(bool, String), String> {
         let cmd = cmd.to_string();
         self.runtime.block_on(async {
             let mut channel = self.handle.channel_open_session()
@@ -122,7 +160,29 @@ impl SshExec {
             let mut stderr_bytes = Vec::new();
             let mut exit_status: Option<u32> = None;
 
-            while let Some(msg) = channel.wait().await {
+            loop {
+                if cancel_flag
+                    .map(|flag| flag.load(Ordering::Relaxed))
+                    .unwrap_or(false)
+                {
+                    let _ = self
+                        .handle
+                        .disconnect(Disconnect::ByApplication, "cancelled", "en")
+                        .await;
+                    return Err("Cancelled".to_string());
+                }
+
+                let msg = match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    channel.wait(),
+                )
+                .await
+                {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => break,
+                    Err(_) => continue,
+                };
+
                 match msg {
                     ChannelMsg::ExtendedData { data, ext } => {
                         if ext == 1 {
@@ -177,7 +237,8 @@ fn build_ssh_option(profile: &RemoteProfile) -> String {
     // Key file
     if let RemoteAuth::KeyFile { ref path, .. } = profile.auth {
         let expanded = expand_tilde(path).display().to_string();
-        ssh_cmd.push_str(&format!(" -i '{}'", expanded));
+        let escaped = expanded.replace('\'', "'\\''");
+        ssh_cmd.push_str(&format!(" -i '{}'", escaped));
     }
 
     // Disable strict host key checking for convenience
@@ -366,6 +427,16 @@ fn transfer_rsync(
         // wrapper) — and never touches the cokacdir TUI process itself.
         crate::services::claude::detach_into_own_pgroup(&mut cmd);
         let mut child = cmd.spawn().map_err(|e| format!("Failed to start rsync: {}", e))?;
+        let (cancel_watch_done, cancel_watch) =
+            spawn_cancel_watchdog(cancel_flag.clone(), child.id());
+        let mut stderr_thread = child.stderr.take().map(|stderr| {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let mut stderr = stderr;
+                let _ = std::io::Read::read_to_string(&mut stderr, &mut buf);
+                buf
+            })
+        });
 
         // Parse rsync progress output.
         // rsync --progress uses \r (carriage return) to update progress in-place,
@@ -378,6 +449,11 @@ fn transfer_rsync(
                 if cancel_flag.load(Ordering::Relaxed) {
                     crate::services::claude::kill_child_tree(&mut child);
                     let _ = child.wait();
+                    cancel_watch_done.store(true, Ordering::Relaxed);
+                    let _ = cancel_watch.join();
+                    if let Some(handle) = stderr_thread.take() {
+                        let _ = handle.join();
+                    }
                     return Ok(());
                 }
 
@@ -409,20 +485,39 @@ fn transfer_rsync(
             }
         }
 
-        let status = child.wait().map_err(|e| format!("rsync wait failed: {}", e))?;
+        let status = match child.wait() {
+            Ok(status) => status,
+            Err(e) => {
+                cancel_watch_done.store(true, Ordering::Relaxed);
+                let _ = cancel_watch.join();
+                if let Some(handle) = stderr_thread.take() {
+                    let _ = handle.join();
+                }
+                if cancel_flag.load(Ordering::Relaxed) {
+                    return Ok(());
+                }
+                return Err(format!("rsync wait failed: {}", e));
+            }
+        };
+        cancel_watch_done.store(true, Ordering::Relaxed);
+        let _ = cancel_watch.join();
+        let stderr_output = stderr_thread
+            .take()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default();
+
+        if cancel_flag.load(Ordering::Relaxed) {
+            return Ok(());
+        }
 
         if status.success() {
             completed_files += 1;
             let _ = tx.send(ProgressMessage::FileCompleted(file_name));
             let _ = tx.send(ProgressMessage::TotalProgress(completed_files, total_files, 0, 0));
         } else {
-            let stderr_msg = if let Some(mut stderr) = child.stderr.take() {
-                let mut buf = String::new();
-                let _ = std::io::Read::read_to_string(&mut stderr, &mut buf);
-                buf
-            } else {
-                format!("rsync exited with code {}", status.code().unwrap_or(-1))
-            };
+            let stderr_msg = Some(stderr_output)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| format!("rsync exited with code {}", status.code().unwrap_or(-1)));
             let _ = tx.send(ProgressMessage::Error(file_name, stderr_msg.clone()));
             return Err(stderr_msg);
         }
@@ -459,14 +554,21 @@ fn parse_rsync_progress(line: &str) -> Option<(u64, u64)> {
 /// Delete source files after a successful cut (move) transfer.
 /// If `source_profile` is Some, the source is remote (delete via SSH rm -rf).
 /// If `source_profile` is None, the source is local (delete via std::fs).
+/// `cancel_flag` lets the remote `rm -rf` be aborted while it is still
+/// running, matching the rest of the transfer pipeline (which raised the
+/// SSH inactivity timeout to 24h and therefore can no longer rely on a
+/// short timeout to break out of a hung deletion).
 fn delete_source_files_after_cut(
     source_files: &[PathBuf],
     source_base: &str,
     source_profile: Option<&RemoteProfile>,
+    cancel_flag: &Arc<AtomicBool>,
     tx: &Sender<ProgressMessage>,
 ) {
     match source_profile {
-        Some(profile) => delete_remote_source_files(profile, source_files, source_base, tx),
+        Some(profile) => {
+            delete_remote_source_files(profile, source_files, source_base, cancel_flag, tx)
+        }
         None => delete_local_source_files(source_files, source_base, tx),
     }
 }
@@ -493,11 +595,15 @@ fn delete_local_source_files(
     }
 }
 
-/// Delete remote source files via russh SSH exec (rm -rf)
+/// Delete remote source files via russh SSH exec (rm -rf).
+/// Honors `cancel_flag` so a slow `rm -rf` on a large tree can be aborted
+/// via /stop. Without this, the 24h SSH inactivity timeout would let a
+/// silent rm hold the caller hostage for a full day before unsticking.
 fn delete_remote_source_files(
     profile: &RemoteProfile,
     source_files: &[PathBuf],
     source_base: &str,
+    cancel_flag: &Arc<AtomicBool>,
     tx: &Sender<ProgressMessage>,
 ) {
     // Build rm -rf paths
@@ -516,11 +622,20 @@ fn delete_remote_source_files(
         return;
     }
 
+    // Already-cancelled: skip the SSH connect entirely. The transfer phase
+    // already finished — there is nothing further the user is waiting on.
+    if cancel_flag.load(Ordering::Relaxed) {
+        return;
+    }
+
     let rm_cmd = format!("rm -rf {}", rm_paths.join(" "));
 
     let ssh = match SshExec::connect(profile) {
         Ok(s) => s,
         Err(e) => {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return;
+            }
             let _ = tx.send(ProgressMessage::Error(
                 String::new(),
                 format!("Failed to connect for source deletion: {}", e),
@@ -529,7 +644,7 @@ fn delete_remote_source_files(
         }
     };
 
-    match ssh.exec(&rm_cmd) {
+    match ssh.exec_cancelable(&rm_cmd, Some(cancel_flag)) {
         Ok((success, stderr)) => {
             if !success {
                 let _ = tx.send(ProgressMessage::Error(
@@ -538,6 +653,10 @@ fn delete_remote_source_files(
                 ));
             }
         }
+        // Cancellation surfaces as Err from exec_cancelable; suppress the
+        // error toast because the user asked for the stop, they did not hit
+        // an SSH failure.
+        Err(_) if cancel_flag.load(Ordering::Relaxed) => {}
         Err(e) => {
             let _ = tx.send(ProgressMessage::Error(
                 String::new(),
@@ -589,6 +708,7 @@ pub fn transfer_files_with_progress(
                         &config.source_files,
                         &config.source_base,
                         source_profile.as_ref(),
+                        &cancel_flag,
                         &tx,
                     );
                 }
@@ -639,7 +759,11 @@ fn transfer_same_server(
             format!("cp -a '{}' '{}'", escaped_src, escaped_dst)
         };
 
-        let (success, stderr) = ssh.exec(&remote_cmd)?;
+        let (success, stderr) = match ssh.exec_cancelable(&remote_cmd, Some(cancel_flag)) {
+            Ok(result) => result,
+            Err(_) if cancel_flag.load(Ordering::Relaxed) => return Ok(()),
+            Err(e) => return Err(e),
+        };
 
         if success {
             completed_files += 1;
@@ -802,6 +926,7 @@ pub fn transfer_remote_to_remote_with_progress(
                         &source_files,
                         &source_base,
                         Some(&source_profile),
+                        &cancel_flag,
                         &tx,
                     );
                 }

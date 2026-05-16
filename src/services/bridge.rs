@@ -328,7 +328,10 @@ fn run_stream_json(parsed: &BridgeArgs, gemini_bin: &str) -> i32 {
     cmd.args(&child_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Forward Gemini stderr to the bridge's stderr. The parent adapter
+        // already drains bridge stderr; piping it here without reading can
+        // deadlock if Gemini writes enough diagnostics to fill the OS pipe.
+        .stderr(Stdio::inherit())
         .env_remove("COKAC_GEMINI_SKIP_TRUST");
     for (k, v) in &env_extra {
         cmd.env(k, v);
@@ -572,7 +575,10 @@ fn run_json_mode(parsed: &BridgeArgs, gemini_bin: &str) -> i32 {
     cmd.args(&child_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // Forward Gemini stderr to the bridge's stderr. The parent adapter
+        // already drains bridge stderr; piping it here without reading can
+        // deadlock if Gemini writes enough diagnostics to fill the OS pipe.
+        .stderr(Stdio::inherit())
         .env_remove("COKAC_GEMINI_SKIP_TRUST");
     for (k, v) in &env_extra {
         cmd.env(k, v);

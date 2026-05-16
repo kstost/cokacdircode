@@ -29,6 +29,29 @@ fn encode_command_base64(command: &str) -> String {
     BASE64.encode(command.as_bytes())
 }
 
+fn spawn_process_cancel_watchdog(
+    cancel_flag: Arc<AtomicBool>,
+    pid: u32,
+) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let done_for_thread = done.clone();
+    let token = Arc::new(crate::services::claude::CancelToken::new());
+    {
+        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(pid);
+    }
+    let handle = thread::spawn(move || {
+        while !done_for_thread.load(Ordering::Relaxed) {
+            if cancel_flag.load(Ordering::Relaxed) {
+                token.cancel_now();
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    (done, handle)
+}
+
 /// Theme file watcher state for hot-reload
 pub struct ThemeWatchState {
     /// Path to the current theme file (if external)
@@ -2389,6 +2412,14 @@ impl App {
                     }
                     Ok(None) => {
                         // Process still running - consider it successful
+                        if let Some(stderr) = child.stderr.take() {
+                            let _ = std::thread::spawn(move || {
+                                use std::io::Read;
+                                let mut stderr = stderr;
+                                let mut sink = Vec::new();
+                                let _ = stderr.read_to_end(&mut sink);
+                            });
+                        }
                         Ok(true)
                     }
                     Err(e) => Err(format!("Failed to check process: {}", e)),
@@ -5061,6 +5092,8 @@ impl App {
 
             match child {
                 Ok(mut child) => {
+                    let (cancel_watch_done, cancel_watch) =
+                        spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
                     let stdout = child.stdout.take();
                     let stderr = child.stderr.take();
                     let mut completed_files = 0usize;
@@ -5089,6 +5122,9 @@ impl App {
                             // Check for cancellation
                             if cancel_flag.load(Ordering::Relaxed) {
                                 crate::services::claude::kill_child_tree(&mut child);
+                                let _ = child.wait();
+                                cancel_watch_done.store(true, Ordering::Relaxed);
+                                let _ = cancel_watch.join();
                                 // Cleanup partial archive on cancellation
                                 cleanup_archive(&archive_path_clone);
                                 let _ = tx.send(ProgressMessage::Error(
@@ -5129,8 +5165,20 @@ impl App {
                     }
 
                     // Wait for completion
-                    match child.wait() {
+                    let wait_result = child.wait();
+                    cancel_watch_done.store(true, Ordering::Relaxed);
+                    let _ = cancel_watch.join();
+                    match wait_result {
                         Ok(status) => {
+                            if cancel_flag.load(Ordering::Relaxed) {
+                                cleanup_archive(&archive_path_clone);
+                                let _ = tx.send(ProgressMessage::Error(
+                                    archive_name_owned.clone(),
+                                    "Cancelled".to_string(),
+                                ));
+                                let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
+                                return;
+                            }
                             if status.success() {
                                 let _ = tx.send(ProgressMessage::Completed(completed_files, 0));
                             } else {
@@ -5179,8 +5227,9 @@ impl App {
         tar_cmd: &str,
         archive_path: &std::path::Path,
         archive_name: &str,
+        cancel_flag: Arc<AtomicBool>,
     ) -> (usize, u64, std::collections::HashMap<String, u64>) {
-        use std::process::Command;
+        use std::process::{Command, Stdio};
         use std::collections::HashMap;
 
         // Determine list option based on extension
@@ -5194,13 +5243,33 @@ impl App {
             "tvf"
         };
 
-        let output = Command::new(tar_cmd)
-            .args(&[list_options, &archive_path.to_string_lossy()])
-            .output();
-
         let mut total_files = 0usize;
         let mut total_bytes = 0u64;
         let mut size_map = HashMap::new();
+
+        let archive_path_str = archive_path.to_string_lossy().to_string();
+        let mut cmd = Command::new(tar_cmd);
+        cmd.arg(list_options)
+            .arg(&archive_path_str)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        crate::services::claude::detach_into_own_pgroup(&mut cmd);
+
+        let output = match cmd.spawn() {
+            Ok(child) => {
+                let (cancel_watch_done, cancel_watch) =
+                    spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
+                let output = child.wait_with_output();
+                cancel_watch_done.store(true, Ordering::Relaxed);
+                let _ = cancel_watch.join();
+                output
+            }
+            Err(_) => return (total_files, total_bytes, size_map),
+        };
+
+        if cancel_flag.load(Ordering::Relaxed) {
+            return (total_files, total_bytes, size_map);
+        }
 
         if let Ok(output) = output {
             if output.status.success() {
@@ -5372,7 +5441,12 @@ impl App {
             // List archive contents
             let _ = tx.send(ProgressMessage::Preparing("Reading archive contents...".to_string()));
             let (total_file_count, total_bytes, size_map) =
-                Self::list_archive_contents(&tar_cmd, &archive_path_owned, &archive_name_owned);
+                Self::list_archive_contents(
+                    &tar_cmd,
+                    &archive_path_owned,
+                    &archive_name_owned,
+                    cancel_flag.clone(),
+                );
 
             // Check for cancellation after listing
             if cancel_flag.load(Ordering::Relaxed) {
@@ -5438,6 +5512,8 @@ impl App {
 
             match child {
                 Ok(mut child) => {
+                    let (cancel_watch_done, cancel_watch) =
+                        spawn_process_cancel_watchdog(cancel_flag.clone(), child.id());
                     let stdout = child.stdout.take();
                     let stderr = child.stderr.take();
                     let mut completed_files = 0usize;
@@ -5465,6 +5541,9 @@ impl App {
                             // Check for cancellation
                             if cancel_flag.load(Ordering::Relaxed) {
                                 crate::services::claude::kill_child_tree(&mut child);
+                                let _ = child.wait();
+                                cancel_watch_done.store(true, Ordering::Relaxed);
+                                let _ = cancel_watch.join();
                                 cleanup_extract_dir(&extract_path_clone);
                                 let _ = tx.send(ProgressMessage::Error(
                                     extract_dir_owned.clone(),
@@ -5503,8 +5582,20 @@ impl App {
                     }
 
                     // Wait for completion
-                    match child.wait() {
+                    let wait_result = child.wait();
+                    cancel_watch_done.store(true, Ordering::Relaxed);
+                    let _ = cancel_watch.join();
+                    match wait_result {
                         Ok(status) => {
+                            if cancel_flag.load(Ordering::Relaxed) {
+                                cleanup_extract_dir(&extract_path_clone);
+                                let _ = tx.send(ProgressMessage::Error(
+                                    extract_dir_owned.clone(),
+                                    "Cancelled".to_string(),
+                                ));
+                                let _ = tx.send(ProgressMessage::Completed(completed_files, 1));
+                                return;
+                            }
                             if status.success() {
                                 let _ = tx.send(ProgressMessage::Completed(completed_files, 0));
                             } else {

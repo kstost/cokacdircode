@@ -1695,9 +1695,6 @@ impl ServeChild {
     fn new(child: tokio::process::Child) -> Self {
         Self { child: Some(child) }
     }
-    fn id(&self) -> Option<u32> {
-        self.child.as_ref().and_then(|c| c.id())
-    }
     async fn shutdown(&mut self) {
         if let Some(mut child) = self.child.take() {
             let pid_opt = child.id();
@@ -1726,10 +1723,9 @@ impl Drop for ServeChild {
     }
 }
 
-/// Send SIGKILL to the whole process group led by `pid`. No-op on platforms
-/// other than Unix. Ignores errors: the worst case is that we left a group
-/// running, which tokio's kill_on_drop + direct child kill should cover on
-/// its own.
+/// Kill the whole serve process family led by `pid`. Unix uses a process
+/// group kill; Windows uses taskkill's tree mode. Ignores errors: the worst
+/// case is that `start_kill` below still kills the direct child.
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn kill_serve_process_group(pid_opt: Option<u32>) {
@@ -1743,9 +1739,18 @@ fn kill_serve_process_group(pid_opt: Option<u32>) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn kill_serve_process_group(pid_opt: Option<u32>) {
+    if let Some(pid) = pid_opt {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn kill_serve_process_group(_pid_opt: Option<u32>) {
-    // Non-unix platforms: fall back to the direct child kill only.
+    // Other non-Unix platforms: fall back to the direct child kill only.
 }
 
 /// Async-side entry point for the SSE adapter. Orchestrates the whole turn.
@@ -1793,6 +1798,10 @@ async fn execute_command_streaming_serve(
     let (mut serve_child, base_url) = match spawn_opencode_serve(working_dir, cancel_token.as_ref()).await {
         Ok(pair) => pair,
         Err(e) => {
+            if serve_cancel_hit(cancel_token.as_ref()) {
+                opencode_debug(&format!("[serve] spawn aborted after cancel: {}", e));
+                return Ok(());
+            }
             opencode_debug(&format!("[serve] spawn failed: {}", e));
             let _ = sender.send(StreamMessage::Error {
                 message: format!("Failed to start opencode serve: {}", e),
@@ -1804,15 +1813,6 @@ async fn execute_command_streaming_serve(
         }
     };
     opencode_debug(&format!("[serve] ready at {}", base_url));
-
-    // Register PID for external cancel. Recover from a poisoned mutex
-    // (a prior holder panicked) instead of silently dropping the PID.
-    if let Some(ref token) = cancel_token {
-        if let Some(pid) = serve_child.id() {
-            let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
-            *guard = Some(pid);
-        }
-    }
 
     // ---- 4. Build HTTP clients ----
     //
@@ -1905,7 +1905,20 @@ async fn execute_command_streaming_serve(
     // consumer has connected and we would miss them entirely. To close that
     // race, the HTTP GET /event call happens on this (main) task; only the
     // chunk-reading loop is then handed off to a spawned task.
-    let sse_url = format!("{}/event", base_url);
+    // Use /global/event, not /event. The per-instance /event endpoint only
+    // emits BusEvents (message.part.delta, session.status, session.idle, …)
+    // and silently omits SyncEvents like message.part.updated and
+    // message.updated. Without message.part.updated, the consumer below
+    // cannot learn that an in-flight part has type "text" (versus
+    // "reasoning"), so every delta is dropped by the part_types guard and
+    // the turn ends with an empty result → "(No response)". /global/event
+    // wraps each event in a {directory, project, payload} envelope and
+    // forwards SyncEvents alongside BusEvents (and a redundant payload.type
+    // == "sync" copy that we skip during unwrap). Verified live against
+    // opencode 1.15.0: with /event the SSE stream emitted 0
+    // message.part.updated frames; with /global/event the same turn emitted
+    // them in the order the legacy consumer expects.
+    let sse_url = format!("{}/global/event", base_url);
     opencode_debug(&format!("[serve] connecting SSE: {}", sse_url));
     let sse_resp = match sse_client.get(&sse_url).send().await {
         Ok(r) if r.status().is_success() => r,
@@ -2122,6 +2135,23 @@ async fn spawn_opencode_serve(
         .map_err(|e| format!("spawn {}: {}", bin, e))?;
     opencode_debug(&format!("[serve.spawn] spawned PID={:?}", child.id()));
 
+    // Register PID immediately after spawn so /stop can kill the serve
+    // process even while we are still waiting for the readiness line.
+    // Recover from a poisoned mutex instead of silently dropping the PID.
+    if let Some(token) = cancel_token {
+        if let Some(pid) = child.id() {
+            let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(pid);
+        }
+        if token.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            opencode_debug("[serve.spawn] cancelled after PID registration");
+            token.cancel_now();
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(3), child.wait()).await;
+            return Err("cancelled before opencode serve became ready".to_string());
+        }
+    }
+
     // Take stdout/stderr readers. The readiness line can appear on either one
     // depending on how opencode decided to log in this build — probe both.
     let stdout = child
@@ -2334,11 +2364,13 @@ async fn post_prompt_async(
     Ok(())
 }
 
-/// Consume an already-connected `GET /event` response as a stream of SSE
-/// frames, translating each into zero or more `StreamMessage` variants that
-/// belong to the parent session. Text parts feed both the live UI stream
-/// (via `StreamMessage::Text`) and a shared accumulator used for the final
-/// `Done.result`.
+/// Consume an already-connected `GET /global/event` response as a stream of
+/// SSE frames, translating each into zero or more `StreamMessage` variants
+/// that belong to the parent session. Each frame's outer JSON wraps the real
+/// event in a `payload` field (see the unwrap in the body); `handle_sse_event`
+/// itself operates on the unwrapped event. Text parts feed both the live UI
+/// stream (via `StreamMessage::Text`) and a shared accumulator used for the
+/// final `Done.result`.
 async fn consume_sse_chunks(
     mut resp: reqwest::Response,
     parent_sid: String,
@@ -2411,7 +2443,7 @@ async fn consume_sse_chunks(
             if payload.is_empty() {
                 continue;
             }
-            let json: Value = match serde_json::from_str(&payload) {
+            let raw_json: Value = match serde_json::from_str(&payload) {
                 Ok(v) => v,
                 Err(e) => {
                     opencode_debug(&format!(
@@ -2421,6 +2453,25 @@ async fn consume_sse_chunks(
                     ));
                     continue;
                 }
+            };
+            // /global/event wraps every event in
+            //   { "directory": "...", "project": "...", "payload": {...} }
+            // (server.connected / server.heartbeat omit the directory/project
+            // keys but still wrap as { "payload": {...} }). When the inner
+            // payload itself has `type == "sync"`, it is a versioned mirror
+            // of an event that was already published unwrapped through the
+            // same stream — `handle_sse_event` would see the unwrapped copy
+            // moments earlier, so we skip the sync envelope here to avoid
+            // double-handling.
+            let json: Value = match raw_json.get("payload") {
+                Some(inner) => {
+                    let inner_type = inner.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if inner_type == "sync" {
+                        continue;
+                    }
+                    inner.clone()
+                }
+                None => raw_json,
             };
             handle_sse_event(
                 &json,
