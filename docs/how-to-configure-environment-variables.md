@@ -89,6 +89,37 @@ Controls the size threshold (in bytes) at which the bot switches from sending a 
 - **Example:** `COKAC_FILE_ATTACH_THRESHOLD=16384` — switch to file attachment only when the response exceeds 16 KB.
 - **Invalid values** (non-numeric, negative, etc.) are silently ignored and the default is used.
 
+### `COKAC_SCHEDULE_INLINE`
+
+Run scheduled tasks **inline in the chat's current session** instead of the default isolated workspace. With this enabled, the schedule's prompt and reply appear in the live conversation as if you had typed them yourself at the trigger time — see `how-to-use-schedules.md` for the full user-facing flow.
+
+- **Type:** string — set to exactly `"1"` to enable. Any other value (including unset, `"0"`, `"true"`, `"yes"`) is treated as disabled. The check is strict string comparison, matching the convention of `COKACDIR_DEBUG`.
+- **Default:** not set (disabled — schedules use isolated workspaces, the original behavior).
+- **States:** binary. The variable has only two effective states — true (value is the literal string `"1"`) or false (everything else).
+- **Scope:** loaded once at bot startup from `~/.cokacdir/.env.json`. Restart the bot after changing the value.
+- **Example `.env.json`:**
+
+  ```json
+  {
+    "COKAC_SCHEDULE_INLINE": "1"
+  }
+  ```
+
+- **Behavior when enabled:**
+  - At trigger time, the bot does **not** create a new workspace under `~/.cokacdir/workspace/<schedule_id>`, does **not** swap the chat's session for a fresh one, and does **not** inject `context_summary` into the prompt.
+  - Instead, the schedule's prompt is sent to the provider with `--resume <chat's current session_id>` and `cwd = chat's current_path`, so the scheduled task continues the conversation already in progress.
+  - The schedule prompt and the AI's reply are appended to the chat's session history just as if the user had typed the prompt themselves, then persisted to disk so they survive bot restarts.
+  - If the provider issues a new `session_id` during the run (e.g. Claude fork-on-resume), the chat session's `session_id` is updated to the new one so the user's next message lands on the same continuation.
+  - The bot does **not** append the `Use /<schedule_id> to continue this schedule session` hint to the reply, because the chat itself is the continuation point.
+- **Safety fallback:** if the chat has no active session (no `current_path`) at trigger time, the bot silently falls back to the isolated-workspace path so the schedule still fires.
+- **Concurrency:** unchanged — the existing busy/`pending_schedules` mechanism keeps inline runs serialized against the user's own messages. If you are mid-conversation when the schedule's trigger time hits, it queues until your current exchange finishes.
+- **Verifying it loaded:** in a 1:1 chat with the bot, run `/envvars` (owner-only) and confirm `COKAC_SCHEDULE_INLINE=1` is listed. Be aware `/envvars` dumps every environment variable including secrets — clear those messages afterward.
+
+> ⚠ **Side effects of enabling.** Inline mode is invasive by design — the schedule's prompt and reply land in the chat's live conversation, which is what most users want when this flag is on. Consequences worth knowing:
+> - Recurring cron schedules in inline mode reuse the chat's session every run, so context accumulates instead of being summarized between runs. Use `/clear` if it grows unwieldy.
+> - One-time inline schedules cannot be re-entered via `/<schedule_id>` because no isolated workspace is created — the work is already in the chat's live session. The shortcut will return "no workspace found" if attempted.
+> - Tools that consult `entry.current_path` (the path the schedule was registered from) are bypassed in favor of whatever path the chat is currently on. Moving the chat with `/start <other_path>` between trigger times means the next run executes in that new path.
+
 ### `COKACDIR_DEBUG`
 
 Enable debug logging globally at startup. This is the programmatic way to turn on debug for automated runs and CI — achieving the same effect as manually toggling `/debug` to ON in every chat after the bot starts.

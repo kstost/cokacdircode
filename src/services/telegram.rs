@@ -819,6 +819,14 @@ fn schedule_dir() -> Option<std::path::PathBuf> {
     result
 }
 
+/// When `COKAC_SCHEDULE_INLINE=1`, scheduled tasks run inline in the chat's
+/// current session (reusing `session_id` and `current_path`) instead of being
+/// isolated into `~/.cokacdir/workspace/<schedule_id>` with a fresh session.
+/// Any value other than the literal string `"1"` (including unset) is false.
+fn is_schedule_inline_enabled() -> bool {
+    std::env::var("COKAC_SCHEDULE_INLINE").map(|v| v == "1").unwrap_or(false)
+}
+
 fn sched_debug(msg: &str) {
     // AI provider errors that surface here can carry the bot token via
     // teloxide / reqwest URL renderings. Redact before persisting, matching
@@ -10040,8 +10048,14 @@ async fn handle_text_message(
                 // Rate limit before final API call
                 shared_rate_limit_wait(&state_owned, chat_id).await;
 
-                // Final response
-                if full_response.is_empty() {
+                // Final response. Capture "AI produced no output at all" before
+                // the sentinel replacement so (a) the UI can silently delete the
+                // placeholder instead of editing it to the user-confusing
+                // "(No response)" string, and (b) the session writeback below
+                // can skip the assistant push so the sentinel does not end up
+                // in saved history / future /start preview / future --resume.
+                let was_originally_empty = full_response.is_empty();
+                if was_originally_empty {
                     ai_trace(&format!("[FINAL] full_response is EMPTY → (No response). cancelled={}, last_confirmed_len={}", cancelled, last_confirmed_len));
                     full_response = "(No response)".to_string();
                     msg_debug(&format!("[fr_trace][{}] =NoResponse: set to '(No response)', cancelled={}", chat_id.0, cancelled));
@@ -10057,7 +10071,7 @@ async fn handle_text_message(
                 let remaining = &full_response[last_confirmed_len..];
                 msg_debug(&format!("[rolling_ph] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
                     placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
-                if remaining.trim().is_empty() {
+                if was_originally_empty || remaining.trim().is_empty() {
                     // No new content — delete the spinner placeholder
                     msg_debug(&format!("[rolling_ph] FINAL DELETE placeholder: msg_id={}", placeholder_msg_id));
                     shared_rate_limit_wait(&state_owned, chat_id).await;
@@ -10153,10 +10167,18 @@ async fn handle_text_message(
                             item_type: HistoryType::User,
                             content: user_text_owned.clone(),
                         });
-                        session.history.push(HistoryItem {
-                            item_type: HistoryType::Assistant,
-                            content: final_response,
-                        });
+                        // Skip the assistant push when the AI produced no output.
+                        // The UI now silently deletes the placeholder in that case
+                        // (instead of editing it to "(No response)"), so persisting
+                        // the sentinel string here would create a phantom assistant
+                        // turn that the user never saw and the provider's JSONL
+                        // does not contain.
+                        if !was_originally_empty {
+                            session.history.push(HistoryItem {
+                                item_type: HistoryType::Assistant,
+                                content: final_response,
+                            });
+                        }
                         save_session_to_file(session, &current_path, provider_str);
                         msg_debug(&format!("[polling] session saved: session_id={:?}, history_len={}",
                             session.session_id, session.history.len()));
@@ -11839,9 +11861,29 @@ async fn execute_schedule(
     state: &SharedState,
     token: &str,
     prev_session: Option<ChatSession>,
+    inline_mode: bool,
 ) {
-    sched_debug(&format!("[execute_schedule] START id={}, chat_id={}, prompt={:?}, has_context={}, has_prev_session={}",
-        entry.id, chat_id, truncate_str(&entry.prompt, 60), entry.context_summary.is_some(), prev_session.is_some()));
+    sched_debug(&format!("[execute_schedule] START id={}, chat_id={}, prompt={:?}, has_context={}, has_prev_session={}, inline_mode={}",
+        entry.id, chat_id, truncate_str(&entry.prompt, 60), entry.context_summary.is_some(), prev_session.is_some(), inline_mode));
+
+    // Inline mode: capture the chat's current session_id, current_path, and the
+    // chat's clear_epoch under a single lock so we can (a) route the provider
+    // call into that exact session, and (b) detect at cleanup time whether the
+    // user mutated the chat's session mid-run (via /clear, /start <other-path>,
+    // /start <other-sid>, or model change). scheduler_cycle already verified
+    // the session exists with a current_path before dispatching an inline run;
+    // if it disappeared in between we still respect inline_mode and fall back
+    // to entry.current_path with no session_id, which is the same shape
+    // isolated mode would have used. clear_epoch defaults to 0 (a /clear
+    // bumps it, matching the post-completion guard in handle_text_message).
+    let (inline_session_id, inline_path, inline_clear_epoch): (Option<String>, Option<String>, u64) = if inline_mode {
+        let data = state.lock().await;
+        let s = data.sessions.get(&chat_id);
+        let epoch = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
+        (s.and_then(|s| s.session_id.clone()), s.and_then(|s| s.current_path.clone()), epoch)
+    } else {
+        (None, None, 0)
+    };
 
     // Acquire group chat lock (serializes processing across bots in the same group chat)
     let group_lock = acquire_group_chat_lock(chat_id.0).await;
@@ -11861,10 +11903,13 @@ async fn execute_schedule(
                 set.remove(&entry.id);
             }
             remove_cancel_token_locked(&mut data, chat_id);
-            if let Some(prev) = prev_session {
-                data.sessions.insert(chat_id, prev);
-            } else {
-                data.sessions.remove(&chat_id);
+            // Inline mode never replaced the session, so leave it untouched.
+            if !inline_mode {
+                if let Some(prev) = prev_session {
+                    data.sessions.insert(chat_id, prev);
+                } else {
+                    data.sessions.remove(&chat_id);
+                }
             }
         }
         msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_cancelled_during_lock", chat_id.0));
@@ -11873,16 +11918,20 @@ async fn execute_schedule(
         return;
     }
 
-    // Build prompt with context summary if available
+    // Build prompt with context summary if available.
+    // Inline mode runs in the chat's current session, so context_summary (which
+    // exists to bridge the isolated-session gap) would just duplicate context
+    // the model already has — skip injection.
     let user_prompt = entry.prompt.clone();
-    let prompt = if let Some(ref summary) = entry.context_summary {
-        sched_debug(&format!("[execute_schedule] id={}, injecting context summary ({} chars)", entry.id, summary.len()));
-        format!(
-            "[이전 작업 맥락]\n{}\n\n[작업 지시]\n{}",
-            summary, user_prompt
-        )
-    } else {
-        user_prompt.clone()
+    let prompt = match (&entry.context_summary, inline_mode) {
+        (Some(summary), false) => {
+            sched_debug(&format!("[execute_schedule] id={}, injecting context summary ({} chars)", entry.id, summary.len()));
+            format!(
+                "[이전 작업 맥락]\n{}\n\n[작업 지시]\n{}",
+                summary, user_prompt
+            )
+        }
+        _ => user_prompt.clone(),
     };
     let project_path = crate::utils::format::to_shell_path(&entry.current_path);
     let schedule_id = entry.id.clone();
@@ -11896,51 +11945,59 @@ async fn execute_schedule(
     let ts = chrono::Local::now().format("%H:%M:%S");
     println!("  [{ts}] ⏰ Schedule Starting: {user_prompt}");
 
-    // Create persistent workspace directory for this schedule execution
-    let Some(home) = dirs::home_dir() else {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!("  [{ts}] ⚠ [Schedule] Failed to get home directory");
-        {
-            let mut data = state.lock().await;
-            if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
-                set.remove(&schedule_id);
+    // Resolve the working directory. Inline mode runs in the chat's current path
+    // (no isolated workspace), so we skip the create_dir_all entirely. Isolated
+    // mode creates ~/.cokacdir/workspace/<schedule_id> as before.
+    let workspace_path: String = if inline_mode {
+        let path = inline_path.clone().unwrap_or_else(|| entry.current_path.clone());
+        sched_debug(&format!("[execute_schedule] id={}, inline mode → working dir={}", schedule_id, path));
+        path
+    } else {
+        let Some(home) = dirs::home_dir() else {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ⚠ [Schedule] Failed to get home directory");
+            {
+                let mut data = state.lock().await;
+                if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
+                    set.remove(&schedule_id);
+                }
+                remove_cancel_token_locked(&mut data, chat_id);
+                if let Some(prev) = prev_session {
+                    data.sessions.insert(chat_id, prev);
+                } else {
+                    data.sessions.remove(&chat_id);
+                }
             }
-            remove_cancel_token_locked(&mut data, chat_id);
-            if let Some(prev) = prev_session {
-                data.sessions.insert(chat_id, prev);
-            } else {
-                data.sessions.remove(&chat_id);
+            msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_no_home", chat_id.0));
+            drop(group_lock); // release before queue processing to avoid deadlock
+            process_next_queued_message(bot, chat_id, state).await;
+            return;
+        };
+        let workspace_dir = home.join(".cokacdir").join("workspace").join(&schedule_id);
+        sched_debug(&format!("[execute_schedule] id={}, creating workspace: {}", schedule_id, workspace_dir.display()));
+        if let Err(e) = fs::create_dir_all(&workspace_dir) {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!("  [{ts}] ⚠ [Schedule] Failed to create workspace: {e}");
+            sched_debug(&format!("[execute_schedule] id={}, workspace creation failed: {}, restoring session", schedule_id, e));
+            {
+                let mut data = state.lock().await;
+                if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
+                    set.remove(&schedule_id);
+                }
+                remove_cancel_token_locked(&mut data, chat_id);
+                if let Some(prev) = prev_session {
+                    data.sessions.insert(chat_id, prev);
+                } else {
+                    data.sessions.remove(&chat_id);
+                }
             }
+            msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_workspace_error", chat_id.0));
+            drop(group_lock); // release before queue processing to avoid deadlock
+            process_next_queued_message(bot, chat_id, state).await;
+            return;
         }
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_no_home", chat_id.0));
-        drop(group_lock); // release before queue processing to avoid deadlock
-        process_next_queued_message(bot, chat_id, state).await;
-        return;
+        workspace_dir.display().to_string()
     };
-    let workspace_dir = home.join(".cokacdir").join("workspace").join(&schedule_id);
-    sched_debug(&format!("[execute_schedule] id={}, creating workspace: {}", schedule_id, workspace_dir.display()));
-    if let Err(e) = fs::create_dir_all(&workspace_dir) {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        println!("  [{ts}] ⚠ [Schedule] Failed to create workspace: {e}");
-        sched_debug(&format!("[execute_schedule] id={}, workspace creation failed: {}, restoring session", schedule_id, e));
-        {
-            let mut data = state.lock().await;
-            if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
-                set.remove(&schedule_id);
-            }
-            remove_cancel_token_locked(&mut data, chat_id);
-            if let Some(prev) = prev_session {
-                data.sessions.insert(chat_id, prev);
-            } else {
-                data.sessions.remove(&chat_id);
-            }
-        }
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_workspace_error", chat_id.0));
-        drop(group_lock); // release before queue processing to avoid deadlock
-        process_next_queued_message(bot, chat_id, state).await;
-        return;
-    }
-    let workspace_path = workspace_dir.display().to_string();
 
     // Get allowed tools and model for this chat
     let (allowed_tools, model, sched_chrome_enabled) = {
@@ -11963,10 +12020,13 @@ async fn execute_schedule(
                     set.remove(&schedule_id);
                 }
                 remove_cancel_token_locked(&mut data, chat_id);
-                if let Some(prev) = prev_session {
-                    data.sessions.insert(chat_id, prev);
-                } else {
-                    data.sessions.remove(&chat_id);
+                // Inline mode never replaced the session, so leave it untouched.
+                if !inline_mode {
+                    if let Some(prev) = prev_session {
+                        data.sessions.insert(chat_id, prev);
+                    } else {
+                        data.sessions.remove(&chat_id);
+                    }
                 }
             }
             msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_placeholder_error", chat_id.0));
@@ -12003,15 +12063,24 @@ async fn execute_schedule(
     };
     let platform = capitalize_platform(detect_platform(token));
     let sched_role = {
-        let base = format!(
-            "You are executing a scheduled task through {}.\n\
-             Project directory: {project_path}\n\
-             Your current working directory is a dedicated workspace for this schedule.\n\
-             This workspace will be preserved after execution. The user can continue work here via /start.\n\
-             To work with project files, use absolute paths to the project directory.\n\
-             Any files you want to deliver must be sent via the \"{}\" --sendfile command before the task ends.",
-            platform, shell_bin_path()
-        );
+        let base = if inline_mode {
+            format!(
+                "You are executing a scheduled task through {}.\n\
+                 This task runs inline in the chat's current session — its prompt and your reply continue the ongoing conversation here, not a separate workspace.\n\
+                 Any files you want to deliver must be sent via the \"{}\" --sendfile command before the task ends.",
+                platform, shell_bin_path()
+            )
+        } else {
+            format!(
+                "You are executing a scheduled task through {}.\n\
+                 Project directory: {project_path}\n\
+                 Your current working directory is a dedicated workspace for this schedule.\n\
+                 This workspace will be preserved after execution. The user can continue work here via /start.\n\
+                 To work with project files, use absolute paths to the project directory.\n\
+                 Any files you want to deliver must be sent via the \"{}\" --sendfile command before the task ends.",
+                platform, shell_bin_path()
+            )
+        };
         match &sched_instruction {
             Some(instr) => format!("{}\n\nUser's instruction for this chat:\n{}", base, instr),
             None => base,
@@ -12043,9 +12112,13 @@ async fn execute_schedule(
     let cancel_token_clone = cancel_token.clone();
     let model_for_summary = model.clone();
 
-    // Run AI backend in a blocking thread (always new session — context is in the prompt)
+    // Run AI backend in a blocking thread.
+    // - Isolated mode: always a new provider session (session_id=None); context arrives via the prompt.
+    // - Inline mode: resume the chat's current provider session by id so the schedule's
+    //   prompt and reply are appended to that conversation.
     // Session persistence must be kept so users can resume via /SCHEDULE_ID
     let workspace_path_for_claude = workspace_path.clone();
+    let resume_session_id: Option<String> = if inline_mode { inline_session_id.clone() } else { None };
     let model_clone_for_exec = model.clone();
     let bot_key_for_codex = bot_key.clone();
     let request_tasks = {
@@ -12054,15 +12127,16 @@ async fn execute_schedule(
     };
     let _ = spawn_tracked_blocking_task(request_tasks, move || {
         let provider = detect_provider(model_clone_for_exec.as_deref());
-        sched_debug(&format!("[execute_schedule:spawn_blocking] provider={}, model={:?}",
-            provider, model_clone_for_exec));
+        sched_debug(&format!("[execute_schedule:spawn_blocking] provider={}, model={:?}, resume_session_id={:?}",
+            provider, model_clone_for_exec, resume_session_id));
+        let resume_ref = resume_session_id.as_deref();
         let result = if provider == "opencode" {
             let opencode_model = model_clone_for_exec.as_deref().and_then(opencode::strip_opencode_prefix);
-            sched_debug(&format!("[execute_schedule] → opencode::execute, opencode_model={:?}, session_id=None, workspace={}, prompt_len={}, system_prompt_len={}",
-                opencode_model, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
+            sched_debug(&format!("[execute_schedule] → opencode::execute, opencode_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
+                opencode_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
             opencode::execute_command_streaming(
                 &prompt,
-                None,
+                resume_ref,
                 &workspace_path_for_claude,
                 tx.clone(),
                 Some(&system_prompt_owned),
@@ -12073,11 +12147,11 @@ async fn execute_schedule(
             )
         } else if provider == "gemini" {
             let gemini_model = model_clone_for_exec.as_deref().and_then(gemini::strip_gemini_prefix);
-            sched_debug(&format!("[execute_schedule] → gemini::execute, gemini_model={:?}, session_id=None, workspace={}, prompt_len={}, system_prompt_len={}",
-                gemini_model, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
+            sched_debug(&format!("[execute_schedule] → gemini::execute, gemini_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
+                gemini_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
             gemini::execute_command_streaming(
                 &prompt,
-                None,
+                resume_ref,
                 &workspace_path_for_claude,
                 tx.clone(),
                 Some(&system_prompt_owned),
@@ -12096,7 +12170,7 @@ async fn execute_schedule(
             };
             codex::execute_command_streaming(
                 &prompt,
-                None,
+                resume_ref,
                 &workspace_path_for_claude,
                 tx.clone(),
                 Some(&codex_system_prompt),
@@ -12110,7 +12184,7 @@ async fn execute_schedule(
             let claude_model = model_clone_for_exec.as_deref().and_then(claude::strip_claude_prefix);
             claude::execute_command_streaming(
                 &prompt,
-                None,
+                resume_ref,
                 &workspace_path_for_claude,
                 tx.clone(),
                 Some(&system_prompt_owned),
@@ -12131,6 +12205,14 @@ async fn execute_schedule(
     let state_owned = state.clone();
     let entry_clone = entry.clone();
     let workspace_path_owned = workspace_path.clone();
+    let inline_mode_owned = inline_mode;
+    // Owned copies of the inline-mode start-state, moved into the polling closure
+    // so its cleanup block can run the session_changed guard before writing back
+    // to the chat's session. provider comparison uses provider_str (already
+    // captured below from the same `model` snapshot taken at execute start).
+    let inline_session_id_for_guard = inline_session_id.clone();
+    let inline_path_for_guard = inline_path.clone();
+    let inline_clear_epoch_for_guard = inline_clear_epoch;
     let provider_str: &'static str = detect_provider(model.as_deref());
     // Captured for schedule_history append at the end of this run.
     // Wall-clock duration is measured from this point (just after placeholder send +
@@ -12414,6 +12496,22 @@ async fn execute_schedule(
         // Final response
         sched_debug(&format!("[execute_schedule] id={}, polling done: cancelled={}, had_error={}, response_len={}",
             schedule_id, cancelled, had_error, full_response.len()));
+        // Snapshot whether the AI actually produced any output, taken BEFORE the
+        // not-cancelled branch below replaces an empty `full_response` with the
+        // user-facing "(No response)" sentinel. Inline cleanup uses this flag so
+        // the sentinel does not leak into the chat's session history or get
+        // persisted to disk — the chat would otherwise show a phantom assistant
+        // turn that the provider's own JSONL transcript does not have.
+        let had_real_response = !full_response.is_empty();
+        // The "Use /<id> to continue this schedule session" hint points users
+        // at the isolated workspace's resume shortcut. Inline mode does not
+        // create an isolated workspace, so that shortcut would fail — the
+        // continuation is the chat session itself. Suppress the hint there.
+        let continue_hint: String = if inline_mode_owned {
+            String::new()
+        } else {
+            format!("\n\nUse /{} to continue this schedule session.", schedule_id)
+        };
         if cancelled {
             sched_debug(&format!("[execute_schedule] id={}, cancelled — killing child process", schedule_id));
             // Re-send SIGKILL as a safety belt (cancel_now is idempotent).
@@ -12424,16 +12522,16 @@ async fn execute_schedule(
             if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
             let remaining = &full_response[last_confirmed_len..];
             if should_attach_response_as_file(full_response.len(), provider_str) {
-                let notice = format!("\u{1f4c4} Response attached as file [Stopped]\n\nUse /{} to continue this schedule session.", schedule_id);
+                let notice = format!("\u{1f4c4} Response attached as file [Stopped]{}", continue_hint);
                 let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &notice).await);
                 let stopped_content = format!("{}\n\n[Stopped]", normalize_empty_lines(&full_response));
                 send_response_as_file(&bot_owned, chat_id, &stopped_content, &state_owned, "schedule").await;
             } else {
                 let display_stopped = if remaining.trim().is_empty() {
-                    format!("⛔ Stopped\n\nUse /{} to continue this schedule session.", schedule_id)
+                    format!("⛔ Stopped{}", continue_hint)
                 } else {
                     let normalized = normalize_empty_lines(remaining);
-                    format!("{}\n\n⛔ Stopped\n\nUse /{} to continue this schedule session.", normalized, schedule_id)
+                    format!("{}\n\n⛔ Stopped{}", normalized, continue_hint)
                 };
                 let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &display_stopped).await);
             }
@@ -12441,6 +12539,11 @@ async fn execute_schedule(
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ [Schedule] Stopped");
         } else {
+            // had_real_response (captured above before this branch ran) is the
+            // pre-replacement emptiness signal. When the AI produced no output
+            // at all, delete the placeholder silently rather than editing it to
+            // the "(No response)" sentinel — that string was confusing users
+            // and is also gated out of session history below.
             if full_response.is_empty() {
                 full_response = "(No response)".to_string();
                 sched_debug(&format!("[fr_trace][{}] =NoResponse: set to '(No response)'", chat_id.0));
@@ -12453,18 +12556,18 @@ async fn execute_schedule(
             let remaining = &full_response[last_confirmed_len..];
             msg_debug(&format!("[rolling_ph/sched] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
                 placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
-            if remaining.trim().is_empty() {
+            if !had_real_response || remaining.trim().is_empty() {
                 msg_debug(&format!("[rolling_ph/sched] FINAL DELETE placeholder: msg_id={}", placeholder_msg_id));
                 let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
             } else if should_attach_response_as_file(full_response.len(), provider_str) {
                 msg_debug(&format!("[rolling_ph/sched] FINAL FILE ATTACH: total={}", full_response.len()));
-                let notice = format!("\u{1f4c4} Response attached as file\n\nUse /{} to continue this schedule session.", schedule_id);
+                let notice = format!("\u{1f4c4} Response attached as file{}", continue_hint);
                 let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &notice).await);
-                let final_text = format!("{}\n\nUse /{} to continue this schedule session.", normalize_empty_lines(&full_response), schedule_id);
+                let final_text = format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
                 send_response_as_file(&bot_owned, chat_id, &final_text, &state_owned, "schedule").await;
             } else {
                 let normalized_remaining = normalize_empty_lines(remaining);
-                let final_text = format!("{}\n\nUse /{} to continue this schedule session.", normalized_remaining, schedule_id);
+                let final_text = format!("{}{}", normalized_remaining, continue_hint);
                 let html_response = markdown_to_telegram_html(&final_text);
                 msg_debug(&format!("[rolling_ph/sched] FINAL EDIT placeholder: msg_id={}, html_len={}", placeholder_msg_id, html_response.len()));
                 if html_response.len() <= TELEGRAM_MSG_LIMIT {
@@ -12516,11 +12619,16 @@ async fn execute_schedule(
         }
 
         // For cron entries with context_summary, extract result summary for next run
-        // Skip if execution was cancelled or encountered an error
-        sched_debug(&format!("[execute_schedule] id={}, checking context summary: cancelled={}, had_error={}, type={}, once={:?}, has_context={}",
-            schedule_id, cancelled, had_error, entry_clone.schedule_type, entry_clone.once, entry_clone.context_summary.is_some()));
+        // Skip if execution was cancelled or encountered an error.
+        // Inline mode also skips: the chat's live session already carries the
+        // conversation forward, so an extra summary text would be redundant.
+        sched_debug(&format!("[execute_schedule] id={}, checking context summary: cancelled={}, had_error={}, type={}, once={:?}, has_context={}, inline={}",
+            schedule_id, cancelled, had_error, entry_clone.schedule_type, entry_clone.once, entry_clone.context_summary.is_some(), inline_mode_owned));
         let sched_provider = detect_provider(model_for_summary.as_deref());
-        let new_context_summary = if sched_provider != "claude" {
+        let new_context_summary = if inline_mode_owned {
+            sched_debug(&format!("[execute_schedule] id={}, inline mode — skipping context summary extraction", schedule_id));
+            None
+        } else if sched_provider != "claude" {
             // Codex/Gemini/OpenCode: skip summary extraction (not supported via Claude API)
             sched_debug(&format!("[execute_schedule] id={}, non-Claude backend — skipping context summary", schedule_id));
             None
@@ -12560,28 +12668,39 @@ async fn execute_schedule(
             None
         };
 
-        // Save schedule session to file so user can resume via /start [workspace_path]
-        if let Some(ref sid) = exec_session_id {
-            let mut sched_session = ChatSession {
-                session_id: Some(sid.clone()),
-                current_path: Some(workspace_path_owned.clone()),
-                history: Vec::new(),
-                pending_uploads: Vec::new(),
-                pending_uploads_added_at: None,
-            };
-            // Add user prompt and AI response to history for session continuity
-            sched_session.history.push(HistoryItem {
-                item_type: HistoryType::User,
-                content: entry_clone.prompt.clone(),
-            });
-            if !full_response.is_empty() {
+        // Save schedule session to file so user can resume via /start [workspace_path].
+        // Inline mode has no isolated workspace — the provider session is part of
+        // the chat's normal session, which persists through the live ChatSession
+        // and provider-side JSONL. Skipping the workspace write avoids littering
+        // the chat's working directory with an unrelated session snapshot.
+        if !inline_mode_owned {
+            if let Some(ref sid) = exec_session_id {
+                let mut sched_session = ChatSession {
+                    session_id: Some(sid.clone()),
+                    current_path: Some(workspace_path_owned.clone()),
+                    history: Vec::new(),
+                    pending_uploads: Vec::new(),
+                    pending_uploads_added_at: None,
+                };
+                // Add user prompt and AI response to history for session continuity.
+                // Use had_real_response (not !full_response.is_empty()) so the
+                // "(No response)" UI sentinel does not leak into the isolated
+                // workspace's session file either — keeping all three paths
+                // (inline cleanup, isolated workspace, /start preview) free of
+                // a phantom assistant turn the user never saw.
                 sched_session.history.push(HistoryItem {
-                    item_type: HistoryType::Assistant,
-                    content: full_response.clone(),
+                    item_type: HistoryType::User,
+                    content: entry_clone.prompt.clone(),
                 });
+                if had_real_response {
+                    sched_session.history.push(HistoryItem {
+                        item_type: HistoryType::Assistant,
+                        content: full_response.clone(),
+                    });
+                }
+                // sched_provider already computed above
+                save_session_to_file(&sched_session, &workspace_path_owned, sched_provider);
             }
-            // sched_provider already computed above
-            save_session_to_file(&sched_session, &workspace_path_owned, sched_provider);
         }
 
         // Write to group chat shared log (scheduled task)
@@ -12646,16 +12765,84 @@ async fn execute_schedule(
 
         // Workspace directory is preserved for user to continue work via /start
 
-        // Clean up + restore previous session
-        sched_debug(&format!("[execute_schedule] id={}, cleaning up: removing cancel_token, pending, restoring session (has_prev={})",
-            schedule_id, prev_session.is_some()));
+        // Clean up.
+        // - Isolated mode: restore the user's pre-schedule session (the temp session
+        //   we inserted in scheduler_cycle is discarded).
+        // - Inline mode: leave the chat session in place; if the provider issued a
+        //   new session_id during this run (e.g. Claude fork on resume), propagate
+        //   it so the user's next message continues the same provider session.
+        //   Append the schedule prompt+reply to history for continuity, then
+        //   persist the session to disk to match the normal-message handler so
+        //   the inline run survives bot restarts (matches the writeback at line
+        //   ~10168 in handle_text_message's polling completion).
+        sched_debug(&format!("[execute_schedule] id={}, cleaning up: removing cancel_token, pending, inline={}, has_prev={}",
+            schedule_id, inline_mode_owned, prev_session.is_some()));
         {
             let mut data = state_owned.lock().await;
             remove_cancel_token_locked(&mut data, chat_id);
             if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
                 set.remove(&schedule_id);
             }
-            if let Some(prev) = prev_session {
+            if inline_mode_owned {
+                // session_changed guard: if the user mutated the chat's session
+                // mid-run, the writeback below would partially resurrect a /clear,
+                // land the schedule's prompt+reply in a different /start path, or
+                // overwrite a different model's session_id. Mirrors the polling
+                // completion guard at handle_text_message's writeback. Read all
+                // guard inputs before any &mut borrow of `sessions` to avoid a
+                // re-borrow conflict with the `get_mut` below.
+                let now_clear_epoch = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
+                let now_model = get_model(&data.settings, chat_id);
+                let now_provider = detect_provider(now_model.as_deref());
+                let (now_sid, now_path) = data.sessions.get(&chat_id)
+                    .map(|s| (s.session_id.clone(), s.current_path.clone()))
+                    .unwrap_or((None, None));
+                let session_changed = now_provider != provider_str
+                    || now_path != inline_path_for_guard
+                    || now_sid != inline_session_id_for_guard
+                    || now_clear_epoch != inline_clear_epoch_for_guard;
+                if session_changed {
+                    sched_debug(&format!(
+                        "[execute_schedule] id={}, inline cleanup: session changed during run — skipping writeback \
+                         (provider: {}→{}, path: {:?}→{:?}, sid: {:?}→{:?}, epoch: {}→{})",
+                        schedule_id, provider_str, now_provider,
+                        inline_path_for_guard, now_path,
+                        inline_session_id_for_guard, now_sid,
+                        inline_clear_epoch_for_guard, now_clear_epoch
+                    ));
+                } else if let Some(session) = data.sessions.get_mut(&chat_id) {
+                    if let Some(ref sid) = exec_session_id {
+                        session.session_id = Some(sid.clone());
+                    }
+                    session.history.push(HistoryItem {
+                        item_type: HistoryType::User,
+                        content: entry_clone.prompt.clone(),
+                    });
+                    // Skip the assistant push when the AI produced no real output
+                    // (had_real_response was captured BEFORE the "(No response)"
+                    // sentinel replacement). Without this guard the chat history
+                    // would contain a phantom assistant turn that no provider
+                    // JSONL backs.
+                    if had_real_response {
+                        session.history.push(HistoryItem {
+                            item_type: HistoryType::Assistant,
+                            content: full_response.clone(),
+                        });
+                    }
+                    // Persist to disk so the inline run is durable across restarts.
+                    // save_session_to_file takes `&ChatSession`; the `session`
+                    // binding here is `&mut ChatSession` and Rust performs an
+                    // implicit shared reborrow at the call. current_path is
+                    // cloned first so the path argument and the session reborrow
+                    // do not need to share a live borrow of `session`.
+                    let cp = session.current_path.clone().unwrap_or_default();
+                    if !cp.is_empty() {
+                        save_session_to_file(session, &cp, provider_str);
+                    } else {
+                        sched_debug(&format!("[execute_schedule] id={}, inline cleanup: session has no current_path — skipping save_session_to_file", schedule_id));
+                    }
+                }
+            } else if let Some(prev) = prev_session {
                 data.sessions.insert(chat_id, prev);
             } else {
                 // No prior session existed — remove the schedule's temporary session
@@ -13304,7 +13491,12 @@ async fn process_bot_message(
 
                 shared_rate_limit_wait(&state_owned, chat_id).await;
 
-                if full_response.is_empty() {
+                // Capture pre-replacement emptiness so the UI silently deletes
+                // the placeholder when the AI produced nothing, and the session
+                // writeback below skips the assistant push — see handle_text_message
+                // for the same pattern.
+                let was_originally_empty = full_response.is_empty();
+                if was_originally_empty {
                     msg_debug(&format!("[botmsg_poll:{}] empty response, using placeholder text", bmsg_id_for_log));
                     full_response = "(No response)".to_string();
                     msg_debug(&format!("[fr_trace][{}] =NoResponse: set to '(No response)'", chat_id.0));
@@ -13319,7 +13511,7 @@ async fn process_bot_message(
                 let remaining = &full_response[last_confirmed_len..];
                 msg_debug(&format!("[rolling_ph/botmsg] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
                     placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
-                if remaining.trim().is_empty() {
+                if was_originally_empty || remaining.trim().is_empty() {
                     msg_debug(&format!("[rolling_ph/botmsg] FINAL DELETE placeholder: msg_id={}", placeholder_msg_id));
                     shared_rate_limit_wait(&state_owned, chat_id).await;
                     let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
@@ -13395,10 +13587,15 @@ async fn process_bot_message(
                             item_type: HistoryType::User,
                             content: prompt_owned.clone(),
                         });
-                        session.history.push(HistoryItem {
-                            item_type: HistoryType::Assistant,
-                            content: final_response.clone(),
-                        });
+                        // Skip the assistant push when the AI produced no output —
+                        // mirrors the UI's silent-delete behavior so saved history
+                        // does not contain a sentinel string the user never saw.
+                        if !was_originally_empty {
+                            session.history.push(HistoryItem {
+                                item_type: HistoryType::Assistant,
+                                content: final_response.clone(),
+                            });
+                        }
                         save_session_to_file(session, &current_path_owned, provider_str);
                         msg_debug(&format!("[botmsg_poll:{}] session saved: history_len_after={}", bmsg_id_for_log, session.history.len()));
                     } else {
@@ -13694,7 +13891,12 @@ async fn scheduler_cycle(
                 Skip,
                 DiscardExpired,
                 Execute(Option<ChatSession>, u64),
+                /// Inline mode: run the scheduled task inside the chat's current
+                /// session (no backup, no isolated workspace). Carries dispatch_id only —
+                /// the existing session is left in place.
+                ExecuteInline(u64),
             }
+            let inline_env_on = is_schedule_inline_enabled();
 
             let action = {
                 let mut data = state.lock().await;
@@ -13743,85 +13945,107 @@ async fn scheduler_cycle(
                         }
                         SchedAction::Skip
                     } else {
-                        // Not busy — backup session, replace with schedule-specific session, and execute
-                        let prev = data.sessions.get(&chat_id).cloned();
+                        // Inline mode requires an active chat session with a current_path;
+                        // otherwise fall back to isolated mode so the schedule still runs.
+                        let inline_usable = inline_env_on
+                            && data.sessions.get(&chat_id)
+                                .and_then(|s| s.current_path.as_ref())
+                                .is_some();
                         let dispatch_id = next_dispatch_id();
-                        sched_debug(&format!("[scheduler_loop] id={}, not busy → execute (has_prev_session={}, dispatch_id={})", entry.id, prev.is_some(), dispatch_id));
-                        data.sessions.insert(chat_id, ChatSession {
-                            session_id: None,
-                            current_path: Some(entry.current_path.clone()),
-                            history: Vec::new(),
-                            pending_uploads: Vec::new(),
-                            pending_uploads_added_at: None,
-                        });
-                        data.pending_schedules.entry(chat_id).or_default().insert(entry.id.clone());
-                        // Pre-insert cancel_token tagged with this dispatch_id so a panic
-                        // inside execute_schedule can be safely reclaimed by the owner
-                        // check in reclaim_panicked_dispatch_token.
-                        let cancel_token = new_cancel_token_for_owner(dispatch_id);
-                        insert_cancel_token_locked(&mut data, chat_id, cancel_token);
-                        SchedAction::Execute(prev, dispatch_id)
+                        if inline_usable {
+                            sched_debug(&format!("[scheduler_loop] id={}, inline mode → execute in current session (dispatch_id={})", entry.id, dispatch_id));
+                            data.pending_schedules.entry(chat_id).or_default().insert(entry.id.clone());
+                            let cancel_token = new_cancel_token_for_owner(dispatch_id);
+                            insert_cancel_token_locked(&mut data, chat_id, cancel_token);
+                            SchedAction::ExecuteInline(dispatch_id)
+                        } else {
+                            // Not busy — backup session, replace with schedule-specific session, and execute
+                            let prev = data.sessions.get(&chat_id).cloned();
+                            sched_debug(&format!("[scheduler_loop] id={}, not busy → execute (has_prev_session={}, dispatch_id={})", entry.id, prev.is_some(), dispatch_id));
+                            data.sessions.insert(chat_id, ChatSession {
+                                session_id: None,
+                                current_path: Some(entry.current_path.clone()),
+                                history: Vec::new(),
+                                pending_uploads: Vec::new(),
+                                pending_uploads_added_at: None,
+                            });
+                            data.pending_schedules.entry(chat_id).or_default().insert(entry.id.clone());
+                            // Pre-insert cancel_token tagged with this dispatch_id so a panic
+                            // inside execute_schedule can be safely reclaimed by the owner
+                            // check in reclaim_panicked_dispatch_token.
+                            let cancel_token = new_cancel_token_for_owner(dispatch_id);
+                            insert_cancel_token_locked(&mut data, chat_id, cancel_token);
+                            SchedAction::Execute(prev, dispatch_id)
+                        }
                     }
                 }
             };
 
-            match action {
+            let (inline_mode, dispatch_id, prev_session) = match action {
                 SchedAction::Skip => continue,
                 SchedAction::DiscardExpired => {
                     delete_schedule_entry(&entry.id);
                     let ts = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts}] ⏰ [Scheduler] Discarded expired once-schedule: {}", entry.id);
                     sched_debug(&format!("[scheduler_loop] id={}, discarded expired", entry.id));
-                    continue;
+                    // Trailing `continue` (no semicolon) makes this block's type `!`,
+                    // which coerces cleanly to the tuple type of the Execute arms in
+                    // match-arm type unification. With a semicolon the block would be
+                    // syntactically `()` and the arms would fail to unify.
+                    continue
                 }
-                SchedAction::Execute(prev_session, dispatch_id) => {
-                    sched_debug(&format!("[scheduler_loop] id={}, calling execute_schedule (dispatch_id={})", entry.id, dispatch_id));
-                    // Run inside CURRENT_DISPATCH_ID scope and inside a child spawn so
-                    // a panic inside execute_schedule kills only that one task — the
-                    // scheduler keeps running and the busy slot is reclaimed via the
-                    // owner_id check. Session and pending_schedules state inserted
-                    // by the pre-execute lock above are also restored on panic so
-                    // the chat does not see an empty session or a stuck pending id.
-                    let bot_c = bot.clone();
-                    let state_c = state.clone();
-                    let token_c = token.clone();
-                    let entry_c = entry.clone();
-                    let entry_id_for_log = entry.id.clone();
-                    let prev_for_recover = prev_session.clone();
-                    let join = tokio::spawn(async move {
-                        CURRENT_DISPATCH_ID
-                            .scope(dispatch_id, async move {
-                                execute_schedule(&bot_c, chat_id, &entry_c, &state_c, &token_c, prev_session).await
-                            })
-                            .await
-                    });
-                    if let Err(join_err) = join.await {
-                        let panic_str = redact_known_tokens(&join_err.to_string());
-                        msg_debug(&format!(
-                            "[scheduler_loop] id={}, execute_schedule PANICKED: {}",
-                            entry_id_for_log, panic_str
-                        ));
-                        eprintln!(
-                            "  ⚠ Chat {} schedule {} panicked: {} — recovering",
-                            chat_id.0, entry_id_for_log, panic_str
-                        );
-                        reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:execute").await;
-                        // Restore session/pending state that the pre-execute lock
-                        // had mutated on this dispatch's behalf. If the panic
-                        // happened after execute_schedule already restored these
-                        // (e.g. very late in cleanup), the writes here are
-                        // overwriting equivalent state — safe and idempotent.
-                        let mut data = state.lock().await;
-                        match prev_for_recover {
-                            Some(prev) => { data.sessions.insert(chat_id, prev); }
-                            None => { data.sessions.remove(&chat_id); }
-                        }
-                        if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
-                            set.remove(&entry_id_for_log);
-                            if set.is_empty() {
-                                data.pending_schedules.remove(&chat_id);
-                            }
-                        }
+                SchedAction::Execute(prev, did) => (false, did, prev),
+                SchedAction::ExecuteInline(did) => (true, did, None),
+            };
+            sched_debug(&format!("[scheduler_loop] id={}, calling execute_schedule (dispatch_id={}, inline={})", entry.id, dispatch_id, inline_mode));
+            // Run inside CURRENT_DISPATCH_ID scope and inside a child spawn so
+            // a panic inside execute_schedule kills only that one task — the
+            // scheduler keeps running and the busy slot is reclaimed via the
+            // owner_id check. Session and pending_schedules state inserted
+            // by the pre-execute lock above are also restored on panic so
+            // the chat does not see an empty session or a stuck pending id.
+            let bot_c = bot.clone();
+            let state_c = state.clone();
+            let token_c = token.clone();
+            let entry_c = entry.clone();
+            let entry_id_for_log = entry.id.clone();
+            let prev_for_recover = prev_session.clone();
+            let join = tokio::spawn(async move {
+                CURRENT_DISPATCH_ID
+                    .scope(dispatch_id, async move {
+                        execute_schedule(&bot_c, chat_id, &entry_c, &state_c, &token_c, prev_session, inline_mode).await
+                    })
+                    .await
+            });
+            if let Err(join_err) = join.await {
+                let panic_str = redact_known_tokens(&join_err.to_string());
+                msg_debug(&format!(
+                    "[scheduler_loop] id={}, execute_schedule PANICKED: {}",
+                    entry_id_for_log, panic_str
+                ));
+                eprintln!(
+                    "  ⚠ Chat {} schedule {} panicked: {} — recovering",
+                    chat_id.0, entry_id_for_log, panic_str
+                );
+                reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:execute").await;
+                // Restore session/pending state that the pre-execute lock
+                // had mutated on this dispatch's behalf. If the panic
+                // happened after execute_schedule already restored these
+                // (e.g. very late in cleanup), the writes here are
+                // overwriting equivalent state — safe and idempotent.
+                // Inline mode never mutated `sessions` upfront, so we only
+                // touch sessions on the isolated path.
+                let mut data = state.lock().await;
+                if !inline_mode {
+                    match prev_for_recover {
+                        Some(prev) => { data.sessions.insert(chat_id, prev); }
+                        None => { data.sessions.remove(&chat_id); }
+                    }
+                }
+                if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
+                    set.remove(&entry_id_for_log);
+                    if set.is_empty() {
+                        data.pending_schedules.remove(&chat_id);
                     }
                 }
             }

@@ -118,7 +118,13 @@ pub fn verify_completion_opencode(session_id: &str, working_dir: &str) -> Result
         ])
         .current_dir(working_dir)
         .env("PATH", crate::services::claude::enhanced_path_for_bin(&opencode_bin))
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)
+        // Block `question` / `plan_exit` — both wait on a user reply via
+        // opencode's `question.ask` Deferred and would hang the verify fork.
+        // The verify prompt itself says "Do NOT call any tools", but the
+        // `plan` agent's plan_exit is auto-called when planning concludes, so
+        // the deny rule is a belt-and-braces safeguard. See the matching
+        // comment in `build_opencode_command` / `spawn_opencode_serve`.
+        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -800,7 +806,13 @@ fn build_opencode_command(
     let mut cmd = Command::new(&opencode_bin);
     cmd.args(&args)
         .current_dir(working_dir)
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)
+        // `question` and `plan_exit` are the only opencode tools that block on
+        // a user reply through opencode's `question.ask` Deferred. cokacdir's
+        // Telegram flow has no handler that posts answers back, so an AI call
+        // to either tool would hang the session forever. Deny them explicitly
+        // while keeping every other tool allowed. Permission evaluation uses
+        // `findLast` so the trailing keys override the leading `*` rule.
+        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -822,8 +834,19 @@ fn parse_text_event(json: &Value) -> Option<String> {
 }
 
 /// Normalize opencode's lowercase tool names to PascalCase (system standard).
+///
+/// Verified against opencode v1.15.5 `packages/opencode/src/tool/*.ts` —
+/// each `Tool.define("<id>", …)` first-arg is the wire-level tool name we
+/// receive on `message.part.updated` events with `part.type == "tool"`.
+///
+/// The first block lists every tool ID opencode 1.15.5 actually emits; the
+/// second block is legacy aliases (older opencode versions / Claude-Code
+/// alternate names) kept for backward compatibility — opencode 1.15.5 does
+/// not emit them, so they are dead in the current version but harmless and
+/// useful when running against older binaries.
 fn normalize_tool_name(name: &str) -> String {
     match name {
+        // ── opencode 1.15.5 tool IDs (verified against tool registry) ──
         "bash" => "Bash",
         "read" => "Read",
         "write" => "Write",
@@ -832,40 +855,98 @@ fn normalize_tool_name(name: &str) -> String {
         "grep" => "Grep",
         "webfetch" => "WebFetch",
         "websearch" => "WebSearch",
+        "task" => "Task",
+        "task_status" => "TaskStatus",
+        "skill" => "Skill",
+        "todowrite" => "TodoWrite",
+        "question" => "Question",
+        "plan_exit" => "PlanExit",
+        "lsp" => "Lsp",
+        "repo_clone" => "RepoClone",
+        "repo_overview" => "RepoOverview",
+        "invalid" => "Invalid",
+        "apply_patch" => "Edit",
+        // ── Legacy aliases (older opencode / Claude-Code parity) ──
         "notebookedit" => "NotebookEdit",
         "list" => "Glob",
-        "task" => "Task",
         "taskoutput" => "TaskOutput",
         "taskstop" => "TaskStop",
         "taskcreate" => "TaskCreate",
         "taskupdate" => "TaskUpdate",
         "taskget" => "TaskGet",
         "tasklist" => "TaskList",
-        "skill" => "Skill",
-        "todowrite" => "TodoWrite",
         "todoread" => "TodoRead",
         "askuserquestion" => "AskUserQuestion",
         "enterplanmode" => "EnterPlanMode",
         "exitplanmode" => "ExitPlanMode",
         "codesearch" => "Grep",
-        "apply_patch" => "Edit",
         _ => name,
     }.to_string()
 }
 
 /// Normalize OpenCode tool input field names to Claude-compatible names.
+///
+/// opencode 1.15.5 uses **camelCase** for tool parameters (e.g. `filePath`,
+/// `oldString`, `replaceAll`, `include`), while cokacdir's UI renderer in
+/// `ui/ai_screen.rs` looks up **snake_case** keys (`file_path`, `old_string`,
+/// `replace_all`, `glob`). Without this normalization the UI would display
+/// empty file paths and missing parameters for `write`, `edit`, and `grep`
+/// tool calls coming from opencode.
+///
+/// Per-tool key map (opencode wire key → cokacdir canonical key):
+/// - `read`  : filePath → file_path
+/// - `write` : filePath → file_path
+/// - `edit`  : filePath → file_path, oldString → old_string, newString → new_string, replaceAll → replace_all
+/// - `grep`  : include → glob
+/// - `apply_patch` : synth file_path from `*** Add/Update/Delete File:` line
+/// - `skill` : name → skill
+///
+/// Other opencode tools (`bash`, `glob`, `webfetch`, `websearch`, `task`,
+/// `task_status`, `lsp`, `repo_clone`, `repo_overview`, `question`,
+/// `plan_exit`, `invalid`, `todowrite`) already use keys the UI renderer
+/// accepts as-is, so they need no normalization.
 fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
     let Some(obj) = input.as_object() else { return input.clone() };
     let mut out = obj.clone();
 
+    // Rename a single camelCase key to its snake_case canonical form, only if
+    // the snake_case key is not already present (so we never clobber an
+    // already-correct value emitted by a hypothetical future opencode that
+    // adopts snake_case).
+    fn rename(out: &mut serde_json::Map<String, Value>, from: &str, to: &str) {
+        if out.contains_key(from) && !out.contains_key(to) {
+            if let Some(v) = out.remove(from) {
+                out.insert(to.to_string(), v);
+            }
+        }
+    }
+
     match tool {
         "read" => {
-            // filePath → file_path
-            if out.contains_key("filePath") && !out.contains_key("file_path") {
-                if let Some(v) = out.remove("filePath") {
-                    out.insert("file_path".to_string(), v);
-                }
-            }
+            rename(&mut out, "filePath", "file_path");
+        }
+        "write" => {
+            rename(&mut out, "filePath", "file_path");
+        }
+        "edit" => {
+            rename(&mut out, "filePath", "file_path");
+            rename(&mut out, "oldString", "old_string");
+            rename(&mut out, "newString", "new_string");
+            rename(&mut out, "replaceAll", "replace_all");
+        }
+        "grep" => {
+            // opencode's grep tool uses `include` (file-glob filter) while
+            // cokacdir's UI displays it under the canonical `glob` key — same
+            // semantic, different name.
+            rename(&mut out, "include", "glob");
+        }
+        "lsp" => {
+            // No "Lsp" handler in ui/ai_screen.rs today — display falls through
+            // to the generic key-listing branch — but normalize here so the
+            // listed keys read consistently with the rest of the system
+            // (snake_case), and so a future Lsp-specific UI handler can read
+            // `file_path` like the other file-touching tools.
+            rename(&mut out, "filePath", "file_path");
         }
         "apply_patch" => {
             // Extract file_path from patchText for display
@@ -882,12 +963,7 @@ fn normalize_opencode_params(tool: &str, input: &Value) -> Value {
             }
         }
         "skill" => {
-            // name → skill
-            if out.contains_key("name") && !out.contains_key("skill") {
-                if let Some(v) = out.remove("name") {
-                    out.insert("skill".to_string(), v);
-                }
-            }
+            rename(&mut out, "name", "skill");
         }
         _ => {}
     }
@@ -2166,7 +2242,16 @@ async fn spawn_opencode_serve(
         // JSON string like `"allow"` silently no-ops. `{"*":"allow"}` becomes
         // the ruleset rule `{permission:"*", pattern:"*", action:"allow"}`
         // which matches every permission check including `external_directory`.
-        .env("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)
+        //
+        // `question` and `plan_exit` are the only tools that block on a user
+        // reply through opencode's `question.ask` Deferred (see
+        // packages/opencode/src/tool/question.ts and plan.ts). cokacdir's
+        // Telegram flow has no handler that posts answers back to opencode,
+        // so an AI call to either tool would hang the session forever. Deny
+        // them explicitly while keeping every other tool allowed. Permission
+        // evaluation uses `findLast` (see permission/evaluate.ts), so the
+        // trailing `question`/`plan_exit` rules override the leading `*`.
+        .env("OPENCODE_PERMISSION", r#"{"*":"allow","question":"deny","plan_exit":"deny"}"#)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
