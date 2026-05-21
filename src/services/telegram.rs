@@ -2742,19 +2742,27 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
         pending_uploads_added_at: None,
     });
     session.current_path = Some(last_path.clone());
+    let mut restored_active_session = false;
     if let Some((session_data, _)) = existing {
         msg_debug(&format!("[auto-restore] SUCCESS: session_id={}, history_len={}", session_data.session_id, session_data.history.len()));
-        if !session_data.session_id.is_empty() {
+        if session_data_has_active_session(&session_data) {
             session.session_id = Some(session_data.session_id.clone());
+            session.history = session_data.history.clone();
+            restored_active_session = true;
         } else {
             cleanup_session_files(&last_path, auto_provider);
+            session.session_id = None;
+            session.history.clear();
         }
-        session.history = session_data.history.clone();
     } else {
         msg_debug("[auto-restore] FAIL: no session data found (local or external) → empty history");
     }
     let ts = chrono::Local::now().format("%H:%M:%S");
-    println!("  [{ts}] ↻ [{user_name}] Auto-restored session: {last_path}");
+    if restored_active_session {
+        println!("  [{ts}] ↻ [{user_name}] Auto-restored session: {last_path}");
+    } else {
+        println!("  [{ts}] ↻ [{user_name}] Auto-started session path: {last_path}");
+    }
 
     // Append auto-restore marker to group chat log
     if chat_id.0 < 0 {
@@ -2768,7 +2776,11 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
                 bot_display_name: dn,
                 role: "system".to_string(),
                 from: None,
-                text: format!("Session restored at {}", last_path),
+                text: if restored_active_session {
+                    format!("Session restored at {}", last_path)
+                } else {
+                    format!("Session started at {}", last_path)
+                },
                 clear: false,
             });
         }
@@ -5919,35 +5931,52 @@ async fn handle_start_command(
         }
 
         if let Some((session_data, _)) = &existing {
-            if !session_data.session_id.is_empty() {
+            if session_data_has_active_session(session_data) {
                 session.session_id = Some(session_data.session_id.clone());
+                session.current_path = Some(canonical_path.clone());
+                session.history = session_data.history.clone();
+                is_restored = true;
+                msg_debug(&format!("[handle_start_command] restored: session_id={}, path={}, history_len={}",
+                    session_data.session_id, canonical_path, session_data.history.len()));
+
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ▶ Session restored: {canonical_path}");
+                response_lines.push(format!("[{}] Session restored at `{}`.", provider_str, canonical_path));
+                if let Some(folder_name) = std::path::Path::new(&canonical_path).file_name().and_then(|n| n.to_str()) {
+                    if is_workspace_id(folder_name)
+                        && dirs::home_dir()
+                            .map(|h| h.join(".cokacdir").join("workspace").join(folder_name).is_dir())
+                            .unwrap_or(false)
+                    {
+                        response_lines.push(format!("Use /{} to resume this session.", folder_name));
+                    }
+                }
+                let header_len: usize = response_lines.iter().map(|l| l.len() + 1).sum();
+                let remaining = TELEGRAM_MSG_LIMIT.saturating_sub(header_len + 2);
+                let preview = build_history_preview(&session_data.history, remaining);
+                if !preview.is_empty() {
+                    response_lines.push(String::new());
+                    response_lines.push(preview);
+                }
             } else {
                 cleanup_session_files(&canonical_path, provider_str);
-            }
-            session.current_path = Some(canonical_path.clone());
-            session.history = session_data.history.clone();
-            is_restored = true;
-            msg_debug(&format!("[handle_start_command] restored: session_id={}, path={}, history_len={}",
-                session_data.session_id, canonical_path, session_data.history.len()));
+                session.session_id = None;
+                session.current_path = Some(canonical_path.clone());
+                session.history.clear();
+                msg_debug(&format!("[handle_start_command] placeholder session found; starting fresh at path={}", canonical_path));
 
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ▶ Session restored: {canonical_path}");
-            response_lines.push(format!("[{}] Session restored at `{}`.", provider_str, canonical_path));
-            if let Some(folder_name) = std::path::Path::new(&canonical_path).file_name().and_then(|n| n.to_str()) {
-                if is_workspace_id(folder_name)
-                    && dirs::home_dir()
-                        .map(|h| h.join(".cokacdir").join("workspace").join(folder_name).is_dir())
-                        .unwrap_or(false)
-                {
-                    response_lines.push(format!("Use /{} to resume this session.", folder_name));
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ▶ Session started: {canonical_path}");
+                response_lines.push(format!("[{}] Session started at `{}`.", provider_str, canonical_path));
+                if let Some(folder_name) = std::path::Path::new(&canonical_path).file_name().and_then(|n| n.to_str()) {
+                    if is_workspace_id(folder_name)
+                        && dirs::home_dir()
+                            .map(|h| h.join(".cokacdir").join("workspace").join(folder_name).is_dir())
+                            .unwrap_or(false)
+                    {
+                        response_lines.push(format!("Use /{} to resume this session.", folder_name));
+                    }
                 }
-            }
-            let header_len: usize = response_lines.iter().map(|l| l.len() + 1).sum();
-            let remaining = TELEGRAM_MSG_LIMIT.saturating_sub(header_len + 2);
-            let preview = build_history_preview(&session_data.history, remaining);
-            if !preview.is_empty() {
-                response_lines.push(String::new());
-                response_lines.push(preview);
             }
         } else {
             session.session_id = None;
@@ -6331,7 +6360,8 @@ fn resolve_opencode_by_id(session_id: &str) -> Option<ResolvedSession> {
 }
 
 /// Convert an external JSONL session to cokacdir SessionData and save it.
-/// Re-converts if the source JSONL is newer than the existing JSON.
+/// Re-converts if the source JSONL is newer than the existing JSON, or if the
+/// existing JSON is a cleared/incomplete placeholder.
 fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
     msg_debug(&format!("[convert_session] start: jsonl={}, session_id={}, canonical_path={:?}",
         info.jsonl_path.display(), info.session_id, canonical_path));
@@ -6340,19 +6370,24 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
         return;
     };
     let target = sessions_dir.join(format!("{}.json", info.session_id));
+    let provider_str = session_provider_str(info.provider);
     msg_debug(&format!("[convert_session] target={}", target.display()));
     if target.exists() {
-        let source_mtime = info.jsonl_path.metadata().ok().and_then(|m| m.modified().ok());
-        let target_mtime = target.metadata().ok().and_then(|m| m.modified().ok());
-        msg_debug(&format!("[convert_session] target exists, source_mtime={:?}, target_mtime={:?}", source_mtime, target_mtime));
-        if let (Some(src), Some(tgt)) = (source_mtime, target_mtime) {
-            if src <= tgt {
-                msg_debug("[convert_session] skipped: target is up-to-date");
+        if !converted_session_file_is_complete(&target, &info.session_id, canonical_path, provider_str) {
+            msg_debug("[convert_session] target exists but is incomplete or mismatched; reconverting");
+        } else {
+            let source_mtime = info.jsonl_path.metadata().ok().and_then(|m| m.modified().ok());
+            let target_mtime = target.metadata().ok().and_then(|m| m.modified().ok());
+            msg_debug(&format!("[convert_session] target exists, source_mtime={:?}, target_mtime={:?}", source_mtime, target_mtime));
+            if let (Some(src), Some(tgt)) = (source_mtime, target_mtime) {
+                if src <= tgt {
+                    msg_debug("[convert_session] skipped: target is up-to-date");
+                    return;
+                }
+            } else {
+                msg_debug("[convert_session] skipped: cannot compare mtimes");
                 return;
             }
-        } else {
-            msg_debug("[convert_session] skipped: cannot compare mtimes");
-            return;
         }
     }
 
@@ -6377,11 +6412,136 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
     }
 
     crate::services::session_archive::archive_and_save_session(
-        session_provider_str(info.provider),
+        provider_str,
         &info.jsonl_path,
         &info.session_id,
         canonical_path,
     );
+}
+
+fn converted_session_file_is_complete(
+    target: &Path,
+    session_id: &str,
+    canonical_path: &str,
+    provider: &str,
+) -> bool {
+    fs::read_to_string(target)
+        .ok()
+        .and_then(|content| serde_json::from_str::<SessionData>(&content).ok())
+        .map(|data| {
+            data.session_id == session_id
+                && data.current_path == canonical_path
+                && !data.history.is_empty()
+                && (data.provider.is_empty() || data.provider == provider)
+        })
+        .unwrap_or(false)
+}
+
+fn session_data_has_active_session(session_data: &SessionData) -> bool {
+    !session_data.session_id.is_empty()
+}
+
+#[cfg(test)]
+mod session_conversion_tests {
+    use super::{
+        converted_session_file_is_complete, session_data_has_active_session, HistoryItem,
+        HistoryType, SessionData,
+    };
+
+    fn write_session_file(path: &std::path::Path, data: &SessionData) {
+        let json = serde_json::to_string_pretty(data).unwrap();
+        std::fs::write(path, json).unwrap();
+    }
+
+    fn valid_session_data() -> SessionData {
+        SessionData {
+            session_id: "7a34c35a-d26f-4cf8-afe4-6ab2111c8afc".to_string(),
+            history: vec![HistoryItem {
+                item_type: HistoryType::User,
+                content: "hello".to_string(),
+            }],
+            current_path: "/tmp/cokacdir-session".to_string(),
+            created_at: "2026-05-21 00:00:00".to_string(),
+            provider: "claude".to_string(),
+        }
+    }
+
+    #[test]
+    fn cleared_placeholder_is_not_a_complete_conversion_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        std::fs::write(
+            &path,
+            r#"{"current_path":"/tmp/cokacdir-session","provider":"claude"}"#,
+        )
+        .unwrap();
+
+        assert!(!converted_session_file_is_complete(
+            &path,
+            "7a34c35a-d26f-4cf8-afe4-6ab2111c8afc",
+            "/tmp/cokacdir-session",
+            "claude",
+        ));
+    }
+
+    #[test]
+    fn complete_converted_session_can_use_mtime_fast_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let data = valid_session_data();
+        write_session_file(&path, &data);
+
+        assert!(converted_session_file_is_complete(
+            &path,
+            &data.session_id,
+            &data.current_path,
+            &data.provider,
+        ));
+    }
+
+    #[test]
+    fn mismatched_or_empty_converted_session_is_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.json");
+        let mut data = valid_session_data();
+        data.history.clear();
+        write_session_file(&path, &data);
+        assert!(!converted_session_file_is_complete(
+            &path,
+            &data.session_id,
+            &data.current_path,
+            &data.provider,
+        ));
+
+        data = valid_session_data();
+        data.current_path = "/tmp/other-session".to_string();
+        write_session_file(&path, &data);
+        assert!(!converted_session_file_is_complete(
+            &path,
+            &data.session_id,
+            "/tmp/cokacdir-session",
+            &data.provider,
+        ));
+
+        data = valid_session_data();
+        data.provider = "codex".to_string();
+        write_session_file(&path, &data);
+        assert!(!converted_session_file_is_complete(
+            &path,
+            &data.session_id,
+            &data.current_path,
+            "claude",
+        ));
+    }
+
+    #[test]
+    fn active_session_requires_non_empty_session_id() {
+        let mut data = valid_session_data();
+        assert!(session_data_has_active_session(&data));
+
+        data.session_id.clear();
+        assert!(!session_data_has_active_session(&data));
+    }
 }
 
 /// Find the most recently modified external session whose cwd matches the given path.
@@ -7007,24 +7167,31 @@ async fn handle_workspace_resume(
         }
 
         if let Some((session_data, _)) = &existing {
-            if !session_data.session_id.is_empty() {
+            if session_data_has_active_session(session_data) {
                 session.session_id = Some(session_data.session_id.clone());
+                session.current_path = Some(canonical_path.clone());
+                session.history = session_data.history.clone();
+
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ▶ Workspace session restored: {workspace_id} → {canonical_path}");
+                response_lines.push(format!("[{}] Session restored at `{}`.", ws_provider, canonical_path));
+
+                let header_len: usize = response_lines.iter().map(|l| l.len() + 1).sum();
+                let remaining = TELEGRAM_MSG_LIMIT.saturating_sub(header_len + 2);
+                let preview = build_history_preview(&session_data.history, remaining);
+                if !preview.is_empty() {
+                    response_lines.push(String::new());
+                    response_lines.push(preview);
+                }
             } else {
                 cleanup_session_files(&canonical_path, ws_provider);
-            }
-            session.current_path = Some(canonical_path.clone());
-            session.history = session_data.history.clone();
+                session.session_id = None;
+                session.current_path = Some(canonical_path.clone());
+                session.history.clear();
 
-            let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ▶ Workspace session restored: {workspace_id} → {canonical_path}");
-            response_lines.push(format!("[{}] Session restored at `{}`.", ws_provider, canonical_path));
-
-            let header_len: usize = response_lines.iter().map(|l| l.len() + 1).sum();
-            let remaining = TELEGRAM_MSG_LIMIT.saturating_sub(header_len + 2);
-            let preview = build_history_preview(&session_data.history, remaining);
-            if !preview.is_empty() {
-                response_lines.push(String::new());
-                response_lines.push(preview);
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}] ▶ Workspace session started: {workspace_id} → {canonical_path}");
+                response_lines.push(format!("[{}] Session started at `{}`.", ws_provider, canonical_path));
             }
         } else {
             // Workspace exists but no session — start a new session there
