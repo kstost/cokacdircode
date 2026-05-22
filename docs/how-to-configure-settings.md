@@ -30,6 +30,24 @@ The setting only takes effect when the active model is Claude. Other providers i
 
 ---
 
+## /effort
+
+Sets the effort level for the current chat's active Claude or Codex provider.
+
+```
+/effort high
+/effort reset
+```
+
+- **Claude**: `low`, `medium`, `high`, `xhigh`, `max`
+- **Codex**: `minimal`, `low`, `medium`, `high`, `xhigh`
+- Without arguments, shows the current provider's value and accepted levels.
+- `reset`, `clear`, or `default` removes the override for the current provider.
+
+This setting is stored per chat by cokacdir. The underlying Claude CLI receives it as `--effort <level>` for each session invocation; Codex receives it as `-c model_reasoning_effort=<level>`.
+
+---
+
 ## /greeting
 
 Toggles the startup greeting style.

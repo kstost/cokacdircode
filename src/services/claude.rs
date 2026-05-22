@@ -930,7 +930,7 @@ pub fn extract_result_summary(session_id: &str, working_dir: &str, model: Option
 
 /// Verify whether a session's task has been fully completed.
 /// Forks the session, asks Claude to judge completeness, and returns the result.
-pub fn verify_completion(session_id: &str, working_dir: &str) -> Result<VerifyResult, String> {
+pub fn verify_completion(session_id: &str, working_dir: &str, effort: Option<&str>) -> Result<VerifyResult, String> {
     debug_log("=== verify_completion START ===");
     debug_log(&format!("  session_id: {}", session_id));
     debug_log(&format!("  working_dir: {}", working_dir));
@@ -947,15 +947,20 @@ pub fn verify_completion(session_id: &str, working_dir: &str) -> Result<VerifyRe
         })?;
     debug_log(&format!("  claude_bin: {}", claude_bin));
 
-    let args = vec![
-        "-p",
-        "--dangerously-skip-permissions",
-        "--no-session-persistence",
-        "--max-turns", "1",
-        "--tools", "",
-        "--resume", session_id,
-        "--fork-session",
+    let mut args = vec![
+        "-p".to_string(),
+        "--dangerously-skip-permissions".to_string(),
+        "--no-session-persistence".to_string(),
+        "--max-turns".to_string(), "1".to_string(),
+        "--tools".to_string(), "".to_string(),
     ];
+    if let Some(effort) = effort {
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
+    }
+    args.push("--resume".to_string());
+    args.push(session_id.to_string());
+    args.push("--fork-session".to_string());
     debug_log(&format!("  args: {:?}", args));
 
     let verify_prompt = "Review what you just did in this session. \
@@ -1115,6 +1120,7 @@ pub fn execute_command_streaming(
     model: Option<&str>,
     no_session_persistence: bool,
     use_chrome: bool,
+    effort: Option<&str>,
 ) -> Result<(), String> {
     debug_log("========================================");
     debug_log("=== execute_command_streaming START ===");
@@ -1200,6 +1206,11 @@ IMPORTANT: Format your responses using Markdown for better readability:
     if let Some(m) = model {
         args.push("--model".to_string());
         args.push(m.to_string());
+    }
+
+    if let Some(effort) = effort {
+        args.push("--effort".to_string());
+        args.push(effort.to_string());
     }
 
     // Enable Chrome browser tool

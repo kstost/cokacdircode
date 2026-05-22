@@ -67,7 +67,7 @@ For AI provider setup, keyboard shortcuts, and detailed documentation, visit:
 * Bot-to-bot messaging for multi-agent workflows
 * File upload/download, tool management, debug logging
 
-**Commands:** `/start`, `/stop`, `/clear`, `/help`, `/session`, `/pwd`, `/model`, `/down`, `/instruction`, `/instruction_clear`, `/allowed`, `/allowedtools`, `/availabletools`, `/contextlevel`, `/query`, `/loop`, `/setendhook`, `/setendhook_clear`, `/public`, `/direct`, `/setpollingtime`, `/debug`, `/silent`, `/envvars`
+**Commands:** `/start`, `/stop`, `/clear`, `/help`, `/session`, `/pwd`, `/model`, `/effort`, `/down`, `/instruction`, `/instruction_clear`, `/allowed`, `/allowedtools`, `/availabletools`, `/contextlevel`, `/query`, `/loop`, `/setendhook`, `/setendhook_clear`, `/public`, `/direct`, `/setpollingtime`, `/debug`, `/silent`, `/envvars`
 
 ## Configuration
 

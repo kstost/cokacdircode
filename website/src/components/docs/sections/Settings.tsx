@@ -15,6 +15,7 @@ export default function Settings() {
           rows={[
             ['/silent', String(t('Toggle silent mode (hide/show tool call details)', '무음 모드 전환 (도구 호출 세부사항 숨기기/표시)'))],
             ['/debug', String(t('Enable/disable debug logging', '디버그 로깅 활성화/비활성화'))],
+            ['/effort <level>', String(t('Set Claude/Codex effort level', 'Claude/Codex effort 수준 설정'))],
             ['/greeting', String(t('Toggle startup greeting style (Compact / Full)', '시작 인사 스타일 전환 (간략 / 전체)'))],
             ['/setpollingtime <ms>', String(t('Set API polling interval', 'API 폴링 간격 설정'))],
             ['/envvars', String(t('Show all environment variables (owner only)', '모든 환경변수 표시 (소유자 전용)'))],
@@ -45,6 +46,21 @@ export default function Settings() {
             '설정값은 봇별로 저장되지만, 봇 서버가 실행 중일 때 디버그 로깅은 프로세스 전체에 적용됩니다. 같은 프로세스의 어떤 봇이라도 디버그가 켜져 있으면 공유 디버그 로그는 계속 켜져 있습니다.'
           )}
         </InfoBox>
+      </SubSection>
+
+      <SubSection title="/effort">
+        <P>{t(
+          <>Sets the effort level for the active <IC>Claude</IC> or <IC>Codex</IC> provider in the current chat.</>,
+          <>현재 채팅에서 활성화된 <IC>Claude</IC> 또는 <IC>Codex</IC> provider의 effort 수준을 설정합니다.</>
+        )}</P>
+        <ul className="list-disc list-inside space-y-1.5 text-zinc-400 my-4 ml-2">
+          <li>{t(<>Claude: <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC></>, <>Claude: <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC>, <IC>max</IC></>)}</li>
+          <li>{t(<>Codex: <IC>minimal</IC>, <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC></>, <>Codex: <IC>minimal</IC>, <IC>low</IC>, <IC>medium</IC>, <IC>high</IC>, <IC>xhigh</IC></>)}</li>
+        </ul>
+        <P>{t(
+          <><IC>/effort reset</IC> clears the override for the current provider.</>,
+          <><IC>/effort reset</IC>은 현재 provider의 override를 해제합니다.</>
+        )}</P>
       </SubSection>
 
       <SubSection title="/greeting">

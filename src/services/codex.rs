@@ -157,7 +157,11 @@ fn codex_debug_log(msg: &str) {
 ///   and not `mission_pending`.
 /// - `feedback` carries the "what remains" text with keywords stripped,
 ///   ready to be re-injected as the next user prompt.
-pub fn verify_completion_codex(session_id: &str, working_dir: &str) -> Result<crate::services::claude::VerifyResult, String> {
+pub fn verify_completion_codex(
+    session_id: &str,
+    working_dir: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<crate::services::claude::VerifyResult, String> {
     codex_debug_log("=== verify_completion_codex START ===");
     codex_debug_log(&format!("  session_id: {}", session_id));
     codex_debug_log(&format!("  working_dir: {}", working_dir));
@@ -230,14 +234,18 @@ pub fn verify_completion_codex(session_id: &str, working_dir: &str) -> Result<cr
     // read-only sandbox prevents any filesystem writes the model might try,
     // and the prompt itself instructs "do not call any tools".
     let out_path_str = out_path.to_string_lossy().to_string();
-    let args: Vec<&str> = vec![
-        "exec",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--sandbox", "read-only",
-        "--output-last-message", &out_path_str,
-        "-",
+    let mut args: Vec<String> = vec![
+        "exec".to_string(),
+        "--ephemeral".to_string(),
+        "--skip-git-repo-check".to_string(),
+        "--sandbox".to_string(), "read-only".to_string(),
+        "--output-last-message".to_string(), out_path_str,
     ];
+    if let Some(effort) = reasoning_effort {
+        args.push("-c".to_string());
+        args.push(format!("model_reasoning_effort={}", effort));
+    }
+    args.push("-".to_string());
     codex_debug_log(&format!("  args: {:?}", args));
 
     let spawn_start = std::time::Instant::now();
@@ -344,6 +352,7 @@ pub fn execute_command_streaming(
     model: Option<&str>,               // "codex:" prefix already stripped
     _no_session_persistence: bool,     // ignored — Codex exec handles persistence internally
     auto_send: Option<&CodexAutoSendCtx>, // when Some, deliver image_gen outputs that the model forgot to sendfile
+    reasoning_effort: Option<&str>,    // None = use Codex CLI default (~/.codex/config.toml)
 ) -> Result<(), String> {
     codex_debug_log("========================================");
     codex_debug_log("=== codex execute_command_streaming START ===");
@@ -445,6 +454,17 @@ pub fn execute_command_streaming(
     if let Some(m) = model {
         args.push("-m".to_string());
         args.push(m.to_string());
+    }
+
+    // Reasoning effort override (minimal/low/medium/high/xhigh).
+    // Caller must already have validated the value; codex parses `-c key=value`
+    // as JSON when possible, otherwise as a literal string — these enum
+    // values are safe bare identifiers.
+    if let Some(effort) = reasoning_effort {
+        let arg_value = format!("model_reasoning_effort={}", effort);
+        codex_debug_log(&format!("[EFFORT] Adding args: -c {}", arg_value));
+        args.push("-c".to_string());
+        args.push(arg_value);
     }
 
     // `-` means read prompt from stdin

@@ -722,6 +722,12 @@ struct BotSettings {
     use_chrome: HashMap<String, bool>,
     /// chat_id (string) → message to send when AI processing completes
     end_hook: HashMap<String, String>,
+    /// chat_id (string) -> codex reasoning effort.
+    /// Applied only when current model is codex; passed via `-c model_reasoning_effort=<v>`.
+    effort: HashMap<String, String>,
+    /// chat_id (string) -> Claude effort level.
+    /// Applied only when current model is Claude; passed via `--effort <v>`.
+    claude_effort: HashMap<String, String>,
 }
 
 impl Default for BotSettings {
@@ -743,6 +749,8 @@ impl Default for BotSettings {
             greeting: false,
             use_chrome: HashMap::new(),
             end_hook: HashMap::new(),
+            effort: HashMap::new(),
+            claude_effort: HashMap::new(),
         }
     }
 }
@@ -772,6 +780,52 @@ fn get_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
 /// Check if silent mode is enabled for a chat (default: ON)
 fn is_silent(settings: &BotSettings, chat_id: ChatId) -> bool {
     settings.silent.get(&chat_id.0.to_string()).copied().unwrap_or(SILENT_MODE_DEFAULT)
+}
+
+/// Get the configured Codex reasoning effort for a specific chat_id.
+/// Returns None when unset, so the Codex CLI / config.toml default applies.
+fn get_codex_effort(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
+    settings.effort.get(&chat_id.0.to_string()).cloned()
+}
+
+/// Get the configured Claude effort for a specific chat_id.
+/// Returns None when unset, so Claude Code's effortLevel/default applies.
+fn get_claude_effort(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
+    settings.claude_effort.get(&chat_id.0.to_string()).cloned()
+}
+
+fn get_effort_for_provider(settings: &BotSettings, chat_id: ChatId, provider: &str) -> Option<String> {
+    match provider {
+        "claude" => get_claude_effort(settings, chat_id),
+        "codex" => get_codex_effort(settings, chat_id),
+        _ => None,
+    }
+}
+
+/// Validate a Codex reasoning_effort value.
+fn is_valid_codex_effort(v: &str) -> bool {
+    matches!(v, "minimal" | "low" | "medium" | "high" | "xhigh")
+}
+
+/// Validate a Claude Code --effort value.
+fn is_valid_claude_effort(v: &str) -> bool {
+    matches!(v, "low" | "medium" | "high" | "xhigh" | "max")
+}
+
+fn valid_effort_values(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "low, medium, high, xhigh, max",
+        "codex" => "minimal, low, medium, high, xhigh",
+        _ => "Claude: low, medium, high, xhigh, max; Codex: minimal, low, medium, high, xhigh",
+    }
+}
+
+fn is_valid_effort_for_provider(provider: &str, v: &str) -> bool {
+    match provider {
+        "claude" => is_valid_claude_effort(v),
+        "codex" => is_valid_codex_effort(v),
+        _ => false,
+    }
 }
 
 /// Schedule entry persisted as JSON in ~/.cokacdir/schedule/
@@ -3079,7 +3133,21 @@ fn load_bot_settings(token: &str) -> BotSettings {
             .collect())
         .unwrap_or_default();
 
-    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat, models, debug, silent, direct, context, instructions, queue, username, display_name, greeting, use_chrome, end_hook }
+    let effort: HashMap<String, String> = entry.get("effort")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect())
+        .unwrap_or_default();
+
+    let claude_effort: HashMap<String, String> = entry.get("claude_effort")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect())
+        .unwrap_or_default();
+
+    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat, models, debug, silent, direct, context, instructions, queue, username, display_name, greeting, use_chrome, end_hook, effort, claude_effort }
 }
 
 /// Save bot settings to bot_settings.json
@@ -3128,6 +3196,8 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
         "greeting": settings.greeting,
         "use_chrome": settings.use_chrome,
         "end_hook": settings.end_hook,
+        "effort": settings.effort,
+        "claude_effort": settings.claude_effort,
     });
     if let Some(owner_id) = settings.owner_user_id {
         entry["owner_user_id"] = serde_json::json!(owner_id);
@@ -3309,6 +3379,13 @@ fn command_name(text: &str) -> Option<&str> {
     Some(token.split('@').next().unwrap_or(token))
 }
 
+fn command_args(text: &str) -> &str {
+    let Some(rest) = text.trim_start().strip_prefix('/') else { return ""; };
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let _ = parts.next();
+    parts.next().unwrap_or("").trim()
+}
+
 /// True iff `text` is the slash command `name` — i.e. `/name`, `/name args`,
 /// `/name@bot`, or `/name@bot args`. Substring-prefix matches do NOT count
 /// (e.g., `/silentmode` is not `/silent`). Use this everywhere instead of
@@ -3339,6 +3416,7 @@ fn is_owner_only_command(text: &str) -> bool {
             | "public"
             | "setpollingtime"
             | "model"
+            | "effort"
             | "greeting"
             | "debug"
             | "envvars"
@@ -3999,6 +4077,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         teloxide::types::BotCommand::new("allowed", "Add/remove tool (+name / -name)"),
         teloxide::types::BotCommand::new("setpollingtime", "Set API polling interval (ms)"),
         teloxide::types::BotCommand::new("model", "Set AI model"),
+        teloxide::types::BotCommand::new("effort", "Set Claude/Codex effort level"),
         teloxide::types::BotCommand::new("greeting", "Toggle compact startup greeting"),
         teloxide::types::BotCommand::new("debug", "Toggle debug logging"),
         teloxide::types::BotCommand::new("envvars", "Show all environment variables"),
@@ -5354,6 +5433,10 @@ async fn handle_message(
         msg_debug("[handle_message] routing → /model");
         println!("  [{timestamp}] ◀ [{user_name}] /model {}", text.strip_prefix("/model").unwrap_or("").trim());
         handle_model_command(&bot, chat_id, &text, &state, token).await?;
+    } else if is_cmd(&text, "effort") {
+        msg_debug("[handle_message] routing → /effort");
+        println!("  [{timestamp}] ◀ [{user_name}] /effort {}", command_args(&text));
+        handle_effort_command(&bot, chat_id, &text, &state, token).await?;
     } else if is_cmd(&text, "greeting") {
         msg_debug("[handle_message] routing → /greeting");
         println!("  [{timestamp}] ◀ [{user_name}] /greeting");
@@ -5584,6 +5667,8 @@ Ask in natural language to manage schedules.
 <b>Settings</b>
 <code>/model</code> — Show current AI model
 <code>/model &lt;name&gt;</code> — Set model (claude/codex/gemini or provider:model)
+<code>/effort</code> — Show current Claude/Codex effort
+<code>/effort &lt;level&gt;</code> — Set effort (Claude: low/medium/high/xhigh/max, Codex: minimal/low/medium/high/xhigh, or reset)
 <code>/setpollingtime &lt;ms&gt;</code> — Set API polling interval
   Too low may cause API rate limits.
   Minimum 2500ms, recommended 3000ms+.
@@ -9113,6 +9198,118 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
     }
 }
 
+/// Handle /effort command — set Claude/Codex effort for the current provider.
+/// Usage:
+///   /effort           — show current value + accepted values
+///   /effort <level>   — set for current provider
+///   /effort reset     — clear current provider override
+async fn handle_effort_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+    token: &str,
+) -> ResponseResult<()> {
+    let arg = command_args(text).to_lowercase();
+    msg_debug(&format!("[handle_effort_command] chat_id={}, arg={:?}", chat_id.0, arg));
+    let current_model = {
+        let data = state.lock().await;
+        get_model(&data.settings, chat_id)
+    };
+    let provider = detect_provider(current_model.as_deref());
+    let provider_label = match provider {
+        "claude" => "Claude",
+        "codex" => "Codex",
+        _ => provider,
+    };
+
+    if arg.is_empty() {
+        let current = {
+            let data = state.lock().await;
+            get_effort_for_provider(&data.settings, chat_id, provider)
+        };
+        let mut msg = if provider == "claude" || provider == "codex" {
+            match &current {
+                Some(v) => format!("Current {} effort: <b>{}</b>\n", provider_label, html_escape(v)),
+                None => format!("Current {} effort: <b>default</b>\n", provider_label),
+            }
+        } else {
+            format!("Effort is supported only for Claude and Codex.\nCurrent model provider: <b>{}</b>\n", html_escape(provider_label))
+        };
+        if provider == "claude" || provider == "codex" {
+            msg.push_str(&format!("\nAccepted for {}: <code>{}</code>\n", provider_label, valid_effort_values(provider)));
+        }
+        msg.push_str("\n<b>Usage:</b>\n");
+        msg.push_str("<code>/effort low</code>, <code>/effort medium</code>, <code>/effort high</code>, <code>/effort xhigh</code>\n");
+        msg.push_str("<code>/effort max</code> — Claude only\n");
+        msg.push_str("<code>/effort minimal</code> — Codex only\n");
+        msg.push_str("<code>/effort reset</code> — clear current provider override\n");
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!("send_message", bot.send_message(chat_id, msg)
+            .parse_mode(ParseMode::Html)
+            .await)?;
+        return Ok(());
+    }
+
+    if provider != "claude" && provider != "codex" {
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!("send_message", bot.send_message(
+            chat_id,
+            format!("/effort is supported only for Claude and Codex. Current provider: {}.", provider_label),
+        ).await)?;
+        return Ok(());
+    }
+
+    if arg == "reset" || arg == "clear" || arg == "default" {
+        let removed = {
+            let mut data = state.lock().await;
+            let key = chat_id.0.to_string();
+            let r = match provider {
+                "claude" => data.settings.claude_effort.remove(&key).is_some(),
+                "codex" => data.settings.effort.remove(&key).is_some(),
+                _ => false,
+            };
+            save_bot_settings(token, &data.settings);
+            r
+        };
+        let msg = if removed {
+            format!("{} effort cleared — provider default will be used.", provider_label)
+        } else {
+            format!("{} effort was not set.", provider_label)
+        };
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!("send_message", bot.send_message(chat_id, msg).await)?;
+        return Ok(());
+    }
+
+    if !is_valid_effort_for_provider(provider, &arg) {
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!("send_message", bot.send_message(
+            chat_id,
+            format!("Invalid {} effort value: '{}'. Accepted: {}, reset.", provider_label, arg, valid_effort_values(provider)),
+        ).await)?;
+        return Ok(());
+    }
+
+    {
+        let mut data = state.lock().await;
+        let key = chat_id.0.to_string();
+        match provider {
+            "claude" => { data.settings.claude_effort.insert(key, arg.clone()); }
+            "codex" => { data.settings.effort.insert(key, arg.clone()); }
+            _ => {}
+        }
+        save_bot_settings(token, &data.settings);
+    };
+    let arg_escaped = html_escape(&arg);
+    let msg = format!("{} effort set to <b>{}</b>.", provider_label, arg_escaped);
+    shared_rate_limit_wait(state, chat_id).await;
+    tg!("send_message", bot.send_message(chat_id, msg)
+        .parse_mode(ParseMode::Html)
+        .await)?;
+    Ok(())
+}
+
 /// Handle /model command
 async fn handle_model_command(
     bot: &Bot,
@@ -9611,7 +9808,7 @@ async fn handle_text_message(
     // request on this bot for this chat.
 
     // Get session info, allowed tools, model, pending uploads, history, instruction, and bot_username (drop lock before any await)
-    let (session_info, allowed_tools, pending_uploads, model, history, instruction, context_count, bot_username_for_prompt, bot_display_name_for_prompt, chrome_enabled) = {
+    let (session_info, allowed_tools, pending_uploads, model, history, instruction, context_count, bot_username_for_prompt, bot_display_name_for_prompt, chrome_enabled, effort) = {
         let mut data = state.lock().await;
         let info = data.sessions.get(&chat_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
@@ -9632,9 +9829,11 @@ async fn handle_text_message(
         let buname = data.bot_username.clone();
         let bdname = data.bot_display_name.clone();
         let chrome = data.settings.use_chrome.get(&chat_id.0.to_string()).copied().unwrap_or(false);
+        let provider = detect_provider(mdl.as_deref());
+        let effort = get_effort_for_provider(&data.settings, chat_id, provider);
         msg_debug(&format!("[handle_text_message] session_id={:?}, current_path={:?}, model={:?}, uploads={}, history_len={}, instruction={:?}",
             info.as_ref().map(|(sid, _)| sid), info.as_ref().map(|(_, p)| p), mdl, uploads.len(), hist.len(), instr.is_some()));
-        (info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname, chrome)
+        (info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname, chrome, effort)
     };
 
     let (session_id, current_path) = match session_info {
@@ -9732,6 +9931,8 @@ async fn handle_text_message(
     // inner `spawn_tracked_blocking_task` call.
     let model_clone = model.clone();
     let history_clone = history;
+    // None when unset: let the provider's own default/config apply.
+    let effort_clone: Option<String> = effort;
 
     // Spawn the polling loop as a separate task so the handler returns immediately.
     // This allows teloxide's per-chat worker to process subsequent messages (e.g. /stop).
@@ -9888,6 +10089,7 @@ async fn handle_text_message(
                     codex_model,
                     false,
                     Some(&codex_auto_send),
+                    effort_clone.as_deref(),
                 )
             } else {
                 let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
@@ -9903,6 +10105,7 @@ async fn handle_text_message(
                     claude_model,
                     false,
                     chrome_enabled,
+                    effort_clone.as_deref(),
                 )
             };
 
@@ -10404,15 +10607,16 @@ async fn handle_text_message(
                 // loop-state / cancel / re-inject logic is shared.
                 if !cancelled && !cancel_token.cancelled.load(Ordering::Relaxed)
                     && (provider_str == "claude" || provider_str == "codex" || provider_str == "opencode") {
-                    let loop_info = {
-                        let data = state_owned.lock().await;
-                        data.loop_states.get(&chat_id).map(|ls| {
-                            let sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
-                            let cwd = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone()).unwrap_or_default();
-                            (ls.remaining, ls.max_iterations, ls.original_request.clone(), sid, cwd)
-                        })
-                    };
-                    if let Some((remaining, max_iterations, original_request, sid, cwd)) = loop_info {
+                        let loop_info = {
+                            let data = state_owned.lock().await;
+                            data.loop_states.get(&chat_id).map(|ls| {
+                                let sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+                                let cwd = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone()).unwrap_or_default();
+                                let effort = get_effort_for_provider(&data.settings, chat_id, provider_str);
+                                (ls.remaining, ls.max_iterations, ls.original_request.clone(), sid, cwd, effort)
+                            })
+                        };
+                    if let Some((remaining, max_iterations, original_request, sid, cwd, effort_for_verify)) = loop_info {
                         if let Some(session_id) = sid {
                             msg_debug(&format!("[loop] verifying ({}): session_id={}, remaining={}, request={:?}",
                                 provider_str, session_id, remaining, truncate_str(&original_request, 60)));
@@ -10514,9 +10718,9 @@ async fn handle_text_message(
                             };
                             let verify_result = spawn_tracked_blocking_result(request_tasks, move || {
                                 match provider_for_verify {
-                                    "codex" => crate::services::codex::verify_completion_codex(&sid_clone, &cwd_clone),
+                                    "codex" => crate::services::codex::verify_completion_codex(&sid_clone, &cwd_clone, effort_for_verify.as_deref()),
                                     "opencode" => crate::services::opencode::verify_completion_opencode(&sid_clone, &cwd_clone),
-                                    _ => crate::services::claude::verify_completion(&sid_clone, &cwd_clone),
+                                    _ => crate::services::claude::verify_completion(&sid_clone, &cwd_clone, effort_for_verify.as_deref()),
                                 }
                             }).await;
                             // Stop animation and await its task so no stray
@@ -12166,11 +12370,14 @@ async fn execute_schedule(
         workspace_dir.display().to_string()
     };
 
-    // Get allowed tools and model for this chat
-    let (allowed_tools, model, sched_chrome_enabled) = {
+    // Get allowed tools, model, and provider effort for this chat
+    let (allowed_tools, model, sched_chrome_enabled, effort) = {
         let data = state.lock().await;
         let chrome = data.settings.use_chrome.get(&chat_id.0.to_string()).copied().unwrap_or(false);
-        (get_allowed_tools(&data.settings, chat_id), get_model(&data.settings, chat_id), chrome)
+        let model = get_model(&data.settings, chat_id);
+        let provider = detect_provider(model.as_deref());
+        let effort = get_effort_for_provider(&data.settings, chat_id, provider);
+        (get_allowed_tools(&data.settings, chat_id), model, chrome, effort)
     };
 
     // Send placeholder (show only the user's original prompt, not the context summary)
@@ -12287,6 +12494,7 @@ async fn execute_schedule(
     let workspace_path_for_claude = workspace_path.clone();
     let resume_session_id: Option<String> = if inline_mode { inline_session_id.clone() } else { None };
     let model_clone_for_exec = model.clone();
+    let effort_for_exec: Option<String> = effort.clone();
     let bot_key_for_codex = bot_key.clone();
     let request_tasks = {
         let data = state.lock().await;
@@ -12346,6 +12554,7 @@ async fn execute_schedule(
                 codex_model,
                 false,
                 Some(&codex_auto_send),
+                effort_for_exec.as_deref(),
             )
         } else {
             let claude_model = model_clone_for_exec.as_deref().and_then(claude::strip_claude_prefix);
@@ -12360,6 +12569,7 @@ async fn execute_schedule(
                 claude_model,
                 false,
                 sched_chrome_enabled,
+                effort_for_exec.as_deref(),
             )
         };
         if let Err(e) = result {
@@ -13094,8 +13304,8 @@ async fn process_bot_message(
     msg_debug(&format!("[process_bot_message] auto_restore_session for bot:{}", msg.from));
     auto_restore_session(state, chat_id, &format!("bot:{}", msg.from)).await;
 
-    // Get session info, allowed tools, model, history, instruction
-    let (session_info, allowed_tools, model, history, instruction, context_count, botmsg_chrome_enabled) = {
+    // Get session info, allowed tools, model, history, instruction, effort
+    let (session_info, allowed_tools, model, history, instruction, context_count, botmsg_chrome_enabled, effort) = {
         let data = state.lock().await;
         let info = data.sessions.get(&chat_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
@@ -13110,9 +13320,11 @@ async fn process_bot_message(
         let instr = data.settings.instructions.get(&chat_id.0.to_string()).cloned();
         let ctx = data.settings.context.get(&chat_id.0.to_string()).copied().unwrap_or(12);
         let chrome = data.settings.use_chrome.get(&chat_id.0.to_string()).copied().unwrap_or(false);
+        let provider = detect_provider(mdl.as_deref());
+        let eff = get_effort_for_provider(&data.settings, chat_id, provider);
         msg_debug(&format!("[process_bot_message] session_info={}, tools={}, model={:?}, history_len={}, instruction={}",
             info.is_some(), tools.len(), mdl, hist.len(), instr.is_some()));
-        (info, tools, mdl, hist, instr, ctx, chrome)
+        (info, tools, mdl, hist, instr, ctx, chrome, eff)
     };
 
     let (session_id, current_path) = match session_info {
@@ -13256,6 +13468,7 @@ async fn process_bot_message(
     let history_clone = history;
     let prompt_for_ai = prompt.clone();
     let bot_key_for_codex = bot_key.clone();
+    let effort_clone: Option<String> = effort.clone();
     msg_debug(&format!("[process_bot_message] spawning AI backend: model={:?}, history_len={}, prompt_len={}",
         model_clone, history_clone.len(), prompt_for_ai.len()));
     let request_tasks = {
@@ -13345,6 +13558,7 @@ async fn process_bot_message(
                 codex_model,
                 false,
                 Some(&codex_auto_send),
+                effort_clone.as_deref(),
             )
         } else {
             let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
@@ -13359,6 +13573,7 @@ async fn process_bot_message(
                 claude_model,
                 false,
                 botmsg_chrome_enabled,
+                effort_clone.as_deref(),
             )
         };
         if let Err(e) = result {

@@ -929,6 +929,7 @@ Keep responses concise and terminal-friendly.",
                 None,
                 false,
                 false,
+                None,
             );
 
             let elapsed = start_time.elapsed();
