@@ -48,12 +48,19 @@ This setting is stored per chat by cokacdir. The underlying Claude CLI receives 
 
 ---
 
-## /greeting
+## /fast
 
-Toggles the startup greeting style.
+Toggles Codex Fast mode for the current chat. The setting only applies when the active provider is Codex.
 
-- **Compact**: `cokacdir started (v0.4.80, Claude)`
-- **Full**: Includes session path, community links, GitHub URL, and update notices.
+```
+/fast
+/fast on
+/fast off
+/fast status
+```
+
+- **ON** — Codex receives `-c service_tier="fast"` for each invocation.
+- **OFF** — cokacdir removes its per-chat override and Codex uses its default/configured service tier.
 
 ---
 

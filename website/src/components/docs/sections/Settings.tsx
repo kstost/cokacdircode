@@ -16,7 +16,7 @@ export default function Settings() {
             ['/silent', String(t('Toggle silent mode (hide/show tool call details)', '무음 모드 전환 (도구 호출 세부사항 숨기기/표시)'))],
             ['/debug', String(t('Enable/disable debug logging', '디버그 로깅 활성화/비활성화'))],
             ['/effort <level>', String(t('Set Claude/Codex effort level', 'Claude/Codex effort 수준 설정'))],
-            ['/greeting', String(t('Toggle startup greeting style (Compact / Full)', '시작 인사 스타일 전환 (간략 / 전체)'))],
+            ['/fast', String(t('Toggle Codex fast service tier', 'Codex fast service tier 전환'))],
             ['/setpollingtime <ms>', String(t('Set API polling interval', 'API 폴링 간격 설정'))],
             ['/envvars', String(t('Show all environment variables (owner only)', '모든 환경변수 표시 (소유자 전용)'))],
             ['/help', String(t('Display full command reference', '전체 명령어 참조 표시'))],
@@ -63,10 +63,14 @@ export default function Settings() {
         )}</P>
       </SubSection>
 
-      <SubSection title="/greeting">
+      <SubSection title="/fast">
         <P>{t(
-          <>Toggles the startup greeting style between <strong className="text-zinc-300">Compact</strong> and <strong className="text-zinc-300">Full</strong> formats.</>,
-          <>시작 인사 스타일을 <strong className="text-zinc-300">간략</strong>과 <strong className="text-zinc-300">전체</strong> 형식 사이에서 전환합니다.</>
+          <>Toggles Codex Fast mode for the current chat. When enabled, Codex receives <IC>-c service_tier="fast"</IC>.</>,
+          <>현재 채팅의 Codex Fast mode를 전환합니다. 활성화되면 Codex에 <IC>-c service_tier="fast"</IC>가 전달됩니다.</>
+        )}</P>
+        <P>{t(
+          <><IC>/fast off</IC> removes the per-chat override and Codex uses its default/configured service tier.</>,
+          <><IC>/fast off</IC>는 채팅별 override를 제거하며 Codex는 기본/설정된 service tier를 사용합니다.</>
         )}</P>
       </SubSection>
 

@@ -161,6 +161,7 @@ pub fn verify_completion_codex(
     session_id: &str,
     working_dir: &str,
     reasoning_effort: Option<&str>,
+    fast_mode: bool,
 ) -> Result<crate::services::claude::VerifyResult, String> {
     codex_debug_log("=== verify_completion_codex START ===");
     codex_debug_log(&format!("  session_id: {}", session_id));
@@ -244,6 +245,10 @@ pub fn verify_completion_codex(
     if let Some(effort) = reasoning_effort {
         args.push("-c".to_string());
         args.push(format!("model_reasoning_effort={}", effort));
+    }
+    if fast_mode {
+        args.push("-c".to_string());
+        args.push("service_tier=\"fast\"".to_string());
     }
     args.push("-".to_string());
     codex_debug_log(&format!("  args: {:?}", args));
@@ -353,6 +358,7 @@ pub fn execute_command_streaming(
     _no_session_persistence: bool,     // ignored — Codex exec handles persistence internally
     auto_send: Option<&CodexAutoSendCtx>, // when Some, deliver image_gen outputs that the model forgot to sendfile
     reasoning_effort: Option<&str>,    // None = use Codex CLI default (~/.codex/config.toml)
+    fast_mode: bool,                   // true = pass `-c service_tier="fast"`
 ) -> Result<(), String> {
     codex_debug_log("========================================");
     codex_debug_log("=== codex execute_command_streaming START ===");
@@ -361,6 +367,7 @@ pub fn execute_command_streaming(
     codex_debug_log(&format!("session_id: {:?}", session_id));
     codex_debug_log(&format!("working_dir: {}", working_dir));
     codex_debug_log(&format!("model: {:?}", model));
+    codex_debug_log(&format!("fast_mode: {}", fast_mode));
     let is_resume = session_id.is_some();
     codex_debug_log(&format!("is_resume: {}", is_resume));
     codex_debug_log(&format!("system_prompt: is_some={}, len={}", system_prompt.is_some(), system_prompt.map(|s| s.len()).unwrap_or(0)));
@@ -465,6 +472,12 @@ pub fn execute_command_streaming(
         codex_debug_log(&format!("[EFFORT] Adding args: -c {}", arg_value));
         args.push("-c".to_string());
         args.push(arg_value);
+    }
+
+    if fast_mode {
+        codex_debug_log("[FAST] Adding args: -c service_tier=\"fast\"");
+        args.push("-c".to_string());
+        args.push("service_tier=\"fast\"".to_string());
     }
 
     // `-` means read prompt from stdin
