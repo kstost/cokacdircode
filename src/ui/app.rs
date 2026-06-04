@@ -210,6 +210,7 @@ pub enum DialogType {
     LargeFileConfirm,
     TrueColorWarning,
     Progress,
+    TarError,
     DuplicateConflict,
     Settings,
     ExtensionHandlerError,
@@ -643,6 +644,10 @@ pub struct FileOperationProgress {
 }
 
 impl FileOperationProgress {
+    const CANCELLED_ERROR: &'static str = "Cancelled";
+    const MISSING_COMPLETION_ERROR: &'static str =
+        "Operation worker exited without a completion message";
+
     pub fn new(operation_type: FileOperationType) -> Self {
         Self {
             operation_type,
@@ -725,6 +730,18 @@ impl FileOperationProgress {
                         break;
                     }
                     Err(mpsc::TryRecvError::Disconnected) => {
+                        let last_error = if self.cancel_flag.load(Ordering::Relaxed) {
+                            Some(Self::CANCELLED_ERROR.to_string())
+                        } else {
+                            self.last_error
+                                .take()
+                                .or_else(|| Some(Self::MISSING_COMPLETION_ERROR.to_string()))
+                        };
+                        self.result = Some(FileOperationResult {
+                            success_count: 0,
+                            failure_count: 1,
+                            last_error,
+                        });
                         self.is_active = false;
                         return false;
                     }
@@ -873,6 +890,14 @@ pub enum PanelOpOutcome {
     Simple {
         message: Result<String, String>,
         pending_focus: Option<String>,
+        reload: bool,
+    },
+    /// Remote editor save upload result. The generation prevents stale uploads
+    /// from clearing a newer local save that still needs uploading.
+    RemoteSave {
+        message: Result<String, String>,
+        remote_path: String,
+        generation: u64,
         reload: bool,
     },
     /// list_dir result
@@ -2177,6 +2202,31 @@ impl App {
             || lower.ends_with(".txz")
     }
 
+    fn process_error_message(
+        stderr_output: Option<String>,
+        stdout_error_lines: &[String],
+        fallback: &str,
+    ) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(stderr) = stderr_output {
+            let stderr = stderr.trim_matches(['\r', '\n']).to_string();
+            if !stderr.trim().is_empty() {
+                parts.push(stderr);
+            }
+        }
+
+        if !stdout_error_lines.is_empty() {
+            parts.push(stdout_error_lines.join("\n"));
+        }
+
+        if parts.is_empty() {
+            fallback.to_string()
+        } else {
+            parts.join("\n")
+        }
+    }
+
     /// Check if a file is binary (not a text file)
     /// Reads the first 8KB of the file and checks for null bytes or high proportion of non-text bytes
     fn is_binary_file(path: &std::path::Path) -> bool {
@@ -3451,7 +3501,7 @@ impl App {
 
         // Generate default archive name based on first file
         let first_file = &files[0];
-        let archive_name = format!("{}.tar.gz", first_file);
+        let archive_name = format!("{}.tar", first_file);
 
         let file_list = if files.len() <= 3 {
             files.join(", ")
@@ -4363,8 +4413,6 @@ impl App {
             rename_map.push((src, dest));
         }
 
-        let file_count = rename_map.len();
-
         // Set pending focus to all dup file names (will find first match in sorted file list)
         let dup_names: Vec<String> = rename_map.iter()
             .filter_map(|(_, dest)| dest.file_name().map(|n| n.to_string_lossy().to_string()))
@@ -4377,9 +4425,47 @@ impl App {
         thread::spawn(move || {
             let mut completed = 0;
             let mut failed = 0;
+            let source_paths: Vec<PathBuf> = rename_map
+                .iter()
+                .map(|(src, _)| src.clone())
+                .collect();
+
+            let _ = tx.send(ProgressMessage::Preparing(
+                "Calculating file sizes...".to_string(),
+            ));
+            let (total_bytes, total_files) =
+                match file_ops::calculate_total_size(&source_paths, &cancel_flag) {
+                    Ok((bytes, files)) => (bytes, files),
+                    Err(e) => {
+                        let message = if e.kind() == std::io::ErrorKind::Interrupted {
+                            "Cancelled".to_string()
+                        } else {
+                            e.to_string()
+                        };
+                        let failure_count = if message == "Cancelled" {
+                            1
+                        } else {
+                            rename_map.len()
+                        };
+                        let _ = tx.send(ProgressMessage::Error(String::new(), message));
+                        let _ = tx.send(ProgressMessage::Completed(0, failure_count));
+                        return;
+                    }
+                };
+
+            let _ = tx.send(ProgressMessage::PrepareComplete);
+            let _ = tx.send(ProgressMessage::TotalProgress(0, total_files, 0, total_bytes));
+
+            let mut completed_bytes: u64 = 0;
+            let mut completed_files: usize = 0;
 
             for (src, dest) in rename_map {
                 if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(ProgressMessage::Error(
+                        String::new(),
+                        "Cancelled".to_string(),
+                    ));
+                    let _ = tx.send(ProgressMessage::Completed(completed, failed + 1));
                     return;
                 }
 
@@ -4389,7 +4475,7 @@ impl App {
 
                 // Safety check: never overwrite existing files
                 if dest.exists() {
-                    let _ = tx.send(crate::services::file_ops::ProgressMessage::Error(
+                    let _ = tx.send(ProgressMessage::Error(
                         file_name.clone(),
                         "destination already exists".to_string(),
                     ));
@@ -4397,53 +4483,63 @@ impl App {
                     continue;
                 }
 
-                let _ = tx.send(crate::services::file_ops::ProgressMessage::FileStarted(file_name.clone()));
+                let _ = tx.send(ProgressMessage::FileStarted(file_name.clone()));
 
                 let result = if src.is_dir() {
-                    // Use create_dir (not create_dir_all) to fail if already exists
-                    std::fs::create_dir(&dest)
-                        .and_then(|_| {
-                            // Now copy contents into the newly created directory
-                            for entry in std::fs::read_dir(&src)? {
-                                let entry = entry?;
-                                let entry_src = entry.path();
-                                let entry_dest = dest.join(entry.file_name());
-                                if entry_src.is_dir() {
-                                    crate::services::file_ops::copy_dir_recursive(&entry_src, &entry_dest)?;
-                                } else {
-                                    std::fs::copy(&entry_src, &entry_dest)?;
-                                    // Preserve file timestamps
-                                    if let Ok(meta) = std::fs::metadata(&entry_src) {
-                                        let _ = crate::services::file_ops::preserve_timestamps(&entry_dest, &meta);
-                                    }
-                                }
-                            }
-                            // Preserve directory timestamps
-                            if let Ok(meta) = std::fs::metadata(&src) {
-                                let _ = crate::services::file_ops::preserve_timestamps(&dest, &meta);
-                            }
-                            Ok(())
-                        })
+                    file_ops::copy_dir_recursive_with_progress(
+                        &src,
+                        &dest,
+                        &cancel_flag,
+                        &tx,
+                        &mut completed_bytes,
+                        &mut completed_files,
+                        total_bytes,
+                        total_files,
+                    )
                 } else {
-                    // Use create_new to ensure we never overwrite
-                    std::fs::File::create_new(&dest)
-                        .and_then(|_| std::fs::copy(&src, &dest))
-                        .map(|_| {
-                            // Preserve file timestamps
-                            if let Ok(meta) = std::fs::metadata(&src) {
-                                let _ = crate::services::file_ops::preserve_timestamps(&dest, &meta);
-                            }
-                        })
+                    let file_size = std::fs::metadata(&src).map(|m| m.len()).unwrap_or(0);
+                    let file_completed_bytes = completed_bytes;
+                    file_ops::copy_file_with_progress(
+                        &src,
+                        &dest,
+                        &cancel_flag,
+                        |copied, total| {
+                            let _ = tx.send(ProgressMessage::FileProgress(copied, total));
+                            let _ = tx.send(ProgressMessage::TotalProgress(
+                                completed_files,
+                                total_files,
+                                file_completed_bytes + copied,
+                                total_bytes,
+                            ));
+                        },
+                    )
+                    .map(|_| {
+                        completed_bytes += file_size;
+                        completed_files += 1;
+                    })
                 };
 
                 match result {
                     Ok(_) => {
                         completed += 1;
-                        let _ = tx.send(crate::services::file_ops::ProgressMessage::FileCompleted(file_name));
+                        let _ = tx.send(ProgressMessage::FileCompleted(file_name));
                     }
                     Err(e) => {
+                        if e.kind() == std::io::ErrorKind::Interrupted {
+                            if dest.is_dir() {
+                                let _ = std::fs::remove_dir_all(&dest);
+                            } else {
+                                let _ = std::fs::remove_file(&dest);
+                            }
+                            let _ = tx.send(ProgressMessage::Error(
+                                String::new(),
+                                "Cancelled".to_string(),
+                            ));
+                            let _ = tx.send(ProgressMessage::Completed(completed, failed + 1));
+                            return;
+                        }
                         failed += 1;
-                        let _ = tx.send(crate::services::file_ops::ProgressMessage::Error(
+                        let _ = tx.send(ProgressMessage::Error(
                             file_name,
                             e.to_string(),
                         ));
@@ -4451,7 +4547,7 @@ impl App {
                 }
             }
 
-            let _ = tx.send(crate::services::file_ops::ProgressMessage::Completed(completed, failed));
+            let _ = tx.send(ProgressMessage::Completed(completed, failed));
         });
 
         // Store progress state and show dialog
@@ -4616,15 +4712,15 @@ impl App {
 
     pub fn execute_open_large_file(&mut self) {
         if let Some(path) = self.pending_large_file.take() {
-            let mut editor = EditorState::new();
-            editor.set_syntax_colors(self.theme.syntax);
-            match editor.load_file(&path) {
+            let mut viewer = ViewerState::new();
+            viewer.set_syntax_colors(self.theme.syntax);
+            match viewer.load_file(&path) {
                 Ok(_) => {
-                    self.editor_state = Some(editor);
-                    self.current_screen = Screen::FileEditor;
+                    self.viewer_state = Some(viewer);
+                    self.current_screen = Screen::FileViewer;
                 }
                 Err(e) => {
-                    self.show_message(&format!("Cannot open file: {}", e));
+                    self.show_message(&format!("Cannot read file: {}", e));
                 }
             }
         }
@@ -5098,7 +5194,7 @@ impl App {
                     let stderr = child.stderr.take();
                     let mut completed_files = 0usize;
                     let mut completed_bytes = 0u64;
-                    let mut last_error_line: Option<String> = None;
+                    let mut stdout_error_lines: Vec<String> = Vec::new();
 
                     // Collect stderr in background for error messages
                     let stderr_handle = stderr.map(|stderr| {
@@ -5142,7 +5238,7 @@ impl App {
                                     let filename = line.trim_end();
                                     // Check if this looks like an error line (starts with "tar:")
                                     if filename.starts_with("tar:") || filename.starts_with("gtar:") {
-                                        last_error_line = Some(filename.to_string());
+                                        stdout_error_lines.push(filename.to_string());
                                     } else if !filename.is_empty() {
                                         completed_files += 1;
                                         // Look up file size from the map
@@ -5184,15 +5280,11 @@ impl App {
                             } else {
                                 // Cleanup partial archive on failure
                                 cleanup_archive(&archive_path_clone);
-                                // Get error from stderr or last_error_line
-                                let error_msg = last_error_line
-                                    .or_else(|| {
-                                        stderr_handle
-                                            .and_then(|h| h.join().ok())
-                                            .filter(|s| !s.trim().is_empty())
-                                            .map(|s| s.lines().next().unwrap_or("tar command failed").to_string())
-                                    })
-                                    .unwrap_or_else(|| "tar command failed".to_string());
+                                let error_msg = Self::process_error_message(
+                                    stderr_handle.and_then(|h| h.join().ok()),
+                                    &stdout_error_lines,
+                                    "tar command failed",
+                                );
                                 let _ = tx.send(ProgressMessage::Error(
                                     archive_name_owned,
                                     error_msg,
@@ -5228,7 +5320,7 @@ impl App {
         archive_path: &std::path::Path,
         archive_name: &str,
         cancel_flag: Arc<AtomicBool>,
-    ) -> (usize, u64, std::collections::HashMap<String, u64>) {
+    ) -> Result<(usize, u64, std::collections::HashMap<String, u64>), String> {
         use std::process::{Command, Stdio};
         use std::collections::HashMap;
 
@@ -5252,7 +5344,7 @@ impl App {
         cmd.arg(list_options)
             .arg(&archive_path_str)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         crate::services::claude::detach_into_own_pgroup(&mut cmd);
 
         let output = match cmd.spawn() {
@@ -5264,35 +5356,51 @@ impl App {
                 let _ = cancel_watch.join();
                 output
             }
-            Err(_) => return (total_files, total_bytes, size_map),
+            Err(e) => return Err(format!("Failed to list archive contents: {}", e)),
         };
 
         if cancel_flag.load(Ordering::Relaxed) {
-            return (total_files, total_bytes, size_map);
+            return Err("Cancelled".to_string());
         }
 
-        if let Ok(output) = output {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                for line in stdout.lines() {
-                    // tar -tvf output format: -rw-r--r-- user/group    1234 2024-01-01 12:00 filename
-                    // Parse the line to extract size and filename
-                    let parts: Vec<&str> = line.split_whitespace().collect();
-                    if parts.len() >= 6 {
-                        // Size is typically the 3rd field (index 2)
-                        if let Ok(size) = parts[2].parse::<u64>() {
-                            // Filename is everything after the date/time (index 5+)
-                            let filename = parts[5..].join(" ");
-                            size_map.insert(filename, size);
-                            total_bytes += size;
-                        }
-                        total_files += 1;
-                    }
+        let output = output
+            .map_err(|e| format!("Failed to list archive contents: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout_error_lines: Vec<String> = stdout
+                .lines()
+                .map(|line| line.trim_end_matches('\r'))
+                .filter(|line| line.starts_with("tar:") || line.starts_with("gtar:"))
+                .map(ToString::to_string)
+                .collect();
+
+            return Err(Self::process_error_message(
+                Some(stderr),
+                &stdout_error_lines,
+                "Failed to read archive contents",
+            ));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            // tar -tvf output format: -rw-r--r-- user/group    1234 2024-01-01 12:00 filename
+            // Parse the line to extract size and filename
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                // Size is typically the 3rd field (index 2)
+                if let Ok(size) = parts[2].parse::<u64>() {
+                    // Filename is everything after the date/time (index 5+)
+                    let filename = parts[5..].join(" ");
+                    size_map.insert(filename, size);
+                    total_bytes += size;
                 }
+                total_files += 1;
             }
         }
 
-        (total_files, total_bytes, size_map)
+        Ok((total_files, total_bytes, size_map))
     }
 
     /// Execute archive extraction with progress display
@@ -5441,12 +5549,19 @@ impl App {
             // List archive contents
             let _ = tx.send(ProgressMessage::Preparing("Reading archive contents...".to_string()));
             let (total_file_count, total_bytes, size_map) =
-                Self::list_archive_contents(
+                match Self::list_archive_contents(
                     &tar_cmd,
                     &archive_path_owned,
                     &archive_name_owned,
                     cancel_flag.clone(),
-                );
+                ) {
+                    Ok(contents) => contents,
+                    Err(e) => {
+                        let _ = tx.send(ProgressMessage::Error(extract_dir_owned, e));
+                        let _ = tx.send(ProgressMessage::Completed(0, 1));
+                        return;
+                    }
+                };
 
             // Check for cancellation after listing
             if cancel_flag.load(Ordering::Relaxed) {
@@ -5518,7 +5633,7 @@ impl App {
                     let stderr = child.stderr.take();
                     let mut completed_files = 0usize;
                     let mut completed_bytes = 0u64;
-                    let mut last_error_line: Option<String> = None;
+                    let mut stdout_error_lines: Vec<String> = Vec::new();
 
                     // Collect stderr in background for error messages
                     let stderr_handle = stderr.map(|stderr| {
@@ -5559,7 +5674,7 @@ impl App {
                                 Ok(_) => {
                                     let filename = line.trim_end();
                                     if filename.starts_with("tar:") || filename.starts_with("gtar:") {
-                                        last_error_line = Some(filename.to_string());
+                                        stdout_error_lines.push(filename.to_string());
                                     } else if !filename.is_empty() {
                                         completed_files += 1;
                                         // Look up file size from the map
@@ -5600,14 +5715,11 @@ impl App {
                                 let _ = tx.send(ProgressMessage::Completed(completed_files, 0));
                             } else {
                                 cleanup_extract_dir(&extract_path_clone);
-                                let error_msg = last_error_line
-                                    .or_else(|| {
-                                        stderr_handle
-                                            .and_then(|h| h.join().ok())
-                                            .filter(|s| !s.trim().is_empty())
-                                            .map(|s| s.lines().next().unwrap_or("tar extraction failed").to_string())
-                                    })
-                                    .unwrap_or_else(|| "tar extraction failed".to_string());
+                                let error_msg = Self::process_error_message(
+                                    stderr_handle.and_then(|h| h.join().ok()),
+                                    &stdout_error_lines,
+                                    "tar extraction failed",
+                                );
                                 let _ = tx.send(ProgressMessage::Error(
                                     extract_dir_owned,
                                     error_msg,
@@ -5979,6 +6091,81 @@ impl App {
         });
     }
 
+    fn start_pending_remote_editor_upload(&mut self) -> bool {
+        if self.remote_spinner.is_some() {
+            return false;
+        }
+
+        let (panel_idx, remote_path, local_path, generation) = {
+            let Some(editor) = self.editor_state.as_mut() else {
+                return false;
+            };
+            if !editor.remote_dirty {
+                return false;
+            }
+            let Some(origin) = editor.remote_origin.as_ref() else {
+                return false;
+            };
+            if origin.panel_index >= self.panels.len() {
+                editor.set_message("Saved locally, remote panel is no longer available", 50);
+                return false;
+            }
+            let is_connected = self.panels[origin.panel_index]
+                .remote_ctx
+                .as_ref()
+                .map(|ctx| matches!(ctx.status, ConnectionStatus::Connected))
+                .unwrap_or(false);
+            if !is_connected {
+                editor.set_message("Saved locally, remote connection is not available", 50);
+                return false;
+            }
+            (
+                origin.panel_index,
+                origin.remote_path.clone(),
+                editor.file_path.display().to_string(),
+                editor.remote_save_generation,
+            )
+        };
+
+        let ctx = match self.panels[panel_idx].remote_ctx.take() {
+            Some(ctx) => ctx,
+            None => {
+                if let Some(editor) = self.editor_state.as_mut() {
+                    editor.set_message("Saved locally, remote connection was disconnected", 50);
+                }
+                return false;
+            }
+        };
+        let (tx, rx) = mpsc::channel();
+
+        thread::spawn(move || {
+            let msg = match ctx.session.upload_file(&local_path, &remote_path) {
+                Ok(_) => Ok("Saved & uploaded to remote!".to_string()),
+                Err(e) => Err(format!("Saved locally, upload failed: {}", e)),
+            };
+            let _ = tx.send(RemoteSpinnerResult::PanelOp {
+                ctx,
+                panel_idx,
+                outcome: PanelOpOutcome::RemoteSave {
+                    message: msg,
+                    remote_path,
+                    generation,
+                    reload: true,
+                },
+            });
+        });
+
+        self.remote_spinner = Some(RemoteSpinner {
+            message: "Uploading...".to_string(),
+            started_at: Instant::now(),
+            receiver: rx,
+        });
+        if let Some(editor) = self.editor_state.as_mut() {
+            editor.set_message("Uploading latest local save...", 30);
+        }
+        true
+    }
+
     /// Poll the remote spinner for completion
     pub fn poll_remote_spinner(&mut self) {
         let result = if let Some(ref spinner) = self.remote_spinner {
@@ -6004,6 +6191,7 @@ impl App {
 
         // Spinner completed — remove it
         self.remote_spinner = None;
+        let mut retry_pending_remote_save = true;
 
         match result {
             RemoteSpinnerResult::Connected { result, panel_idx } => {
@@ -6097,6 +6285,57 @@ impl App {
                             }
                         }
                     }
+                    PanelOpOutcome::RemoteSave { message, remote_path, generation, reload } => {
+                        let (mut msg_text, is_err) = match &message {
+                            Ok(msg) => (msg.clone(), false),
+                            Err(e) => (format!("Error: {}", e), true),
+                        };
+                        let mut current_upload_failed = false;
+                        let mut editor_message_duration = if is_err { 50 } else { 30 };
+                        if let Some(ref mut editor) = self.editor_state {
+                            let is_current = editor.apply_remote_save_result(
+                                panel_idx,
+                                &remote_path,
+                                generation,
+                                is_err,
+                            );
+                            current_upload_failed = is_current && is_err;
+                            if !is_current && editor.remote_dirty {
+                                msg_text = if is_err {
+                                    "Previous upload failed; latest local save still needs upload"
+                                        .to_string()
+                                } else {
+                                    "Previous upload finished; latest local save still needs upload"
+                                        .to_string()
+                                };
+                            }
+                            editor_message_duration =
+                                if is_err || editor.remote_dirty { 50 } else { 30 };
+                        }
+                        if self.current_screen == Screen::FileEditor {
+                            if let Some(ref mut editor) = self.editor_state {
+                                editor.set_message(msg_text, editor_message_duration);
+                            }
+                        } else {
+                            self.show_message(&msg_text);
+                        }
+                        if current_upload_failed {
+                            retry_pending_remote_save = false;
+                        }
+                        if reload && !is_err {
+                            // Refresh local panels synchronously
+                            for i in 0..self.panels.len() {
+                                if !self.panels[i].is_remote() {
+                                    self.panels[i].selected_files.clear();
+                                    self.panels[i].load_files();
+                                }
+                            }
+                            // For the remote panel, spawn another list_dir
+                            if self.panels[panel_idx].is_remote() {
+                                self.spawn_remote_refresh(panel_idx);
+                            }
+                        }
+                    }
                     PanelOpOutcome::ListDir { entries, path, old_path } => {
                         match entries {
                             Ok(sftp_entries) => {
@@ -6162,6 +6401,10 @@ impl App {
                 }
             }
         }
+
+        if retry_pending_remote_save {
+            self.start_pending_remote_editor_upload();
+        }
     }
 
     /// 디렉토리로 이동하고 특정 파일에 커서를 위치시킴
@@ -6201,7 +6444,8 @@ impl App {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
 
     /// Counter for unique temp directory names
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -6370,6 +6614,22 @@ mod tests {
     }
 
     #[test]
+    fn test_show_tar_dialog_defaults_to_tar_archive() {
+        let temp_dir = create_temp_dir();
+        fs::write(temp_dir.join("file.txt"), "content").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.active_panel_mut().selected_files.insert("file.txt".to_string());
+
+        app.show_tar_dialog();
+
+        let dialog = app.dialog.as_ref().unwrap();
+        assert_eq!(dialog.dialog_type, DialogType::Tar);
+        assert_eq!(dialog.input, "file.txt.tar");
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
     fn test_app_switch_panel() {
         let temp_dir = create_temp_dir();
         fs::create_dir_all(temp_dir.join("panel1")).unwrap();
@@ -6456,6 +6716,111 @@ mod tests {
         app.show_message("Test message");
         assert_eq!(app.message, Some("Test message".to_string()));
         assert!(app.message_timer > 0);
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_execute_open_large_file_uses_viewer() {
+        let temp_dir = create_temp_dir();
+        let path = temp_dir.join("large.txt");
+        fs::write(&path, "content").unwrap();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.pending_large_file = Some(path.clone());
+
+        app.execute_open_large_file();
+
+        assert_eq!(app.current_screen, Screen::FileViewer);
+        assert!(app.viewer_state.is_some());
+        assert!(app.editor_state.is_none());
+        assert_eq!(app.viewer_state.as_ref().unwrap().file_path, path);
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_file_operation_disconnected_cancel_reports_cancelled() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut progress = FileOperationProgress::new(FileOperationType::Copy);
+        progress.is_active = true;
+        progress.receiver = Some(rx);
+        progress.cancel();
+        drop(tx);
+
+        assert!(!progress.poll());
+
+        let result = progress.result.unwrap();
+        assert_eq!(result.failure_count, 1);
+        assert_eq!(result.last_error.as_deref(), Some("Cancelled"));
+    }
+
+    #[test]
+    fn test_file_operation_disconnected_without_completion_reports_protocol_error() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut progress = FileOperationProgress::new(FileOperationType::Copy);
+        progress.is_active = true;
+        progress.receiver = Some(rx);
+        tx.send(ProgressMessage::TotalProgress(3, 5, 123, 456)).unwrap();
+        drop(tx);
+
+        assert!(!progress.poll());
+
+        let result = progress.result.unwrap();
+        assert_eq!(result.success_count, 0);
+        assert_eq!(result.failure_count, 1);
+        assert_eq!(
+            result.last_error.as_deref(),
+            Some("Operation worker exited without a completion message")
+        );
+    }
+
+    #[test]
+    fn test_process_error_message_preserves_all_available_lines() {
+        let stdout_errors = vec![
+            "tar: first stdout error".to_string(),
+            "tar: second stdout error".to_string(),
+        ];
+
+        let message = App::process_error_message(
+            Some("stderr line 1\nstderr line 2\n".to_string()),
+            &stdout_errors,
+            "fallback",
+        );
+
+        assert_eq!(
+            message,
+            "stderr line 1\nstderr line 2\ntar: first stdout error\ntar: second stdout error"
+        );
+        assert_eq!(App::process_error_message(Some("\n".to_string()), &[], "fallback"), "fallback");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_list_archive_contents_reports_tar_stderr_on_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = create_temp_dir();
+        let fake_tar = temp_dir.join("fake_tar");
+        let archive = temp_dir.join("bad.tar");
+
+        fs::write(
+            &fake_tar,
+            "#!/bin/sh\necho 'tar: bad archive' >&2\necho 'tar: missing end marker' >&2\nexit 2\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_tar, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&archive, "not a tar archive").unwrap();
+
+        let err = App::list_archive_contents(
+            fake_tar.to_str().unwrap(),
+            &archive,
+            "bad.tar",
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("tar: bad archive"));
+        assert!(err.contains("tar: missing end marker"));
 
         cleanup_temp_dir(&temp_dir);
     }
@@ -6678,7 +7043,7 @@ mod tests {
     }
 
     #[test]
-    fn test_clipboard_paste_same_folder_rejected() {
+    fn test_clipboard_paste_same_folder_creates_duplicate() {
         let temp_dir = create_temp_dir();
         fs::write(temp_dir.join("file.txt"), "content").unwrap();
 
@@ -6695,7 +7060,19 @@ mod tests {
         // Try to paste to the same folder
         app.clipboard_paste();
 
-        // Clipboard should still exist (paste was rejected)
+        // Wait for async duplicate operation to complete
+        while app.file_operation_progress.as_ref().map(|p| p.is_active).unwrap_or(false) {
+            if let Some(ref mut progress) = app.file_operation_progress {
+                progress.poll();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(temp_dir.join("file.txt").exists());
+        assert!(temp_dir.join("file_dup.txt").exists());
+        assert_eq!(fs::read_to_string(temp_dir.join("file_dup.txt")).unwrap(), "content");
+
+        // Clipboard should still exist (copy can be pasted multiple times)
         assert!(app.clipboard.is_some());
 
         cleanup_temp_dir(&temp_dir);

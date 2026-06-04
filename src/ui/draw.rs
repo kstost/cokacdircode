@@ -358,9 +358,16 @@ fn draw_function_bar(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     let label_style = Style::default().fg(theme.function_bar.label);
 
     // Build display strings for width calculation
-    let shortcuts: Vec<(String, &str)> = items.iter().map(|(action, label)| {
-        (kb.panel_first_key(*action).to_string(), *label)
-    }).collect();
+    let shortcuts: Vec<(String, &str)> = items.iter()
+        .filter_map(|(action, label)| {
+            let key = kb.panel_first_key(*action).to_string();
+            if key.is_empty() {
+                None
+            } else {
+                Some((key, *label))
+            }
+        })
+        .collect();
 
     let mut spans = Vec::new();
     for (key, label) in &shortcuts {

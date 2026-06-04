@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +78,27 @@ pub struct FileOperationResult {
 
 /// Buffer size for file copy (64KB)
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
+
+fn send_prepare_error_result(
+    progress_tx: &Sender<ProgressMessage>,
+    err: io::Error,
+    fallback_failure_count: usize,
+) {
+    let cancelled = err.kind() == io::ErrorKind::Interrupted;
+    let message = if cancelled {
+        "Cancelled".to_string()
+    } else {
+        err.to_string()
+    };
+    let failure_count = if cancelled {
+        1
+    } else {
+        fallback_failure_count
+    };
+
+    let _ = progress_tx.send(ProgressMessage::Error(String::new(), message));
+    let _ = progress_tx.send(ProgressMessage::Completed(0, failure_count));
+}
 
 /// Try to clone file using APFS clonefile (macOS only)
 /// Returns Ok(true) if clone succeeded, Ok(false) if should fallback to regular copy
@@ -218,7 +239,7 @@ where
 
     // Fallback to regular copy with progress
     let mut src_file = File::open(src)?;
-    let mut dest_file = File::create(dest)?;
+    let mut dest_file = OpenOptions::new().write(true).create_new(true).open(dest)?;
 
     let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
     let mut copied: u64 = 0;
@@ -324,7 +345,7 @@ fn copy_dir_recursive_with_progress_inner(
             return Err(io::Error::new(io::ErrorKind::Interrupted, "Cancelled"));
         }
 
-        fs::create_dir_all(dest)?;
+        fs::create_dir(dest)?;
 
         for entry in fs::read_dir(src)? {
             let entry = entry?;
@@ -426,7 +447,13 @@ fn copy_dir_recursive_with_progress_inner(
                         if e.kind() == io::ErrorKind::Interrupted {
                             return Err(e);
                         }
-                        let _ = progress_tx.send(ProgressMessage::Error(filename, e.to_string()));
+                        let error_kind = e.kind();
+                        let error_message = format!("{}: {}", src_path.display(), e);
+                        let _ = progress_tx.send(ProgressMessage::Error(
+                            filename,
+                            error_message.clone(),
+                        ));
+                        return Err(io::Error::new(error_kind, error_message));
                     }
                 }
             }
@@ -458,6 +485,7 @@ pub fn copy_files_with_progress(
 ) {
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut cancelled = false;
 
     // Build full paths for size calculation (excluding skipped files)
     let full_paths: Vec<PathBuf> = files.iter()
@@ -472,8 +500,7 @@ pub fn copy_files_with_progress(
     let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
         Ok((size, count)) => (size, count),
         Err(e) => {
-            let _ = progress_tx.send(ProgressMessage::Error("".to_string(), e.to_string()));
-            let _ = progress_tx.send(ProgressMessage::Completed(0, files.len()));
+            send_prepare_error_result(&progress_tx, e, files.len());
             return;
         }
     };
@@ -486,6 +513,7 @@ pub fn copy_files_with_progress(
 
     for file_path in &files {
         if cancel_flag.load(Ordering::Relaxed) {
+            cancelled = true;
             break;
         }
 
@@ -550,6 +578,7 @@ pub fn copy_files_with_progress(
                     if e.kind() == io::ErrorKind::Interrupted {
                         // Cancelled - clean up partial copy
                         let _ = fs::remove_dir_all(&dest);
+                        cancelled = true;
                         break;
                     }
                     failure_count += 1;
@@ -582,6 +611,7 @@ pub fn copy_files_with_progress(
                 }
                 Err(e) => {
                     if e.kind() == io::ErrorKind::Interrupted {
+                        cancelled = true;
                         break;
                     }
                     failure_count += 1;
@@ -591,7 +621,15 @@ pub fn copy_files_with_progress(
         }
     }
 
-    let _ = progress_tx.send(ProgressMessage::Completed(success_count, failure_count));
+    if cancelled {
+        let _ = progress_tx.send(ProgressMessage::Error(
+            String::new(),
+            "Cancelled".to_string(),
+        ));
+        let _ = progress_tx.send(ProgressMessage::Completed(success_count, failure_count + 1));
+    } else {
+        let _ = progress_tx.send(ProgressMessage::Completed(success_count, failure_count));
+    }
 }
 
 /// Move files with progress reporting
@@ -608,6 +646,7 @@ pub fn move_files_with_progress(
 ) {
     let mut success_count = 0;
     let mut failure_count = 0;
+    let mut cancelled = false;
 
     // Build full paths for size calculation (excluding skipped files)
     let full_paths: Vec<PathBuf> = files.iter()
@@ -622,8 +661,7 @@ pub fn move_files_with_progress(
     let (total_bytes, total_files) = match calculate_total_size(&full_paths, &cancel_flag) {
         Ok((size, count)) => (size, count),
         Err(e) => {
-            let _ = progress_tx.send(ProgressMessage::Error("".to_string(), e.to_string()));
-            let _ = progress_tx.send(ProgressMessage::Completed(0, files.len()));
+            send_prepare_error_result(&progress_tx, e, files.len());
             return;
         }
     };
@@ -639,6 +677,7 @@ pub fn move_files_with_progress(
 
     for file_path in &files {
         if cancel_flag.load(Ordering::Relaxed) {
+            cancelled = true;
             break;
         }
 
@@ -661,7 +700,14 @@ pub fn move_files_with_progress(
 
         // Get file/dir size for progress tracking
         let (item_size, item_files) = if src.is_dir() {
-            calculate_dir_size(&src, &cancel_flag).unwrap_or((0, 1))
+            match calculate_dir_size(&src, &cancel_flag) {
+                Ok(size) => size,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    cancelled = true;
+                    break;
+                }
+                Err(_) => (0, 1),
+            }
         } else {
             (fs::metadata(&src).map(|m| m.len()).unwrap_or(0), 1)
         };
@@ -718,9 +764,10 @@ pub fn move_files_with_progress(
     }
 
     // Handle cross-device moves (copy + delete)
-    if !needs_copy.is_empty() && !cancel_flag.load(Ordering::Relaxed) {
+    if !needs_copy.is_empty() && !cancelled {
         for (src, dest, _) in needs_copy {
             if cancel_flag.load(Ordering::Relaxed) {
+                cancelled = true;
                 break;
             }
 
@@ -787,6 +834,7 @@ pub fn move_files_with_progress(
                         } else {
                             let _ = fs::remove_file(&dest);
                         }
+                        cancelled = true;
                         break;
                     }
                     failure_count += 1;
@@ -796,7 +844,15 @@ pub fn move_files_with_progress(
         }
     }
 
-    let _ = progress_tx.send(ProgressMessage::Completed(success_count, failure_count));
+    if cancelled {
+        let _ = progress_tx.send(ProgressMessage::Error(
+            String::new(),
+            "Cancelled".to_string(),
+        ));
+        let _ = progress_tx.send(ProgressMessage::Completed(success_count, failure_count + 1));
+    } else {
+        let _ = progress_tx.send(ProgressMessage::Completed(success_count, failure_count));
+    }
 }
 
 /// Copy a file or directory
@@ -1352,7 +1408,8 @@ mod tests {
     use super::*;
     use std::fs::{self, File};
     use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc};
 
     /// Counter for unique temp directory names
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1373,6 +1430,11 @@ mod tests {
     /// Helper to cleanup temp directory
     fn cleanup_temp_dir(path: &Path) {
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[cfg(unix)]
+    fn create_socket(path: &Path) -> std::os::unix::net::UnixListener {
+        std::os::unix::net::UnixListener::bind(path).unwrap()
     }
 
     // ========== is_valid_filename tests ==========
@@ -1485,6 +1547,164 @@ mod tests {
         let result = copy_file(&src, &dest);
         assert!(result.is_err());
         assert!(result.unwrap_err().kind() == std::io::ErrorKind::AlreadyExists);
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_copy_file_with_progress_dest_exists_rejected() {
+        let temp_dir = create_temp_dir();
+        let src = temp_dir.join("src.txt");
+        let dest = temp_dir.join("dest.txt");
+
+        fs::write(&src, "new").unwrap();
+        fs::write(&dest, "original").unwrap();
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let result = copy_file_with_progress(&src, &dest, &cancel_flag, |_, _| {});
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "original");
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_copy_prepare_cancel_reports_single_cancelled_failure() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("src");
+        let target_dir = temp_dir.join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(source_dir.join("a.txt"), "a").unwrap();
+        fs::write(source_dir.join("b.txt"), "b").unwrap();
+
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        copy_files_with_progress(
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
+            &source_dir,
+            &target_dir,
+            HashSet::new(),
+            HashSet::new(),
+            cancel_flag,
+            tx,
+        );
+
+        let messages: Vec<ProgressMessage> = rx.try_iter().collect();
+        assert!(messages.iter().any(|msg| {
+            matches!(msg, ProgressMessage::Error(_, err) if err == "Cancelled")
+        }));
+        assert!(matches!(
+            messages.last(),
+            Some(ProgressMessage::Completed(0, 1))
+        ));
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_move_prepare_cancel_reports_single_cancelled_failure() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("src");
+        let target_dir = temp_dir.join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(source_dir.join("a.txt"), "a").unwrap();
+        fs::write(source_dir.join("b.txt"), "b").unwrap();
+
+        let cancel_flag = Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        move_files_with_progress(
+            vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")],
+            &source_dir,
+            &target_dir,
+            HashSet::new(),
+            HashSet::new(),
+            cancel_flag,
+            tx,
+        );
+
+        let messages: Vec<ProgressMessage> = rx.try_iter().collect();
+        assert!(messages.iter().any(|msg| {
+            matches!(msg, ProgressMessage::Error(_, err) if err == "Cancelled")
+        }));
+        assert!(matches!(
+            messages.last(),
+            Some(ProgressMessage::Completed(0, 1))
+        ));
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_dir_recursive_with_progress_propagates_child_file_error() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("src");
+        let dest_dir = temp_dir.join("dest");
+        fs::create_dir_all(&source_dir).unwrap();
+        let _listener = create_socket(&source_dir.join("socket"));
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let mut completed_bytes = 0;
+        let mut completed_files = 0;
+
+        let result = copy_dir_recursive_with_progress(
+            &source_dir,
+            &dest_dir,
+            &cancel_flag,
+            &tx,
+            &mut completed_bytes,
+            &mut completed_files,
+            0,
+            1,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+
+        let messages: Vec<ProgressMessage> = rx.try_iter().collect();
+        assert!(messages.iter().any(|msg| {
+            matches!(msg, ProgressMessage::Error(_, err) if err.contains("Cannot copy special file"))
+        }));
+
+        cleanup_temp_dir(&temp_dir);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_copy_files_with_progress_counts_child_file_error_as_directory_failure() {
+        let temp_dir = create_temp_dir();
+        let source_dir = temp_dir.join("src");
+        let target_dir = temp_dir.join("dest");
+        let nested_dir = source_dir.join("folder");
+        fs::create_dir_all(&nested_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        let _listener = create_socket(&nested_dir.join("socket"));
+
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        copy_files_with_progress(
+            vec![PathBuf::from("folder")],
+            &source_dir,
+            &target_dir,
+            HashSet::new(),
+            HashSet::new(),
+            cancel_flag,
+            tx,
+        );
+
+        let messages: Vec<ProgressMessage> = rx.try_iter().collect();
+        assert!(messages.iter().any(|msg| {
+            matches!(msg, ProgressMessage::Error(_, err) if err.contains("Cannot copy special file"))
+        }));
+        assert!(matches!(
+            messages.last(),
+            Some(ProgressMessage::Completed(0, 1))
+        ));
 
         cleanup_temp_dir(&temp_dir);
     }

@@ -430,6 +430,35 @@ impl ViewerState {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_from_viewer_clamps_cursor_after_reload() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("note.txt");
+        std::fs::write(&path, "one\ntwo\nthree\nfour\nfive").unwrap();
+
+        let mut viewer = ViewerState::new();
+        viewer.load_file(&path).unwrap();
+        viewer.scroll = 4;
+
+        std::fs::write(&path, "one").unwrap();
+
+        let mut app = App::new(temp_dir.path().to_path_buf(), temp_dir.path().to_path_buf());
+        app.viewer_state = Some(viewer);
+        app.current_screen = Screen::FileViewer;
+
+        handle_input(&mut app, KeyCode::Char('e'), KeyModifiers::NONE);
+
+        assert_eq!(app.current_screen, Screen::FileEditor);
+        let editor = app.editor_state.as_ref().unwrap();
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.scroll, 0);
+    }
+}
+
 pub fn draw(frame: &mut Frame, state: &mut ViewerState, area: Rect, theme: &Theme, kb: &crate::keybindings::Keybindings) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1390,13 +1419,21 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
                         let path = viewer_state.file_path.clone();
                         let viewer_scroll = viewer_state.scroll;
                         let mut editor = super::file_editor::EditorState::new();
-                        if editor.load_file(&path).is_ok() {
-                            editor.scroll = viewer_scroll;
-                            editor.cursor_line = viewer_scroll;
-                            editor.cursor_col = 0;
-                            app.editor_state = Some(editor);
-                            app.previous_screen = Some(Screen::FileViewer);
-                            app.current_screen = Screen::FileEditor;
+                        editor.set_syntax_colors(app.theme.syntax);
+                        match editor.load_file(&path) {
+                            Ok(_) => {
+                                let cursor_line =
+                                    viewer_scroll.min(editor.lines.len().saturating_sub(1));
+                                editor.scroll = cursor_line;
+                                editor.cursor_line = cursor_line;
+                                editor.cursor_col = 0;
+                                app.editor_state = Some(editor);
+                                app.previous_screen = Some(Screen::FileViewer);
+                                app.current_screen = Screen::FileEditor;
+                            }
+                            Err(e) => {
+                                app.show_message(&format!("Cannot edit file: {}", e));
+                            }
                         }
                     }
                 }
@@ -1456,4 +1493,3 @@ pub fn handle_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
         }
     }
 }
-

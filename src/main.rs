@@ -2083,6 +2083,116 @@ fn is_newer_version(latest: &str, current: &str) -> bool {
     false
 }
 
+fn file_operation_completion_message(
+    progress: &crate::ui::app::FileOperationProgress,
+    pending_tar_archive: Option<&str>,
+    pending_extract_dir: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(result) = progress.result.as_ref() else {
+        return (None, None);
+    };
+
+    if progress.operation_type == crate::services::file_ops::FileOperationType::Tar {
+        if result.failure_count == 0 {
+            let message = if let Some(archive_name) = pending_tar_archive {
+                format!("Created: {}", archive_name)
+            } else {
+                format!("Archived {} file(s)", result.success_count)
+            };
+            return (Some(message), None);
+        }
+
+        let error = result.last_error.as_deref().unwrap_or("Archive failed");
+        let tar_error = if error == "Cancelled" {
+            None
+        } else {
+            let archive_name = pending_tar_archive.unwrap_or("archive");
+            Some(format!(
+                "Failed to create archive '{}'.\n\n{}",
+                archive_name,
+                error
+            ))
+        };
+        return (Some(format!("Error: {}", error)), tar_error);
+    }
+
+    if progress.operation_type == crate::services::file_ops::FileOperationType::Untar {
+        if result.failure_count == 0 {
+            let message = if let Some(extract_dir) = pending_extract_dir {
+                format!("Extracted to: {}", extract_dir)
+            } else {
+                format!("Extracted {} file(s)", result.success_count)
+            };
+            return (Some(message), None);
+        }
+
+        let error = result.last_error.as_deref().unwrap_or("Extract failed");
+        let tar_error = if error == "Cancelled" {
+            None
+        } else if let Some(extract_dir) = pending_extract_dir {
+            Some(format!(
+                "Failed to extract archive to '{}'.\n\n{}",
+                extract_dir,
+                error
+            ))
+        } else {
+            Some(format!("Failed to extract archive.\n\n{}", error))
+        };
+        return (Some(format!("Error: {}", error)), tar_error);
+    }
+
+    let op_name = match progress.operation_type {
+        crate::services::file_ops::FileOperationType::Copy => "Copied",
+        crate::services::file_ops::FileOperationType::Move => "Moved",
+        crate::services::file_ops::FileOperationType::Tar => "Archived",
+        crate::services::file_ops::FileOperationType::Untar => "Extracted",
+        crate::services::file_ops::FileOperationType::Download => "Downloaded",
+        crate::services::file_ops::FileOperationType::Encrypt => "Encrypted",
+        crate::services::file_ops::FileOperationType::Decrypt => "Decrypted",
+    };
+    let total = result.success_count + result.failure_count;
+    if result.failure_count == 0 {
+        (
+            Some(format!("{} {} file(s)", op_name, result.success_count)),
+            None,
+        )
+    } else {
+        (
+            Some(format!(
+                "{} {}/{}. Error: {}",
+                op_name,
+                result.success_count,
+                total,
+                result.last_error.as_deref().unwrap_or("Unknown error")
+            )),
+            None,
+        )
+    }
+}
+
+fn completed_file_operation_succeeded(
+    progress: &crate::ui::app::FileOperationProgress,
+) -> bool {
+    progress
+        .result
+        .as_ref()
+        .map(|result| result.failure_count == 0 && result.success_count > 0)
+        .unwrap_or(false)
+}
+
+fn new_tar_error_dialog(message: String) -> crate::ui::app::Dialog {
+    crate::ui::app::Dialog {
+        dialog_type: crate::ui::app::DialogType::TarError,
+        input: String::new(),
+        cursor_pos: 0,
+        message,
+        completion: None,
+        selected_button: 0,
+        selection: None,
+        use_md5: false,
+    }
+}
+
 fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
@@ -2178,57 +2288,16 @@ fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Poll for file operation progress
+        let mut tar_error_dialog: Option<String> = None;
         let progress_message: Option<String> = if let Some(ref mut progress) = app.file_operation_progress {
             let still_active = progress.poll();
             if !still_active {
-                // Operation completed - extract result info before releasing borrow
-                let msg = if let Some(ref result) = progress.result {
-                    // Special handling for Tar - show archive name
-                    if progress.operation_type == crate::services::file_ops::FileOperationType::Tar {
-                        if result.failure_count == 0 {
-                            if let Some(ref archive_name) = app.pending_tar_archive {
-                                Some(format!("Created: {}", archive_name))
-                            } else {
-                                Some(format!("Archived {} file(s)", result.success_count))
-                            }
-                        } else {
-                            Some(format!("Error: {}", result.last_error.as_deref().unwrap_or("Archive failed")))
-                        }
-                    } else if progress.operation_type == crate::services::file_ops::FileOperationType::Untar {
-                        if result.failure_count == 0 {
-                            if let Some(ref extract_dir) = app.pending_extract_dir {
-                                Some(format!("Extracted to: {}", extract_dir))
-                            } else {
-                                Some(format!("Extracted {} file(s)", result.success_count))
-                            }
-                        } else {
-                            Some(format!("Error: {}", result.last_error.as_deref().unwrap_or("Extract failed")))
-                        }
-                    } else {
-                        let op_name = match progress.operation_type {
-                            crate::services::file_ops::FileOperationType::Copy => "Copied",
-                            crate::services::file_ops::FileOperationType::Move => "Moved",
-                            crate::services::file_ops::FileOperationType::Tar => "Archived",
-                            crate::services::file_ops::FileOperationType::Untar => "Extracted",
-                            crate::services::file_ops::FileOperationType::Download => "Downloaded",
-                            crate::services::file_ops::FileOperationType::Encrypt => "Encrypted",
-                            crate::services::file_ops::FileOperationType::Decrypt => "Decrypted",
-                        };
-                        let total = result.success_count + result.failure_count;
-                        if result.failure_count == 0 {
-                            Some(format!("{} {} file(s)", op_name, result.success_count))
-                        } else {
-                            Some(format!("{} {}/{}. Error: {}",
-                                op_name,
-                                result.success_count,
-                                total,
-                                result.last_error.as_deref().unwrap_or("Unknown error")
-                            ))
-                        }
-                    }
-                } else {
-                    None
-                };
+                let (msg, tar_error) = file_operation_completion_message(
+                    progress,
+                    app.pending_tar_archive.as_deref(),
+                    app.pending_extract_dir.as_deref(),
+                );
+                tar_error_dialog = tar_error;
                 msg
             } else {
                 None
@@ -2241,16 +2310,22 @@ fn run_app<B: ratatui::backend::Backend>(
         if progress_message.is_some() {
             // 원격 다운로드 완료 → 편집기/뷰어 열기
             if let Some(pending) = app.pending_remote_open.take() {
+                let download_succeeded = app
+                    .file_operation_progress
+                    .as_ref()
+                    .map(completed_file_operation_succeeded)
+                    .unwrap_or(false);
+
                 app.file_operation_progress = None;
                 app.dialog = None;
 
-                // tmp 파일 존재 확인으로 성공/실패 판단
+                // Completion result decides success; tmp existence is only a final sanity check.
                 let tmp_exists = match &pending {
                     crate::ui::app::PendingRemoteOpen::Editor { tmp_path, .. } => tmp_path.exists(),
                     crate::ui::app::PendingRemoteOpen::ImageViewer { tmp_path } => tmp_path.exists(),
                 };
 
-                if !tmp_exists {
+                if !download_succeeded || !tmp_exists {
                     if let Some(msg) = progress_message {
                         app.show_message(&msg);
                     } else {
@@ -2298,8 +2373,11 @@ fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
             } else {
+                let show_tar_error_dialog = tar_error_dialog.is_some();
                 if let Some(msg) = progress_message {
-                    app.show_message(&msg);
+                    if !show_tar_error_dialog {
+                        app.show_message(&msg);
+                    }
                 }
                 // Focus on created tar archive if applicable
                 if let Some(archive_name) = app.pending_tar_archive.take() {
@@ -2325,6 +2403,9 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
                 app.file_operation_progress = None;
                 app.dialog = None;
+                if let Some(message) = tar_error_dialog {
+                    app.dialog = Some(new_tar_error_dialog(message));
+                }
             }
         }
 
@@ -2691,5 +2772,79 @@ mod cli_token_tests {
         assert!(is_slack_token("xoxb-bot-token,xapp-app-token"));
         assert!(is_slack_token("slack:xoxb-bot-token,xapp-app-token"));
         assert!(!is_slack_token("123456789:telegram-token"));
+    }
+}
+
+#[cfg(test)]
+mod file_operation_completion_tests {
+    use super::{
+        completed_file_operation_succeeded, file_operation_completion_message,
+        new_tar_error_dialog,
+    };
+    use crate::services::file_ops::{FileOperationResult, FileOperationType};
+    use crate::ui::app::{DialogType, FileOperationProgress};
+
+    #[test]
+    fn tar_failure_returns_status_and_modal_message_with_full_error() {
+        let mut progress = FileOperationProgress::new(FileOperationType::Tar);
+        progress.result = Some(FileOperationResult {
+            success_count: 0,
+            failure_count: 1,
+            last_error: Some("line 1\nline 2".to_string()),
+        });
+
+        let (status, modal) =
+            file_operation_completion_message(&progress, Some("bad.tar"), None);
+
+        assert_eq!(status, Some("Error: line 1\nline 2".to_string()));
+        assert_eq!(
+            modal,
+            Some("Failed to create archive 'bad.tar'.\n\nline 1\nline 2".to_string())
+        );
+    }
+
+    #[test]
+    fn tar_cancel_does_not_return_modal_message() {
+        let mut progress = FileOperationProgress::new(FileOperationType::Tar);
+        progress.result = Some(FileOperationResult {
+            success_count: 0,
+            failure_count: 1,
+            last_error: Some("Cancelled".to_string()),
+        });
+
+        let (status, modal) =
+            file_operation_completion_message(&progress, Some("bad.tar"), None);
+
+        assert_eq!(status, Some("Error: Cancelled".to_string()));
+        assert_eq!(modal, None);
+    }
+
+    #[test]
+    fn tar_error_dialog_starts_at_top() {
+        let dialog = new_tar_error_dialog("full error".to_string());
+
+        assert_eq!(dialog.dialog_type, DialogType::TarError);
+        assert_eq!(dialog.cursor_pos, 0);
+        assert_eq!(dialog.message, "full error");
+    }
+
+    #[test]
+    fn completed_operation_success_requires_success_without_failures() {
+        let mut progress = FileOperationProgress::new(FileOperationType::Download);
+        assert!(!completed_file_operation_succeeded(&progress));
+
+        progress.result = Some(FileOperationResult {
+            success_count: 0,
+            failure_count: 1,
+            last_error: Some("failed".to_string()),
+        });
+        assert!(!completed_file_operation_succeeded(&progress));
+
+        progress.result = Some(FileOperationResult {
+            success_count: 1,
+            failure_count: 0,
+            last_error: None,
+        });
+        assert!(completed_file_operation_succeeded(&progress));
     }
 }

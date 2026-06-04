@@ -371,7 +371,7 @@ pub fn default_panel_keybindings() -> HashMap<PanelAction, Vec<String>> {
 
     // Tools
     m.insert(PanelAction::ProcessManager, vec!["//Process manager".into(), "p".into()]);
-    m.insert(PanelAction::AIScreen, vec!["//AI assistant".into(), ".".into()]);
+    m.insert(PanelAction::AIScreen, vec!["//AI assistant shortcut disabled".into()]);
     m.insert(PanelAction::ToggleBookmark, vec!["//Toggle bookmark".into(), "'".into()]);
 
     // Git / Diff
@@ -942,8 +942,17 @@ pub struct Keybindings {
 
 impl Keybindings {
     pub fn from_config(config: &KeybindingsConfig) -> Self {
+        let mut panel_defaults = default_panel_keybindings();
+        let mut panel_overrides = config.file_panel.clone();
+
+        // Keep the AI assistant implementation intact, but do not expose it as
+        // a panel shortcut. This also prevents older settings.json files that
+        // still contain "." for ai_screen from re-enabling the key.
+        panel_defaults.remove(&PanelAction::AIScreen);
+        panel_overrides.remove(&PanelAction::AIScreen);
+
         Self {
-            panel: ActionMap::build(&default_panel_keybindings(), &config.file_panel),
+            panel: ActionMap::build(&panel_defaults, &panel_overrides),
             editor: ActionMap::build(&default_editor_keybindings(), &config.file_editor),
             file_info: ActionMap::build(&default_file_info_keybindings(), &config.file_info),
             system_info: ActionMap::build(&default_system_info_keybindings(), &config.system_info),
@@ -1239,6 +1248,25 @@ mod tests {
         let config = KeybindingsConfig::default();
         let kb = Keybindings::from_config(&config);
         assert_eq!(kb.panel_action(KeyCode::F(12), KeyModifiers::NONE), None);
+    }
+
+    #[test]
+    fn test_ai_screen_panel_shortcut_is_disabled() {
+        let config = KeybindingsConfig::default();
+        let kb = Keybindings::from_config(&config);
+
+        assert_eq!(kb.panel_action(KeyCode::Char('.'), KeyModifiers::NONE), None);
+        assert!(kb.panel_first_key(PanelAction::AIScreen).is_empty());
+    }
+
+    #[test]
+    fn test_ai_screen_panel_shortcut_stays_disabled_with_legacy_config() {
+        let json = r#"{"file_panel": {"ai_screen": ["."]}}"#;
+        let config: KeybindingsConfig = serde_json::from_str(json).unwrap();
+        let kb = Keybindings::from_config(&config);
+
+        assert_eq!(kb.panel_action(KeyCode::Char('.'), KeyModifiers::NONE), None);
+        assert!(kb.panel_first_key(PanelAction::AIScreen).is_empty());
     }
 
     #[test]

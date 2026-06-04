@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::{
+    event::{KeyCode, KeyModifiers},
+    terminal,
+};
 use unicode_width::UnicodeWidthChar;
 use ratatui::{
     layout::Rect,
@@ -19,6 +22,11 @@ use super::{
     app::{App, ConflictResolution, ConflictState, Dialog, DialogType, GitLogDiffState, PathCompletion, RemoteConnectState, SettingsState, fuzzy_match},
     theme::Theme,
 };
+
+const TAR_ERROR_DIALOG_MARGIN: u16 = 6;
+const TAR_ERROR_DIALOG_MIN_WIDTH: u16 = 60;
+const TAR_ERROR_DIALOG_MAX_WIDTH: u16 = 100;
+const TAR_ERROR_DIALOG_MIN_HEIGHT: u16 = 12;
 
 /// 입력 문자열이 경로인지 판별 ('/', '~', 또는 Windows 드라이브 문자 'C:\' 등)
 fn is_path_input(input: &str) -> bool {
@@ -268,6 +276,84 @@ fn apply_completion(dialog: &mut Dialog, base_dir: &Path, suggestion: &str) {
     dialog.cursor_pos = dialog.input.chars().count();
 }
 
+fn wrap_dialog_text(text: &str, max_width: usize) -> Vec<String> {
+    let max_width = max_width.max(1);
+
+    let mut wrapped = Vec::new();
+    for raw_line in text.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+
+        if line.is_empty() {
+            wrapped.push(String::new());
+            continue;
+        }
+
+        let mut current = String::new();
+        let mut current_width = 0usize;
+
+        for ch in line.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+
+            if ch_width > 0 && current_width > 0 && current_width + ch_width > max_width {
+                wrapped.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+
+            current.push(ch);
+            current_width += ch_width;
+        }
+
+        wrapped.push(current);
+    }
+
+    if wrapped.is_empty() {
+        wrapped.push(String::new());
+    }
+
+    wrapped
+}
+
+fn tar_error_dialog_size(area: Rect) -> (u16, u16, u16) {
+    let width = area
+        .width
+        .saturating_sub(TAR_ERROR_DIALOG_MARGIN)
+        .max(TAR_ERROR_DIALOG_MIN_WIDTH)
+        .min(TAR_ERROR_DIALOG_MAX_WIDTH);
+    let height = area
+        .height
+        .saturating_sub(TAR_ERROR_DIALOG_MARGIN)
+        .max(TAR_ERROR_DIALOG_MIN_HEIGHT);
+
+    (width, height, height)
+}
+
+fn tar_error_dialog_area(area: Rect) -> Rect {
+    let (width, height, max_height) = tar_error_dialog_size(area);
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let max_height = max_height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(max_height)) / 2;
+
+    Rect::new(x, y, width, height)
+}
+
+fn tar_error_max_scroll_for_area(message: &str, area: Rect) -> usize {
+    let dialog_area = tar_error_dialog_area(area);
+    let inner_width = dialog_area.width.saturating_sub(2);
+    let inner_height = dialog_area.height.saturating_sub(2);
+    let message_width = inner_width.saturating_sub(2);
+    let message_height = inner_height.saturating_sub(4);
+    let wrapped_lines = wrap_dialog_text(message, message_width as usize);
+
+    wrapped_lines.len().saturating_sub(message_height as usize)
+}
+
+fn current_terminal_area() -> Rect {
+    let (width, height) = terminal::size().unwrap_or((80, 24));
+    Rect::new(0, 0, width, height)
+}
+
 pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, theme: &Theme) {
     // 다이얼로그 크기 상수
     const MAX_COMPLETION_ITEMS: u16 = 8;      // 자동완성 목록 최대 표시 항목 수
@@ -308,6 +394,9 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
         DialogType::ExtensionHandlerError => {
             // Error dialog: wider to accommodate error messages, taller for multi-line
             (65, 8, 8)
+        }
+        DialogType::TarError => {
+            tar_error_dialog_size(area)
         }
         DialogType::Goto => {
             let w = area.width.saturating_sub(DIALOG_MARGIN).max(DIALOG_MIN_WIDTH);
@@ -454,6 +543,9 @@ pub fn draw_dialog(frame: &mut Frame, app: &App, dialog: &Dialog, area: Rect, th
         }
         DialogType::ExtensionHandlerError => {
             draw_error_dialog(frame, dialog, dialog_area, theme, " Handler Error ");
+        }
+        DialogType::TarError => {
+            draw_tar_error_dialog(frame, dialog, dialog_area, theme);
         }
         DialogType::BinaryFileHandler => {
             draw_binary_file_handler_dialog(frame, dialog, dialog_area, theme);
@@ -1141,6 +1233,71 @@ fn draw_error_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &The
         Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
         button_area,
     );
+}
+
+/// Scrollable tar error dialog. The message is wrapped before rendering so the
+/// scroll offset addresses the exact lines that are displayed.
+fn draw_tar_error_dialog(frame: &mut Frame, dialog: &Dialog, area: Rect, theme: &Theme) {
+    let block = Block::default()
+        .title(" Tar Error ")
+        .title_style(Style::default().fg(theme.confirm_dialog.title).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.confirm_dialog.border))
+        .style(Style::default().bg(theme.confirm_dialog.bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let message_height = inner.height.saturating_sub(4);
+    let message_width = inner.width.saturating_sub(2);
+    let message_area = Rect::new(inner.x + 1, inner.y + 1, message_width, message_height);
+    let wrapped_lines = wrap_dialog_text(&dialog.message, message_width as usize);
+    let visible_height = message_height as usize;
+    let max_scroll = wrapped_lines.len().saturating_sub(visible_height);
+    let scroll_offset = dialog.cursor_pos.min(max_scroll);
+
+    if visible_height > 0 && message_width > 0 {
+        let lines: Vec<Line> = wrapped_lines
+            .iter()
+            .skip(scroll_offset)
+            .take(visible_height)
+            .map(|line| {
+                Line::from(Span::styled(
+                    line.clone(),
+                    Style::default().fg(theme.confirm_dialog.message_text),
+                ))
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), message_area);
+    }
+
+    if wrapped_lines.len() > visible_height && visible_height > 0 && inner.height >= 4 {
+        let first_visible = scroll_offset + 1;
+        let last_visible = (scroll_offset + visible_height).min(wrapped_lines.len());
+        let scroll_info = format!("{}-{}/{}", first_visible, last_visible, wrapped_lines.len());
+        let scroll_area = Rect::new(inner.x + 1, inner.y + inner.height - 3, message_width, 1);
+        frame.render_widget(
+            Paragraph::new(scroll_info)
+                .style(Style::default().fg(theme.confirm_dialog.message_text))
+                .alignment(ratatui::layout::Alignment::Right),
+            scroll_area,
+        );
+    }
+
+    if inner.height >= 2 && message_width > 0 {
+        let selected_style = Style::default()
+            .fg(theme.confirm_dialog.button_selected_text)
+            .bg(theme.confirm_dialog.button_selected_bg);
+
+        let buttons = Line::from(vec![
+            Span::styled(" OK ", selected_style),
+        ]);
+        let button_area = Rect::new(inner.x + 1, inner.y + inner.height - 2, message_width, 1);
+        frame.render_widget(
+            Paragraph::new(buttons).alignment(ratatui::layout::Alignment::Center),
+            button_area,
+        );
+    }
 }
 
 #[allow(dead_code)]
@@ -2266,6 +2423,27 @@ pub fn handle_dialog_input(app: &mut App, code: KeyCode, modifiers: KeyModifiers
             DialogType::ExtensionHandlerError => {
                 // Simple error dialog - any key closes it
                 match code {
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char(_) => {
+                        app.dialog = None;
+                    }
+                    _ => {}
+                }
+            }
+            DialogType::TarError => {
+                let max_scroll =
+                    tar_error_max_scroll_for_area(&dialog.message, current_terminal_area());
+                match code {
+                    KeyCode::Up => {
+                        dialog.cursor_pos =
+                            dialog.cursor_pos.min(max_scroll).saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        dialog.cursor_pos =
+                            dialog.cursor_pos.min(max_scroll).saturating_add(1).min(max_scroll);
+                    }
+                    KeyCode::Home => {
+                        dialog.cursor_pos = 0;
+                    }
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char(_) => {
                         app.dialog = None;
                     }
@@ -4338,6 +4516,92 @@ mod tests {
     /// Helper to cleanup temp directory
     fn cleanup_temp_test_dir(path: &Path) {
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_wrap_dialog_text_preserves_lines_and_wraps_exactly() {
+        assert_eq!(wrap_dialog_text("", 10), vec!["".to_string()]);
+        assert_eq!(
+            wrap_dialog_text("Failed\n\nreason", 80),
+            vec!["Failed".to_string(), String::new(), "reason".to_string()]
+        );
+        assert_eq!(
+            wrap_dialog_text("abcdef", 3),
+            vec!["abc".to_string(), "def".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_tar_error_max_scroll_uses_dialog_layout() {
+        let message = (0..30)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            tar_error_max_scroll_for_area(&message, Rect::new(0, 0, 80, 24)),
+            18
+        );
+    }
+
+    #[test]
+    fn test_tar_error_dialog_scrolls_and_closes() {
+        let temp_dir = create_temp_test_dir();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        app.dialog = Some(Dialog {
+            dialog_type: DialogType::TarError,
+            input: String::new(),
+            cursor_pos: 0,
+            message: "Failed to create archive.\n\nreason".to_string(),
+            completion: None,
+            selected_button: 0,
+            selection: None,
+            use_md5: false,
+        });
+
+        handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.dialog.as_ref().unwrap().cursor_pos, 0);
+
+        handle_dialog_input(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(app.dialog.as_ref().unwrap().cursor_pos, 0);
+
+        handle_dialog_input(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(app.dialog.is_none());
+        cleanup_temp_test_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_tar_error_dialog_scroll_clamps_large_offsets() {
+        let temp_dir = create_temp_test_dir();
+        let mut app = App::new(temp_dir.clone(), temp_dir.clone());
+        let message = (0..200)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let max_scroll = tar_error_max_scroll_for_area(&message, current_terminal_area());
+
+        app.dialog = Some(Dialog {
+            dialog_type: DialogType::TarError,
+            input: String::new(),
+            cursor_pos: usize::MAX,
+            message,
+            completion: None,
+            selected_button: 0,
+            selection: None,
+            use_md5: false,
+        });
+
+        handle_dialog_input(&mut app, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            app.dialog.as_ref().unwrap().cursor_pos,
+            max_scroll.saturating_sub(1)
+        );
+
+        handle_dialog_input(&mut app, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(app.dialog.as_ref().unwrap().cursor_pos, max_scroll);
+
+        cleanup_temp_test_dir(&temp_dir);
     }
 
     // ========== expand_path_string tests ==========

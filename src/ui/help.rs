@@ -368,25 +368,27 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
     // ═══════════════════════════════════════════════════════════════════════
     // Section 10: AI Assistant
     // ═══════════════════════════════════════════════════════════════════════
-    lines.push(section("AI Assistant"));
-    let aik = |action: AIScreenAction, desc: &str| -> Line<'static> {
-        let key_display = kb.ai_screen_first_key(action).to_string();
-        Line::from(vec![
-            Span::styled(format!("  {:28}", key_display), key_style),
-            Span::styled(desc.to_string(), desc_style),
-        ])
-    };
-    lines.push(pk(PanelAction::AIScreen, "Open AI assistant"));
-    lines.push(aik(AIScreenAction::Submit, "Send message"));
-    lines.push(aik(AIScreenAction::InsertNewline, "New line in input"));
-    lines.push(aik(AIScreenAction::ScrollHistoryUp, "Scroll response up"));
-    lines.push(aik(AIScreenAction::ScrollHistoryDown, "Scroll response down"));
-    lines.push(aik(AIScreenAction::PageUp, "Page scroll up"));
-    lines.push(aik(AIScreenAction::PageDown, "Page scroll down"));
-    lines.push(aik(AIScreenAction::ClearHistory, "Clear conversation"));
-    lines.push(aik(AIScreenAction::ToggleFullscreen, "Toggle fullscreen"));
-    lines.push(aik(AIScreenAction::Escape, "Close assistant"));
-    lines.push(Line::from(""));
+    if !kb.panel_first_key(PanelAction::AIScreen).is_empty() {
+        lines.push(section("AI Assistant"));
+        let aik = |action: AIScreenAction, desc: &str| -> Line<'static> {
+            let key_display = kb.ai_screen_first_key(action).to_string();
+            Line::from(vec![
+                Span::styled(format!("  {:28}", key_display), key_style),
+                Span::styled(desc.to_string(), desc_style),
+            ])
+        };
+        lines.push(pk(PanelAction::AIScreen, "Open AI assistant"));
+        lines.push(aik(AIScreenAction::Submit, "Send message"));
+        lines.push(aik(AIScreenAction::InsertNewline, "New line in input"));
+        lines.push(aik(AIScreenAction::ScrollHistoryUp, "Scroll response up"));
+        lines.push(aik(AIScreenAction::ScrollHistoryDown, "Scroll response down"));
+        lines.push(aik(AIScreenAction::PageUp, "Page scroll up"));
+        lines.push(aik(AIScreenAction::PageDown, "Page scroll down"));
+        lines.push(aik(AIScreenAction::ClearHistory, "Clear conversation"));
+        lines.push(aik(AIScreenAction::ToggleFullscreen, "Toggle fullscreen"));
+        lines.push(aik(AIScreenAction::Escape, "Close assistant"));
+        lines.push(Line::from(""));
+    }
 
     // ═══════════════════════════════════════════════════════════════════════
     // Section 11: Search
@@ -530,6 +532,9 @@ fn build_help_content(theme: &Theme, kb: &Keybindings) -> Vec<Line<'static>> {
         let mut row_width: usize = 2;
         for (action, label) in &qr_items {
             let key_str = kb.panel_first_key(*action).to_string();
+            if key_str.is_empty() {
+                continue;
+            }
             let entry_width = key_str.len() + 1 + label.len(); // key:label
             if row_width + entry_width > qr_wrap_width && row_width > 2 {
                 lines.push(Line::from(std::mem::take(&mut row_spans)));
