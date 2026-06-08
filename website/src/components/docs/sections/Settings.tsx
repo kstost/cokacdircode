@@ -1,5 +1,5 @@
 import { Link } from 'react-router-dom'
-import { SectionTitle, SubSection, P, IC, InfoBox, CommandTable } from '../DocComponents'
+import { SectionTitle, SubSection, P, IC, InfoBox, CommandTable, CodeBlock } from '../DocComponents'
 import { useLanguage } from '../../LanguageContext'
 
 export default function Settings() {
@@ -17,6 +17,7 @@ export default function Settings() {
             ['/debug', String(t('Enable/disable debug logging', '디버그 로깅 활성화/비활성화'))],
             ['/effort <level>', String(t('Set Claude/Codex effort level', 'Claude/Codex effort 수준 설정'))],
             ['/fast', String(t('Toggle Codex fast service tier', 'Codex fast service tier 전환'))],
+            ['/stt_model <model>', String(t('Set speech recognition model', '음성 인식 모델 설정'))],
             ['/setpollingtime <ms>', String(t('Set API polling interval', 'API 폴링 간격 설정'))],
             ['/envvars', String(t('Show all environment variables (owner only)', '모든 환경변수 표시 (소유자 전용)'))],
             ['/help', String(t('Display full command reference', '전체 명령어 참조 표시'))],
@@ -71,6 +72,22 @@ export default function Settings() {
         <P>{t(
           <><IC>/fast off</IC> removes the per-chat override and Codex uses its default/configured service tier.</>,
           <><IC>/fast off</IC>는 채팅별 override를 제거하며 Codex는 기본/설정된 service tier를 사용합니다.</>
+        )}</P>
+      </SubSection>
+
+      <SubSection title="/stt_model">
+        <P>{t(
+          <>Sets the transcriptor speech recognition model for the current chat. Bare model names are passed as <IC>--model-name</IC> and override an inherited <IC>TRANSCRIPTOR_MODEL</IC> value for that run; <IC>path:&lt;model_path&gt;</IC> is passed as <IC>--model</IC>.</>,
+          <>현재 채팅의 transcriptor 음성 인식 모델을 설정합니다. 일반 모델명은 <IC>--model-name</IC>으로 전달되고 해당 실행에서 상속된 <IC>TRANSCRIPTOR_MODEL</IC> 값을 무시하며, <IC>path:&lt;model_path&gt;</IC>는 <IC>--model</IC>로 전달됩니다.</>
+        )}</P>
+        <CodeBlock code={`/stt_model
+/stt_model small
+/stt_model large-v3-turbo
+/stt_model path:/absolute/model.bin
+/stt_model reset`} />
+        <P>{t(
+          'If the selected model is not cached yet, Telegram STT progress messages show the model download before recognition continues.',
+          '선택한 모델이 아직 캐시되어 있지 않으면 Telegram STT 진행 메시지가 모델 다운로드를 먼저 표시한 뒤 인식을 이어갑니다.'
         )}</P>
       </SubSection>
 

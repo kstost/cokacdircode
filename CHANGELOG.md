@@ -1,5 +1,25 @@
 # Changelog — cokacdir
 
+## 0.6.19 — 2026-06-08
+
+- **Telegram audio and album handling now keeps upload context atomic when STT fails or is cancelled.** Mixed albums can contain regular files plus Telegram audio/voice items that are transcribed instead of saved. If an STT item fails, `/stop` cancels processing, or the STT confirmation cannot be sent, the bot now removes only the `[File uploaded]` pending/history records created by that same album before releasing the reserved slot. Older pending uploads and unrelated session history are left intact, so a later prompt no longer receives stale file context from a failed album while still preserving pre-existing context.
+
+- **STT cancellation now reaches the pre-process download path.** The cancellation token is checked while waiting for Telegram `getFile`, audio HTTP download, transcriptor binary download, and chunk reads, not only after the transcriptor child process starts. Direct STT and direct album tasks also run under the correct dispatch-id scope and register panic recovery for their background task, so a panic in those fire-and-forget paths can reclaim the chat's busy slot instead of leaving it stuck.
+
+- **Telegram STT now follows the current transcriptor progress-event protocol.** When speech recognition starts, the bot sends `Recognizing speech..`; on success it edits that same message to `🗣️ <recognized text>`, and on failure or cancellation it edits the same message to the error/stopped state. The transcriptor subprocess now runs with `--progress json`, drains stdout and stderr independently while the child is still running, parses stderr NDJSON progress events, and uses stdout only for the final result JSON. This fixes the previous false `Invalid transcriptor JSON output: EOF while parsing a value` failure while also letting the bot surface long-running model setup before transcription completes.
+
+- **Users are now told when transcriptor downloads an STT model.** If transcriptor reports `model_download_required`, `model_download_started`, `model_download_progress`, or `model_download_finished`, the existing `Recognizing speech..` message is edited into a throttled download progress message with model name, percent, and MB counters. Cached-model loads keep the same `Recognizing speech..` text unless model loading takes several seconds, avoiding a noisy `Loading speech model..` flicker before inference starts.
+
+- **New `/stt_model` Telegram command configures the transcriptor model per chat.** The setting is stored in `bot_settings.json` as `stt_models`; bare values such as `tiny`, `base`, `small`, `medium`, `large-v3`, and `large-v3-turbo` are passed as `--model-name`, while `path:<model_path>` is passed as `--model`. `/stt_model reset` removes the override and lets transcriptor use its own environment, saved config, or default model.
+
+- **The runtime transcriptor binary install is now platform-correct and feature-checked.** Windows installs use `transcriptor.exe`, and existing local binaries are checked for `--progress` support before reuse. Older binaries that do not support the current progress-event protocol are replaced by the current platform artifact; empty, oversized, failed, or cancelled downloads are discarded.
+
+- **STT model overrides and transcriptor binary replacement are now safer under real runtime conditions.** Bare `/stt_model <name>` settings suppress only the child process's inherited `TRANSCRIPTOR_MODEL` value so the chat override is not hidden by the parent environment, while `/stt_model path:...` and reset keep transcriptor's documented path/env/config/default behavior. Transcriptor binary install and replacement are also serialized with process-local and lock-file guards, so concurrent first STT requests no longer race while replacing an older binary.
+
+- **Docs now match the Telegram STT behavior and settings surface.** The Markdown docs, website docs, and README command list state that non-audio uploads are saved to the workspace, Telegram audio and voice uploads are transcribed as STT input, model downloads are shown in the progress message, and `/stt_model` controls the chat's transcriptor model.
+
+---
+
 ## 0.6.16 — 2026-05-25
 
 - **New `/fast` Telegram command toggles Codex fast service tier for the current chat.** The command is intentionally Codex-only: it checks the active provider with the same `get_model` + `detect_provider` path used by `/effort`, rejects Claude/Gemini/OpenCode with a clear provider-specific message, and accepts `/fast`, `/fast on`, `/fast off`, and `/fast status` (with aliases such as `enable`, `disable`, `reset`, and `default`). With no argument it toggles the current chat's value; `status` reports the effective stored state without mutating anything; `off` removes the per-chat override rather than writing a persisted `false`, so the absence of a key keeps meaning "use the Codex CLI default/configured service tier." The command is owner-only, registered in Telegram's BotCommand list, routed via exact slash-command matching, and listed in `/help` under Settings.

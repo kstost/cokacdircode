@@ -10,8 +10,8 @@ export default function FileTransfer() {
 
       <SubSection title={String(t('Upload', '업로드'))}>
         <P>{t(
-          'Send any file, photo, or media to the bot. It will be saved to the session\'s working directory. A workspace is auto-created if none exists.',
-          '봇에게 파일, 사진 또는 미디어를 전송하세요. 세션의 작업 디렉토리에 저장됩니다. 워크스페이스가 없으면 자동 생성됩니다.'
+          'Send files, photos, or media to the bot. Non-audio uploads are saved to the session\'s working directory; Telegram audio and voice uploads are transcribed as STT input. A workspace is auto-created if none exists.',
+          '봇에게 파일, 사진 또는 미디어를 전송하세요. 오디오가 아닌 업로드는 세션의 작업 디렉토리에 저장되고, Telegram 오디오와 음성은 STT 입력으로 변환됩니다. 워크스페이스가 없으면 자동 생성됩니다.'
         )}</P>
 
         <CommandTable
@@ -20,8 +20,8 @@ export default function FileTransfer() {
             [String(t('Photo', '사진')), 'photo_<id>.jpg'],
             [String(t('Document', '문서')), String(t('Original filename preserved', '원본 파일명 유지'))],
             [String(t('Video', '동영상')), String(t('video_<id>.mp4 or original filename', 'video_<id>.mp4 또는 원본 파일명'))],
-            [String(t('Audio', '오디오')), String(t('audio_<id>.mp3 or original filename', 'audio_<id>.mp3 또는 원본 파일명'))],
-            [String(t('Voice', '음성')), 'voice_<id>.ogg'],
+            [String(t('Audio', '오디오')), String(t('Telegram: transcribed as STT input', 'Telegram: STT 입력으로 변환'))],
+            [String(t('Voice', '음성')), String(t('Telegram: transcribed as STT input', 'Telegram: STT 입력으로 변환'))],
             [String(t('Animation (GIF)', '애니메이션 (GIF)')), String(t('animation_<id>.mp4 or original filename', 'animation_<id>.mp4 또는 원본 파일명'))],
             [String(t('Video Note', '동영상 메모')), 'videonote_<id>.mp4'],
           ]}
@@ -40,10 +40,25 @@ export default function FileTransfer() {
         )}</P>
       </SubSection>
 
+      <SubSection title={String(t('Speech Recognition', '음성 인식'))}>
+        <P>{t(
+          <>Telegram audio and voice uploads are recognized with transcriptor. The bot first replies with <IC>Recognizing speech..</IC> and edits that same message when recognition finishes. If transcriptor needs to download a model first, the same message shows the model download progress.</>,
+          <>Telegram 오디오와 음성 업로드는 transcriptor로 인식됩니다. 봇은 먼저 <IC>Recognizing speech..</IC>라고 응답하고, 인식이 끝나면 같은 메시지를 수정합니다. transcriptor가 먼저 모델을 다운로드해야 하면 같은 메시지에 모델 다운로드 진행률이 표시됩니다.</>
+        )}</P>
+        <P>{t(
+          <>Use <IC>/stt_model</IC> to view or set the chat's STT model. Bare model names are passed as <IC>--model-name</IC> and override an inherited <IC>TRANSCRIPTOR_MODEL</IC> value for that run; <IC>path:&lt;model_path&gt;</IC> is passed as <IC>--model</IC>.</>,
+          <><IC>/stt_model</IC>로 이 채팅의 STT 모델을 보거나 설정할 수 있습니다. 일반 모델명은 <IC>--model-name</IC>으로 전달되고 해당 실행에서 상속된 <IC>TRANSCRIPTOR_MODEL</IC> 값을 무시하며, <IC>path:&lt;model_path&gt;</IC>는 <IC>--model</IC>로 전달됩니다.</>
+        )}</P>
+        <CodeBlock code={`/stt_model small
+/stt_model large-v3-turbo
+/stt_model path:/absolute/model.bin
+/stt_model reset`} />
+      </SubSection>
+
       <SubSection title={String(t('Multiple Attachments at Once', '여러 첨부를 한 번에 전송'))}>
         <P>{t(
-          'You can send multiple files or photos in a single message — Telegram albums, Discord multi-attachment messages, and Slack multi-file uploads are all supported. The bot processes them atomically: every file in the group is saved to the workspace, and the message caption (typically attached to the first item) is used as the AI instruction for the whole batch.',
-          '한 메시지에 여러 파일이나 사진을 함께 전송할 수 있습니다 — Telegram 앨범, Discord 다중 첨부 메시지, Slack 다중 파일 업로드 모두 지원됩니다. 봇은 이들을 한꺼번에 처리합니다: 그룹의 모든 파일이 워크스페이스에 저장되고, 메시지 캡션(보통 첫 번째 항목에 달림)이 묶음 전체에 대한 AI 지시사항으로 사용됩니다.'
+          'You can send multiple files or photos in a single message — Telegram albums, Discord multi-attachment messages, and Slack multi-file uploads are all supported. The bot processes them atomically: non-audio files in the group are saved to the workspace, Telegram audio items are transcribed, and the message caption (typically attached to the first item) is used as the AI instruction for the whole batch.',
+          '한 메시지에 여러 파일이나 사진을 함께 전송할 수 있습니다 — Telegram 앨범, Discord 다중 첨부 메시지, Slack 다중 파일 업로드 모두 지원됩니다. 봇은 이들을 한꺼번에 처리합니다: 그룹의 오디오가 아닌 파일은 워크스페이스에 저장되고, Telegram 오디오 항목은 STT로 변환되며, 메시지 캡션(보통 첫 번째 항목에 달림)이 묶음 전체에 대한 AI 지시사항으로 사용됩니다.'
         )}</P>
         <InfoBox type="info">
           {t(

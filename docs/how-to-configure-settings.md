@@ -64,6 +64,27 @@ Toggles Codex Fast mode for the current chat. The setting only applies when the 
 
 ---
 
+## /stt_model
+
+Sets the transcriptor speech recognition model for the current chat.
+
+```
+/stt_model
+/stt_model small
+/stt_model large-v3-turbo
+/stt_model path:/absolute/model.bin
+/stt_model reset
+```
+
+- Without arguments, shows the current STT model setting.
+- Bare model names are passed to transcriptor as `--model-name` and override an inherited `TRANSCRIPTOR_MODEL` value for that run.
+- `path:<model_path>` is passed to transcriptor as `--model`.
+- `reset`, `clear`, `default`, or `unset` removes the chat override and lets transcriptor use its environment, saved config, or default model.
+
+If the selected model is not cached yet, transcriptor may download it on first use. Telegram STT progress messages show that download before recognition continues.
+
+---
+
 ## /setpollingtime \<ms\>
 
 Sets the API polling interval in milliseconds. This controls how frequently streaming responses and shell command output are updated on screen.

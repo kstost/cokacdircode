@@ -1,14 +1,14 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::path::Path;
-use std::fs;
 
-use tokio::sync::Mutex;
+use sha2::{Digest, Sha256};
 use teloxide::prelude::*;
 use teloxide::types::{ParseMode, UpdateKind};
-use sha2::{Sha256, Digest};
+use tokio::sync::Mutex;
 
 use crate::services::claude::{self, CancelToken, StreamMessage, DEFAULT_ALLOWED_TOOLS};
 use crate::services::codex;
@@ -24,7 +24,9 @@ static TG_DEBUG: AtomicBool = AtomicBool::new(false);
 /// kinds, and that URL embeds `bot<TOKEN>` in plaintext — without redaction
 /// the daily debug log would persist the token. Tokens are appended on
 /// `run_bot` startup; the list is only ever read for redaction.
-static TG_BOT_TOKENS: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> = std::sync::OnceLock::new();
+static TG_BOT_TOKENS: std::sync::OnceLock<std::sync::RwLock<Vec<String>>> =
+    std::sync::OnceLock::new();
+static TRANSCRIPTOR_BINARY_MUTEX: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
 
 fn register_token_for_redaction(token: &str) {
     let lock = TG_BOT_TOKENS.get_or_init(|| std::sync::RwLock::new(Vec::new()));
@@ -36,8 +38,12 @@ fn register_token_for_redaction(token: &str) {
 }
 
 fn redact_known_tokens(s: &str) -> String {
-    let Some(lock) = TG_BOT_TOKENS.get() else { return s.to_string() };
-    let Ok(guard) = lock.read() else { return s.to_string() };
+    let Some(lock) = TG_BOT_TOKENS.get() else {
+        return s.to_string();
+    };
+    let Ok(guard) = lock.read() else {
+        return s.to_string();
+    };
     if guard.is_empty() {
         return s.to_string();
     }
@@ -71,8 +77,12 @@ fn any_saved_bot_debug_enabled() -> bool {
     let Some(obj) = json.as_object() else {
         return false;
     };
-    obj.values()
-        .any(|entry| entry.get("debug").and_then(|v| v.as_bool()).unwrap_or(false))
+    obj.values().any(|entry| {
+        entry
+            .get("debug")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    })
 }
 
 fn refresh_global_debug_flags() -> bool {
@@ -195,7 +205,10 @@ pub fn parse_raw_payload(text: &str) -> Vec<RawPayloadEntry> {
         if let Some(bracket_tag) = detect_raw_payload_tag(line) {
             // Save previous section
             if let Some(tag) = cur_tag.take() {
-                entries.push(RawPayloadEntry { tag, content: std::mem::take(&mut cur_content) });
+                entries.push(RawPayloadEntry {
+                    tag,
+                    content: std::mem::take(&mut cur_content),
+                });
             }
             // Extract tag name (strip [ and ])
             cur_tag = Some(bracket_tag[1..bracket_tag.len() - 1].to_string());
@@ -207,7 +220,10 @@ pub fn parse_raw_payload(text: &str) -> Vec<RawPayloadEntry> {
         }
     }
     if let Some(tag) = cur_tag {
-        entries.push(RawPayloadEntry { tag, content: cur_content });
+        entries.push(RawPayloadEntry {
+            tag,
+            content: cur_content,
+        });
     }
     entries
 }
@@ -237,7 +253,9 @@ const PAYLOAD_TRUNCATE_LIMIT: usize = 500;
 /// Returns None if saving fails.
 fn save_payload_value(content: &str) -> Option<String> {
     let dir = dirs::home_dir()?.join(".cokacdir").join("values");
-    if fs::create_dir_all(&dir).is_err() { return None; }
+    if fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
     let ts = chrono::Local::now().format("%Y%m%d%H%M%S");
     use rand::Rng;
     let rand_suffix: String = rand::thread_rng()
@@ -247,26 +265,34 @@ fn save_payload_value(content: &str) -> Option<String> {
         .collect();
     let filename = format!("{}_{}.txt", ts, rand_suffix);
     let path = dir.join(&filename);
-    if fs::write(&path, content).is_err() { return None; }
+    if fs::write(&path, content).is_err() {
+        return None;
+    }
     Some(path.display().to_string())
 }
 
 /// Truncate payload entries whose content exceeds the limit.
 /// Long content is saved to ~/.cokacdir/values/ and replaced with a truncated preview + file path.
 fn truncate_payload_entries(entries: &[RawPayloadEntry]) -> Vec<RawPayloadEntry> {
-    entries.iter().map(|entry| {
-        if entry.content.chars().count() <= PAYLOAD_TRUNCATE_LIMIT {
-            entry.clone()
-        } else {
-            let preview: String = entry.content.chars().take(PAYLOAD_TRUNCATE_LIMIT).collect();
-            let truncated_content = if let Some(path) = save_payload_value(&entry.content) {
-                format!("{}...\n(truncated, full content: {})", preview, path)
+    entries
+        .iter()
+        .map(|entry| {
+            if entry.content.chars().count() <= PAYLOAD_TRUNCATE_LIMIT {
+                entry.clone()
             } else {
-                format!("{}...\n(truncated, failed to save full content)", preview)
-            };
-            RawPayloadEntry { tag: entry.tag.clone(), content: truncated_content }
-        }
-    }).collect()
+                let preview: String = entry.content.chars().take(PAYLOAD_TRUNCATE_LIMIT).collect();
+                let truncated_content = if let Some(path) = save_payload_value(&entry.content) {
+                    format!("{}...\n(truncated, full content: {})", preview, path)
+                } else {
+                    format!("{}...\n(truncated, failed to save full content)", preview)
+                };
+                RawPayloadEntry {
+                    tag: entry.tag.clone(),
+                    content: truncated_content,
+                }
+            }
+        })
+        .collect()
 }
 
 /// Serialize payload entries to JSON string (new format).
@@ -275,7 +301,6 @@ pub fn serialize_payload(entries: &[RawPayloadEntry]) -> String {
     let processed = truncate_payload_entries(entries);
     serde_json::to_string(&processed).unwrap_or_default()
 }
-
 
 /// RAII guard for per-chat exclusive lock.
 /// Ensures only one AI request processes at a time within the same chat.
@@ -289,28 +314,40 @@ struct GroupChatLock {
 /// For group chats, polls with sleep until the lock is acquired.
 async fn acquire_group_chat_lock(chat_id: i64) -> Option<GroupChatLock> {
     use fs2::FileExt;
-    if chat_id >= 0 { return None; }
+    if chat_id >= 0 {
+        return None;
+    }
     let dir = dirs::home_dir()?.join(".cokacdir").join("chat_locks");
     let _ = std::fs::create_dir_all(&dir);
     let lock_path = dir.join(format!("{}.lock", chat_id));
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(&lock_path).ok()?;
+        .open(&lock_path)
+        .ok()?;
     let mut waited = false;
     loop {
         match file.try_lock_exclusive() {
             Ok(_) => {
                 if waited {
-                    msg_debug(&format!("[chat_lock] chat_id={} lock acquired after waiting", chat_id));
+                    msg_debug(&format!(
+                        "[chat_lock] chat_id={} lock acquired after waiting",
+                        chat_id
+                    ));
                 } else {
-                    msg_debug(&format!("[chat_lock] chat_id={} lock acquired immediately", chat_id));
+                    msg_debug(&format!(
+                        "[chat_lock] chat_id={} lock acquired immediately",
+                        chat_id
+                    ));
                 }
                 return Some(GroupChatLock { _file: file });
             }
             Err(_) => {
                 if !waited {
-                    msg_debug(&format!("[chat_lock] chat_id={} lock contended, waiting...", chat_id));
+                    msg_debug(&format!(
+                        "[chat_lock] chat_id={} lock contended, waiting...",
+                        chat_id
+                    ));
                     waited = true;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -339,12 +376,18 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
     use fs2::FileExt;
 
     let Some(path) = group_chat_log_path(chat_id) else {
-        msg_debug(&format!("[append_group_chat_log] LOST: no log path resolvable for chat_id={}", chat_id));
+        msg_debug(&format!(
+            "[append_group_chat_log] LOST: no log path resolvable for chat_id={}",
+            chat_id
+        ));
         return;
     };
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            msg_debug(&format!("[append_group_chat_log] LOST: create_dir_all({:?}) failed for chat_id={}: {}", parent, chat_id, e));
+            msg_debug(&format!(
+                "[append_group_chat_log] LOST: create_dir_all({:?}) failed for chat_id={}: {}",
+                parent, chat_id, e
+            ));
             return;
         }
     }
@@ -353,7 +396,10 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
     let json = match serde_json::to_string(entry) {
         Ok(j) => j,
         Err(e) => {
-            msg_debug(&format!("[append_group_chat_log] LOST: serialize failed for chat_id={}: {}", chat_id, e));
+            msg_debug(&format!(
+                "[append_group_chat_log] LOST: serialize failed for chat_id={}: {}",
+                chat_id, e
+            ));
             return;
         }
     };
@@ -361,7 +407,10 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
     // Skip entries containing --read_chat_log to prevent recursive snowball growth:
     // each --read_chat_log result embeds the entire log, causing exponential JSONL inflation.
     if json.contains("--read_chat_log") {
-        msg_debug(&format!("[append_group_chat_log] SKIPPED: line contains --read_chat_log (len={})", json.len()));
+        msg_debug(&format!(
+            "[append_group_chat_log] SKIPPED: line contains --read_chat_log (len={})",
+            json.len()
+        ));
         return;
     }
 
@@ -377,12 +426,18 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
     {
         Ok(f) => f,
         Err(e) => {
-            msg_debug(&format!("[append_group_chat_log] LOST: open lock_file({:?}) failed for chat_id={}: {}", lock_path, chat_id, e));
+            msg_debug(&format!(
+                "[append_group_chat_log] LOST: open lock_file({:?}) failed for chat_id={}: {}",
+                lock_path, chat_id, e
+            ));
             return;
         }
     };
     if let Err(e) = lock_file.lock_exclusive() {
-        msg_debug(&format!("[append_group_chat_log] LOST: lock_exclusive failed for chat_id={}: {}", chat_id, e));
+        msg_debug(&format!(
+            "[append_group_chat_log] LOST: lock_exclusive failed for chat_id={}: {}",
+            chat_id, e
+        ));
         return;
     }
 
@@ -403,7 +458,10 @@ fn append_group_chat_log(chat_id: i64, entry: &GroupChatLogEntry) {
             }
         }
         Err(e) => {
-            msg_debug(&format!("[append_group_chat_log] LOST: open data file({:?}) failed for chat_id={}: {}", path, chat_id, e));
+            msg_debug(&format!(
+                "[append_group_chat_log] LOST: open data file({:?}) failed for chat_id={}: {}",
+                path, chat_id, e
+            ));
         }
     }
 
@@ -418,23 +476,29 @@ pub fn read_group_chat_log_range(
     range_end: Option<usize>,
     filter_bot: Option<&str>,
 ) -> Vec<(usize, GroupChatLogEntry)> {
-    use fs2::FileExt;
-
-    let filter_bot_owned: Option<String> = filter_bot.map(|b| b.strip_prefix('@').unwrap_or(b).to_lowercase());
+    let filter_bot_owned: Option<String> =
+        filter_bot.map(|b| b.strip_prefix('@').unwrap_or(b).to_lowercase());
     let filter_bot = filter_bot_owned.as_deref();
 
-    let Some(path) = group_chat_log_path(chat_id) else { return Vec::new() };
+    let Some(path) = group_chat_log_path(chat_id) else {
+        return Vec::new();
+    };
 
     // Use the same dedicated lock file as append_group_chat_log for coordination
     let lock_path = path.with_extension("jsonl.lock");
     let Ok(lock_file) = fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(&lock_path) else { return Vec::new() };
-    if lock_file.lock_shared().is_err() { return Vec::new(); }
+        .open(&lock_path)
+    else {
+        return Vec::new();
+    };
+    if fs2::FileExt::lock_shared(&lock_file).is_err() {
+        return Vec::new();
+    }
 
     let Ok(file) = fs::File::open(&path) else {
-        let _ = lock_file.unlock();
+        let _ = fs2::FileExt::unlock(&lock_file);
         return Vec::new();
     };
 
@@ -446,17 +510,24 @@ pub fn read_group_chat_log_range(
     // visible via /debug instead of silently disappearing.
     let mut dropped_io: usize = 0;
     let mut dropped_parse: usize = 0;
-    let all_entries: Vec<(usize, GroupChatLogEntry)> = reader.lines()
+    let all_entries: Vec<(usize, GroupChatLogEntry)> = reader
+        .lines()
         .enumerate()
         .filter_map(|(i, line_result)| {
             let line_num = i + 1; // 1-based
             let line = match line_result {
                 Ok(l) => l,
-                Err(_) => { dropped_io += 1; return None; }
+                Err(_) => {
+                    dropped_io += 1;
+                    return None;
+                }
             };
             match serde_json::from_str::<GroupChatLogEntry>(&line) {
                 Ok(entry) => Some((line_num, entry)),
-                Err(_) => { dropped_parse += 1; None }
+                Err(_) => {
+                    dropped_parse += 1;
+                    None
+                }
             }
         })
         .collect();
@@ -476,22 +547,27 @@ pub fn read_group_chat_log_range(
     }
 
     // Second pass: filter entries, skipping those before the clear marker for each bot
-    let entries: Vec<(usize, GroupChatLogEntry)> = all_entries.into_iter()
+    let entries: Vec<(usize, GroupChatLogEntry)> = all_entries
+        .into_iter()
         .filter(|(line_num, entry)| {
             // Skip clear marker entries themselves
-            if entry.clear { return false; }
+            if entry.clear {
+                return false;
+            }
             // Skip entries from a bot that are before its last clear marker
             if let Some(&clear_line) = last_clear.get(&entry.bot) {
-                if *line_num <= clear_line { return false; }
+                if *line_num <= clear_line {
+                    return false;
+                }
             }
-            let in_range = *line_num >= range_start
-                && range_end.map_or(true, |end| *line_num <= end);
+            let in_range =
+                *line_num >= range_start && range_end.map_or(true, |end| *line_num <= end);
             let bot_match = filter_bot.map_or(true, |bot| entry.bot == bot);
             in_range && bot_match
         })
         .collect();
 
-    let _ = lock_file.unlock();
+    let _ = fs2::FileExt::unlock(&lock_file);
     entries
 }
 
@@ -506,25 +582,32 @@ pub fn read_group_chat_log_tail(
     n: usize,
     filter_bot: Option<&str>,
 ) -> Vec<(usize, GroupChatLogEntry)> {
-    use fs2::FileExt;
-    use std::io::BufRead;
     use std::collections::VecDeque;
+    use std::io::BufRead;
 
     if n == 0 {
         return Vec::new();
     }
 
-    let filter_bot_owned: Option<String> = filter_bot.map(|b| b.strip_prefix('@').unwrap_or(b).to_lowercase());
+    let filter_bot_owned: Option<String> =
+        filter_bot.map(|b| b.strip_prefix('@').unwrap_or(b).to_lowercase());
     let filter_bot = filter_bot_owned.as_deref();
 
-    let Some(path) = group_chat_log_path(chat_id) else { return Vec::new() };
+    let Some(path) = group_chat_log_path(chat_id) else {
+        return Vec::new();
+    };
 
     let lock_path = path.with_extension("jsonl.lock");
     let Ok(lock_file) = fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(&lock_path) else { return Vec::new() };
-    if lock_file.lock_shared().is_err() { return Vec::new(); }
+        .open(&lock_path)
+    else {
+        return Vec::new();
+    };
+    if fs2::FileExt::lock_shared(&lock_file).is_err() {
+        return Vec::new();
+    }
 
     let mut dropped_io: usize = 0;
     let mut dropped_parse: usize = 0;
@@ -534,14 +617,17 @@ pub fn read_group_chat_log_tail(
     let mut last_clear: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     {
         let Ok(file) = fs::File::open(&path) else {
-            let _ = lock_file.unlock();
+            let _ = fs2::FileExt::unlock(&lock_file);
             return Vec::new();
         };
         for (i, line_result) in std::io::BufReader::new(&file).lines().enumerate() {
             let line_num = i + 1;
             let line = match line_result {
                 Ok(l) => l,
-                Err(_) => { dropped_io += 1; continue; }
+                Err(_) => {
+                    dropped_io += 1;
+                    continue;
+                }
             };
             match serde_json::from_str::<GroupChatLogEntry>(&line) {
                 Ok(entry) => {
@@ -549,7 +635,9 @@ pub fn read_group_chat_log_tail(
                         last_clear.insert(entry.bot.clone(), line_num);
                     }
                 }
-                Err(_) => { dropped_parse += 1; }
+                Err(_) => {
+                    dropped_parse += 1;
+                }
             }
         }
     }
@@ -559,7 +647,7 @@ pub fn read_group_chat_log_tail(
     let mut tail: VecDeque<(usize, GroupChatLogEntry)> = VecDeque::with_capacity(n + 1);
     {
         let Ok(file) = fs::File::open(&path) else {
-            let _ = lock_file.unlock();
+            let _ = fs2::FileExt::unlock(&lock_file);
             return Vec::new();
         };
         for (i, line_result) in std::io::BufReader::new(&file).lines().enumerate() {
@@ -567,14 +655,24 @@ pub fn read_group_chat_log_tail(
             // Pass 1 already counted any io / parse errors on this same file
             // (locked shared, deterministic). Re-counting here would
             // double-report the same corrupt lines.
-            let Ok(line) = line_result else { continue; };
-            let Ok(entry) = serde_json::from_str::<GroupChatLogEntry>(&line) else { continue; };
-            if entry.clear { continue; }
+            let Ok(line) = line_result else {
+                continue;
+            };
+            let Ok(entry) = serde_json::from_str::<GroupChatLogEntry>(&line) else {
+                continue;
+            };
+            if entry.clear {
+                continue;
+            }
             if let Some(&clear_line) = last_clear.get(&entry.bot) {
-                if line_num <= clear_line { continue; }
+                if line_num <= clear_line {
+                    continue;
+                }
             }
             if let Some(b) = filter_bot {
-                if entry.bot != b { continue; }
+                if entry.bot != b {
+                    continue;
+                }
             }
             tail.push_back((line_num, entry));
             if tail.len() > n {
@@ -590,7 +688,7 @@ pub fn read_group_chat_log_tail(
         ));
     }
 
-    let _ = lock_file.unlock();
+    let _ = fs2::FileExt::unlock(&lock_file);
     tail.into_iter().collect()
 }
 
@@ -601,25 +699,32 @@ pub fn read_group_chat_log_tail(
 ///
 /// Returns a Vec of (bot_username, Option<display_name>) sorted by username.
 pub fn collect_group_chat_bots(chat_id: i64) -> Vec<(String, Option<String>)> {
-    use fs2::FileExt;
     use std::io::BufRead;
 
-    let Some(path) = group_chat_log_path(chat_id) else { return Vec::new() };
+    let Some(path) = group_chat_log_path(chat_id) else {
+        return Vec::new();
+    };
 
     let lock_path = path.with_extension("jsonl.lock");
     let Ok(lock_file) = fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .open(&lock_path) else { return Vec::new() };
-    if lock_file.lock_shared().is_err() { return Vec::new(); }
+        .open(&lock_path)
+    else {
+        return Vec::new();
+    };
+    if fs2::FileExt::lock_shared(&lock_file).is_err() {
+        return Vec::new();
+    }
 
     let Ok(file) = fs::File::open(&path) else {
-        let _ = lock_file.unlock();
+        let _ = fs2::FileExt::unlock(&lock_file);
         return Vec::new();
     };
 
     // Scan forward — later entries overwrite earlier ones, keeping the latest display name
-    let mut bots: std::collections::HashMap<String, Option<String>> = std::collections::HashMap::new();
+    let mut bots: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     for line in std::io::BufReader::new(&file).lines().flatten() {
         if let Ok(entry) = serde_json::from_str::<GroupChatLogEntry>(&line) {
             if !entry.bot.is_empty() {
@@ -628,7 +733,7 @@ pub fn collect_group_chat_bots(chat_id: i64) -> Vec<(String, Option<String>)> {
         }
     }
 
-    let _ = lock_file.unlock();
+    let _ = fs2::FileExt::unlock(&lock_file);
 
     let mut result: Vec<(String, Option<String>)> = bots.into_iter().collect();
     result.sort_by(|a, b| a.0.cmp(&b.0));
@@ -686,6 +791,128 @@ impl ChatSession {
         self.pending_uploads.clear();
         self.pending_uploads_added_at = None;
     }
+
+    fn remove_pending_upload_records(&mut self, records: &[String]) -> usize {
+        if records.is_empty() {
+            return 0;
+        }
+        let mut remaining: HashMap<&str, usize> = HashMap::new();
+        for record in records {
+            *remaining.entry(record.as_str()).or_insert(0) += 1;
+        }
+
+        let before = self.pending_uploads.len();
+        self.pending_uploads.retain(|record| {
+            if let Some(count) = remaining.get_mut(record.as_str()) {
+                if *count > 0 {
+                    *count -= 1;
+                    return false;
+                }
+            }
+            true
+        });
+
+        let removed = before - self.pending_uploads.len();
+        if self.pending_uploads.is_empty() {
+            self.pending_uploads_added_at = None;
+        } else if self.pending_uploads_added_at.is_none() {
+            self.pending_uploads_added_at = Some(std::time::Instant::now());
+        }
+        removed
+    }
+
+    fn remove_user_history_records(&mut self, records: &[String]) -> usize {
+        if records.is_empty() {
+            return 0;
+        }
+        let mut remaining: HashMap<&str, usize> = HashMap::new();
+        for record in records {
+            *remaining.entry(record.as_str()).or_insert(0) += 1;
+        }
+
+        let mut removed = 0usize;
+        let mut idx = self.history.len();
+        while idx > 0 {
+            idx -= 1;
+            let should_remove = self.history[idx].item_type == HistoryType::User
+                && remaining
+                    .get_mut(self.history[idx].content.as_str())
+                    .map(|count| {
+                        if *count > 0 {
+                            *count -= 1;
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+            if should_remove {
+                self.history.remove(idx);
+                removed += 1;
+            }
+        }
+        removed
+    }
+}
+
+#[cfg(test)]
+mod pending_upload_tests {
+    use super::{ChatSession, HistoryItem, HistoryType};
+
+    fn session_with_records(records: &[&str]) -> ChatSession {
+        let mut session = ChatSession {
+            session_id: None,
+            current_path: Some("/tmp/cokacdir-test".to_string()),
+            history: Vec::new(),
+            pending_uploads: Vec::new(),
+            pending_uploads_added_at: None,
+        };
+        for record in records {
+            session.push_pending_upload((*record).to_string());
+            session.history.push(HistoryItem {
+                item_type: HistoryType::User,
+                content: (*record).to_string(),
+            });
+        }
+        session
+    }
+
+    #[test]
+    fn removes_only_targeted_pending_upload_and_history_records() {
+        let mut session = session_with_records(&["before", "album-a", "album-b", "after"]);
+        session.history.push(HistoryItem {
+            item_type: HistoryType::Assistant,
+            content: "album-a".to_string(),
+        });
+
+        let records = vec!["album-a".to_string(), "album-b".to_string()];
+        assert_eq!(session.remove_pending_upload_records(&records), 2);
+        assert_eq!(session.pending_uploads, vec!["before", "after"]);
+        assert!(session.pending_uploads_added_at.is_some());
+
+        assert_eq!(session.remove_user_history_records(&records), 2);
+        let contents: Vec<_> = session
+            .history
+            .iter()
+            .map(|item| item.content.as_str())
+            .collect();
+        assert_eq!(contents, vec!["before", "after", "album-a"]);
+        assert_eq!(
+            session.history.last().unwrap().item_type,
+            HistoryType::Assistant
+        );
+    }
+
+    #[test]
+    fn clearing_last_targeted_pending_upload_resets_timestamp() {
+        let mut session = session_with_records(&["album-a"]);
+        let records = vec!["album-a".to_string()];
+
+        assert_eq!(session.remove_pending_upload_records(&records), 1);
+
+        assert!(session.pending_uploads.is_empty());
+        assert!(session.pending_uploads_added_at.is_none());
+    }
 }
 
 /// Bot-level settings persisted to disk
@@ -730,6 +957,9 @@ struct BotSettings {
     /// chat_id (string) -> Claude effort level.
     /// Applied only when current model is Claude; passed via `--effort <v>`.
     claude_effort: HashMap<String, String>,
+    /// chat_id (string) -> transcriptor model setting for STT.
+    /// Bare values are passed as `--model-name`; `path:<PATH>` is passed as `--model`.
+    stt_models: HashMap<String, String>,
 }
 
 impl Default for BotSettings {
@@ -754,6 +984,7 @@ impl Default for BotSettings {
             effort: HashMap::new(),
             codex_fast: HashMap::new(),
             claude_effort: HashMap::new(),
+            stt_models: HashMap::new(),
         }
     }
 }
@@ -762,27 +993,37 @@ impl Default for BotSettings {
 /// Returns the chat-specific list if configured, otherwise DEFAULT_ALLOWED_TOOLS.
 fn get_allowed_tools(settings: &BotSettings, chat_id: ChatId) -> Vec<String> {
     let key = chat_id.0.to_string();
-    settings.allowed_tools.get(&key)
+    settings
+        .allowed_tools
+        .get(&key)
         .cloned()
-        .unwrap_or_else(|| DEFAULT_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect())
+        .unwrap_or_else(|| {
+            DEFAULT_ALLOWED_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        })
 }
 
 /// Get the configured model for a specific chat_id, if any.
 /// Migrates legacy bare names (e.g. "sonnet") to "claude:" prefixed format.
 fn get_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
     let key = chat_id.0.to_string();
-    settings.models.get(&key).map(|m| {
-        match m.as_str() {
-            "sonnet" | "opus" | "haiku" |
-            "sonnet[1m]" | "opus[1m]" | "haiku[1m]" => format!("claude:{}", m),
-            _ => m.clone(),
+    settings.models.get(&key).map(|m| match m.as_str() {
+        "sonnet" | "opus" | "haiku" | "sonnet[1m]" | "opus[1m]" | "haiku[1m]" => {
+            format!("claude:{}", m)
         }
+        _ => m.clone(),
     })
 }
 
 /// Check if silent mode is enabled for a chat (default: ON)
 fn is_silent(settings: &BotSettings, chat_id: ChatId) -> bool {
-    settings.silent.get(&chat_id.0.to_string()).copied().unwrap_or(SILENT_MODE_DEFAULT)
+    settings
+        .silent
+        .get(&chat_id.0.to_string())
+        .copied()
+        .unwrap_or(SILENT_MODE_DEFAULT)
 }
 
 /// Get the configured Codex reasoning effort for a specific chat_id.
@@ -797,7 +1038,11 @@ fn get_claude_effort(settings: &BotSettings, chat_id: ChatId) -> Option<String> 
     settings.claude_effort.get(&chat_id.0.to_string()).cloned()
 }
 
-fn get_effort_for_provider(settings: &BotSettings, chat_id: ChatId, provider: &str) -> Option<String> {
+fn get_effort_for_provider(
+    settings: &BotSettings,
+    chat_id: ChatId,
+    provider: &str,
+) -> Option<String> {
     match provider {
         "claude" => get_claude_effort(settings, chat_id),
         "codex" => get_codex_effort(settings, chat_id),
@@ -806,7 +1051,72 @@ fn get_effort_for_provider(settings: &BotSettings, chat_id: ChatId, provider: &s
 }
 
 fn is_codex_fast(settings: &BotSettings, chat_id: ChatId) -> bool {
-    settings.codex_fast.get(&chat_id.0.to_string()).copied().unwrap_or(false)
+    settings
+        .codex_fast
+        .get(&chat_id.0.to_string())
+        .copied()
+        .unwrap_or(false)
+}
+
+fn get_stt_model(settings: &BotSettings, chat_id: ChatId) -> Option<String> {
+    settings.stt_models.get(&chat_id.0.to_string()).cloned()
+}
+
+fn is_valid_stt_model_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn normalize_stt_model_setting(arg: &str) -> Result<Option<String>, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Err(
+            "Usage: /stt_model <model>, /stt_model path:<model_path>, or /stt_model reset"
+                .to_string(),
+        );
+    }
+    let lower = arg.to_ascii_lowercase();
+    if matches!(lower.as_str(), "reset" | "clear" | "default" | "unset") {
+        return Ok(None);
+    }
+
+    let clean = arg.split(" \u{2014} ").next().unwrap_or(arg).trim();
+    if let Some(path) = clean.strip_prefix("path:") {
+        let path = path.trim();
+        if path.is_empty() {
+            return Err(
+                "Model path is empty. Usage: /stt_model path:/absolute/model.bin".to_string(),
+            );
+        }
+        return Ok(Some(format!("path:{path}")));
+    }
+
+    if !is_valid_stt_model_name(clean) {
+        return Err("Invalid STT model name. Use names like tiny, base, small, medium, large-v3, large-v3-turbo, or path:<model_path>.".to_string());
+    }
+    Ok(Some(clean.to_string()))
+}
+
+fn stt_model_setting_display(setting: Option<&str>) -> String {
+    match setting {
+        Some(value) if value.starts_with("path:") => {
+            format!("path:{}", value.trim_start_matches("path:"))
+        }
+        Some(value) => value.to_string(),
+        None => "default (transcriptor env/config/base)".to_string(),
+    }
+}
+
+fn expand_user_path(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest).display().to_string();
+        }
+    }
+    path.to_string()
 }
 
 /// Validate a Codex reasoning_effort value.
@@ -849,9 +1159,9 @@ struct ScheduleEntry {
     bot_key_verifier: String,
     current_path: String,
     prompt: String,
-    schedule: String,         // original --at value (cron expression or absolute time)
-    schedule_type: String,    // "absolute" | "cron"
-    once: Option<bool>,       // only meaningful for cron (None for absolute)
+    schedule: String,      // original --at value (cron expression or absolute time)
+    schedule_type: String, // "absolute" | "cron"
+    once: Option<bool>,    // only meaningful for cron (None for absolute)
     last_run: Option<String>, // "2026-02-23 14:00:00"
     created_at: String,
     context_summary: Option<String>, // context summary text for session-isolated schedule
@@ -885,7 +1195,9 @@ fn schedule_dir() -> Option<std::path::PathBuf> {
 /// isolated into `~/.cokacdir/workspace/<schedule_id>` with a fresh session.
 /// Any value other than the literal string `"1"` (including unset) is false.
 fn is_schedule_inline_enabled() -> bool {
-    std::env::var("COKAC_SCHEDULE_INLINE").map(|v| v == "1").unwrap_or(false)
+    std::env::var("COKAC_SCHEDULE_INLINE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 fn sched_debug(msg: &str) {
@@ -918,7 +1230,10 @@ fn ai_trace(msg: &str) {
         {
             let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
             let redacted = redact_known_tokens(msg);
-            let _ = std::io::Write::write_fmt(&mut file, format_args!("[{}] {}\n", timestamp, redacted));
+            let _ = std::io::Write::write_fmt(
+                &mut file,
+                format_args!("[{}] {}\n", timestamp, redacted),
+            );
         }
     }
 }
@@ -938,10 +1253,14 @@ fn log_incoming_message(msg: &Message, accepted: bool, reject_reason: &str) {
 
     let chat_id = msg.chat.id.0;
     let user_id = msg.from.as_ref().map(|u| u.id.0).unwrap_or(0);
-    let username = msg.from.as_ref()
+    let username = msg
+        .from
+        .as_ref()
         .and_then(|u| u.username.as_deref())
         .unwrap_or("");
-    let name = msg.from.as_ref()
+    let name = msg
+        .from
+        .as_ref()
         .map(|u| u.first_name.as_str())
         .unwrap_or("unknown");
     let msg_id = msg.id.0;
@@ -989,7 +1308,11 @@ fn log_incoming_message(msg: &Message, accepted: bool, reject_reason: &str) {
     if let Ok(mut line) = serde_json::to_string(&entry) {
         line.push('\n');
         use std::io::Write;
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        if let Ok(mut f) = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
             let _ = f.write_all(line.as_bytes());
         }
     }
@@ -1013,14 +1336,22 @@ fn read_bot_message(path: &std::path::Path) -> Option<BotMessage> {
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
-            msg_debug(&format!("[read_bot_message] read failed: {} (path={})", e, path.display()));
+            msg_debug(&format!(
+                "[read_bot_message] read failed: {} (path={})",
+                e,
+                path.display()
+            ));
             return None;
         }
     };
     let v: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            msg_debug(&format!("[read_bot_message] JSON parse failed: {} (path={})", e, path.display()));
+            msg_debug(&format!(
+                "[read_bot_message] JSON parse failed: {} (path={})",
+                e,
+                path.display()
+            ));
             return None;
         }
     };
@@ -1030,7 +1361,13 @@ fn read_bot_message(path: &std::path::Path) -> Option<BotMessage> {
     let chat_id_val = v.get("chat_id").and_then(|x| x.as_str());
     let content_val = v.get("content").and_then(|x| x.as_str());
     let created_at = v.get("created_at").and_then(|x| x.as_str());
-    if id.is_none() || from.is_none() || to.is_none() || chat_id_val.is_none() || content_val.is_none() || created_at.is_none() {
+    if id.is_none()
+        || from.is_none()
+        || to.is_none()
+        || chat_id_val.is_none()
+        || content_val.is_none()
+        || created_at.is_none()
+    {
         msg_debug(&format!("[read_bot_message] missing fields: id={}, from={}, to={}, chat_id={}, content={}, created_at={} (path={})",
             id.is_some(), from.is_some(), to.is_some(), chat_id_val.is_some(), content_val.is_some(), created_at.is_some(), path.display()));
         return None;
@@ -1044,13 +1381,19 @@ fn read_bot_message(path: &std::path::Path) -> Option<BotMessage> {
         created_at: created_at.unwrap().to_string(),
         file_path: path.to_path_buf(),
     };
-    msg_debug(&format!("[read_bot_message] ok: id={}, from={}, to={}, chat_id={}", msg.id, msg.from, msg.to, msg.chat_id));
+    msg_debug(&format!(
+        "[read_bot_message] ok: id={}, from={}, to={}, chat_id={}",
+        msg.id, msg.from, msg.to, msg.chat_id
+    ));
     Some(msg)
 }
 
 /// Scan messages directory for messages addressed to this bot, sorted by created_at (FIFO)
 fn scan_messages(my_username: &str) -> Vec<BotMessage> {
-    msg_debug(&format!("[scan_messages] scanning for bot: {}", my_username));
+    msg_debug(&format!(
+        "[scan_messages] scanning for bot: {}",
+        my_username
+    ));
     let Some(dir) = messages_dir() else {
         msg_debug("[scan_messages] messages_dir() returned None");
         return Vec::new();
@@ -1060,41 +1403,78 @@ fn scan_messages(my_username: &str) -> Vec<BotMessage> {
         return Vec::new();
     }
     let Ok(entries) = fs::read_dir(&dir) else {
-        msg_debug(&format!("[scan_messages] read_dir failed: {}", dir.display()));
+        msg_debug(&format!(
+            "[scan_messages] read_dir failed: {}",
+            dir.display()
+        ));
         return Vec::new();
     };
     let all_entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    let json_count = all_entries.iter().filter(|e| e.path().extension().map(|ext| ext == "json").unwrap_or(false)).count();
-    msg_debug(&format!("[scan_messages] dir entries={}, json files={}", all_entries.len(), json_count));
-    let mut msgs: Vec<BotMessage> = all_entries.into_iter()
-        .filter(|e| e.path().extension().map(|ext| ext == "json").unwrap_or(false))
+    let json_count = all_entries
+        .iter()
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "json")
+                .unwrap_or(false)
+        })
+        .count();
+    msg_debug(&format!(
+        "[scan_messages] dir entries={}, json files={}",
+        all_entries.len(),
+        json_count
+    ));
+    let mut msgs: Vec<BotMessage> = all_entries
+        .into_iter()
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "json")
+                .unwrap_or(false)
+        })
         .filter_map(|e| read_bot_message(&e.path()))
         .filter(|m| {
             let matches = m.to.to_lowercase() == my_username.to_lowercase();
             if !matches {
-                msg_debug(&format!("[scan_messages] skip msg id={}, to={} (not for {})", m.id, m.to, my_username));
+                msg_debug(&format!(
+                    "[scan_messages] skip msg id={}, to={} (not for {})",
+                    m.id, m.to, my_username
+                ));
             }
             matches
         })
         .collect();
     msgs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    msg_debug(&format!("[scan_messages] result: {} messages for {}", msgs.len(), my_username));
+    msg_debug(&format!(
+        "[scan_messages] result: {} messages for {}",
+        msgs.len(),
+        my_username
+    ));
     msgs
 }
 
 /// Check for timed-out messages (sent by this bot, still pending after 30 min)
 async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedState) {
-    msg_debug(&format!("[check_message_timeouts] checking for bot: {}", my_username));
+    msg_debug(&format!(
+        "[check_message_timeouts] checking for bot: {}",
+        my_username
+    ));
     let Some(dir) = messages_dir() else {
         msg_debug("[check_message_timeouts] messages_dir() returned None");
         return;
     };
     if !dir.is_dir() {
-        msg_debug(&format!("[check_message_timeouts] dir not found: {}", dir.display()));
+        msg_debug(&format!(
+            "[check_message_timeouts] dir not found: {}",
+            dir.display()
+        ));
         return;
     }
     let Ok(entries) = fs::read_dir(&dir) else {
-        msg_debug(&format!("[check_message_timeouts] read_dir failed: {}", dir.display()));
+        msg_debug(&format!(
+            "[check_message_timeouts] read_dir failed: {}",
+            dir.display()
+        ));
         return;
     };
 
@@ -1103,10 +1483,17 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
     let mut timed_out = 0u32;
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if !path.extension().map(|ext| ext == "json").unwrap_or(false) { continue; }
-        let Some(msg) = read_bot_message(&path) else { continue; };
+        if !path.extension().map(|ext| ext == "json").unwrap_or(false) {
+            continue;
+        }
+        let Some(msg) = read_bot_message(&path) else {
+            continue;
+        };
         if msg.from.to_lowercase() != my_username.to_lowercase() {
-            msg_debug(&format!("[check_message_timeouts] skip msg id={}, from={} (not from {})", msg.id, msg.from, my_username));
+            msg_debug(&format!(
+                "[check_message_timeouts] skip msg id={}, from={} (not from {})",
+                msg.id, msg.from, my_username
+            ));
             continue;
         }
         scanned += 1;
@@ -1116,7 +1503,12 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
             Ok(created) => {
                 if let Some(created_dt) = created.and_local_timezone(chrono::Local).single() {
                     let elapsed = now.signed_duration_since(created_dt);
-                    msg_debug(&format!("[check_message_timeouts] msg id={}, to={}, elapsed={}min", msg.id, msg.to, elapsed.num_minutes()));
+                    msg_debug(&format!(
+                        "[check_message_timeouts] msg id={}, to={}, elapsed={}min",
+                        msg.id,
+                        msg.to,
+                        elapsed.num_minutes()
+                    ));
                     if elapsed.num_minutes() >= 30 {
                         // Delete the timed-out message
                         let remove_result = fs::remove_file(&path);
@@ -1129,10 +1521,18 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
                             let chat_id = ChatId(cid);
                             shared_rate_limit_wait(state, chat_id).await;
                             let notice = format!("⏰ Message to @{} timed out.", msg.to);
-                            let send_result = tg!("send_message", bot.send_message(chat_id, notice).await);
-                            msg_debug(&format!("[check_message_timeouts] notified chat_id={}, send_ok={}", cid, send_result.is_ok()));
+                            let send_result =
+                                tg!("send_message", bot.send_message(chat_id, notice).await);
+                            msg_debug(&format!(
+                                "[check_message_timeouts] notified chat_id={}, send_ok={}",
+                                cid,
+                                send_result.is_ok()
+                            ));
                         } else {
-                            msg_debug(&format!("[check_message_timeouts] invalid chat_id in msg: {}", msg.chat_id));
+                            msg_debug(&format!(
+                                "[check_message_timeouts] invalid chat_id in msg: {}",
+                                msg.chat_id
+                            ));
                         }
                     }
                 } else {
@@ -1140,16 +1540,25 @@ async fn check_message_timeouts(bot: &Bot, my_username: &str, state: &SharedStat
                 }
             }
             Err(e) => {
-                msg_debug(&format!("[check_message_timeouts] time parse failed for msg id={}: {} (created_at={})", msg.id, e, msg.created_at));
+                msg_debug(&format!(
+                    "[check_message_timeouts] time parse failed for msg id={}: {} (created_at={})",
+                    msg.id, e, msg.created_at
+                ));
             }
         }
     }
-    msg_debug(&format!("[check_message_timeouts] done: scanned={}, timed_out={}", scanned, timed_out));
+    msg_debug(&format!(
+        "[check_message_timeouts] done: scanned={}, timed_out={}",
+        scanned, timed_out
+    ));
 }
 
 /// Read a single schedule entry from a JSON file
 fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
-    sched_debug(&format!("[read_schedule_entry] reading: {}", path.display()));
+    sched_debug(&format!(
+        "[read_schedule_entry] reading: {}",
+        path.display()
+    ));
     let content = match fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
@@ -1173,15 +1582,15 @@ fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
     // file without the plaintext field. We deliberately do NOT rewrite the
     // file from the read path: a concurrent `delete_schedule_entry` could let
     // such a rewrite resurrect an already-removed schedule.
-    let bot_key_verifier = if let Some(verifier) = v.get("bot_key_verifier").and_then(|x| x.as_str())
-    {
-        verifier.to_string()
-    } else if let Some(legacy_key) = v.get("bot_key").and_then(|x| x.as_str()) {
-        live_schedule_key_verifier(&id, chat_id, legacy_key)
-    } else {
-        sched_debug("[read_schedule_entry] missing both bot_key_verifier and bot_key");
-        return None;
-    };
+    let bot_key_verifier =
+        if let Some(verifier) = v.get("bot_key_verifier").and_then(|x| x.as_str()) {
+            verifier.to_string()
+        } else if let Some(legacy_key) = v.get("bot_key").and_then(|x| x.as_str()) {
+            live_schedule_key_verifier(&id, chat_id, legacy_key)
+        } else {
+            sched_debug("[read_schedule_entry] missing both bot_key_verifier and bot_key");
+            return None;
+        };
     let entry = Some(ScheduleEntry {
         id,
         chat_id,
@@ -1193,11 +1602,18 @@ fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
         once: v.get("once").and_then(|v| v.as_bool()),
         last_run: v.get("last_run").and_then(|v| v.as_str()).map(String::from),
         created_at: v.get("created_at")?.as_str()?.to_string(),
-        context_summary: v.get("context_summary").and_then(|v| v.as_str()).map(String::from),
+        context_summary: v
+            .get("context_summary")
+            .and_then(|v| v.as_str())
+            .map(String::from),
     });
-    sched_debug(&format!("[read_schedule_entry] result: id={}, type={}, schedule={}, last_run={:?}",
+    sched_debug(&format!(
+        "[read_schedule_entry] result: id={}, type={}, schedule={}, last_run={:?}",
         entry.as_ref().map(|e| e.id.as_str()).unwrap_or("?"),
-        entry.as_ref().map(|e| e.schedule_type.as_str()).unwrap_or("?"),
+        entry
+            .as_ref()
+            .map(|e| e.schedule_type.as_str())
+            .unwrap_or("?"),
         entry.as_ref().map(|e| e.schedule.as_str()).unwrap_or("?"),
         entry.as_ref().and_then(|e| e.last_run.as_deref()),
     ));
@@ -1206,15 +1622,20 @@ fn read_schedule_entry(path: &std::path::Path) -> Option<ScheduleEntry> {
 
 /// Write a schedule entry to its JSON file
 fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
-    sched_debug(&format!("[write_schedule_entry] id={}, type={}, schedule={}, once={:?}, last_run={:?}",
-        entry.id, entry.schedule_type, entry.schedule, entry.once, entry.last_run));
+    sched_debug(&format!(
+        "[write_schedule_entry] id={}, type={}, schedule={}, once={:?}, last_run={:?}",
+        entry.id, entry.schedule_type, entry.schedule, entry.once, entry.last_run
+    ));
     // Reject cron expressions the matcher can't interpret so a syntactically
     // wrong --at value fails loudly at register/update time instead of
     // silently never firing. `absolute` schedules carry a wall-clock
     // timestamp, not cron syntax, so they're exempt.
     if entry.schedule_type == "cron" {
         if let Err(e) = validate_cron_expression(&entry.schedule) {
-            sched_debug(&format!("[write_schedule_entry] id={}, invalid cron: {}", entry.id, e));
+            sched_debug(&format!(
+                "[write_schedule_entry] id={}, invalid cron: {}",
+                entry.id, e
+            ));
             return Err(e);
         }
     }
@@ -1236,23 +1657,38 @@ fn write_schedule_entry(entry: &ScheduleEntry) -> Result<(), String> {
         "context_summary": entry.context_summary,
     });
     if let Some(once_val) = entry.once {
-        json.as_object_mut().unwrap().insert("once".to_string(), serde_json::json!(once_val));
+        json.as_object_mut()
+            .unwrap()
+            .insert("once".to_string(), serde_json::json!(once_val));
     }
     let path = dir.join(format!("{}.json", entry.id));
     let tmp_path = dir.join(format!("{}.json.tmp", entry.id));
-    sched_debug(&format!("[write_schedule_entry] writing tmp: {}", tmp_path.display()));
-    fs::write(&tmp_path, serde_json::to_string_pretty(&json).unwrap_or_default())
-        .map_err(|e| format!("Failed to write schedule file: {e}"))?;
-    sched_debug(&format!("[write_schedule_entry] atomic rename: {} → {}", tmp_path.display(), path.display()));
-    let result = fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("Failed to finalize schedule file: {e}"));
+    sched_debug(&format!(
+        "[write_schedule_entry] writing tmp: {}",
+        tmp_path.display()
+    ));
+    fs::write(
+        &tmp_path,
+        serde_json::to_string_pretty(&json).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write schedule file: {e}"))?;
+    sched_debug(&format!(
+        "[write_schedule_entry] atomic rename: {} → {}",
+        tmp_path.display(),
+        path.display()
+    ));
+    let result =
+        fs::rename(&tmp_path, &path).map_err(|e| format!("Failed to finalize schedule file: {e}"));
     sched_debug(&format!("[write_schedule_entry] result: {:?}", result));
     result
 }
 
 /// List all schedule entries matching the given bot_key and optionally chat_id
 fn list_schedule_entries(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEntry> {
-    sched_debug(&format!("[list_schedule_entries] bot_key=<redacted>, chat_id={:?}", chat_id));
+    sched_debug(&format!(
+        "[list_schedule_entries] bot_key=<redacted>, chat_id={:?}",
+        chat_id
+    ));
     let Some(dir) = schedule_dir() else {
         sched_debug("[list_schedule_entries] no schedule dir");
         return Vec::new();
@@ -1266,7 +1702,12 @@ fn list_schedule_entries(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEnt
     };
     let mut result: Vec<ScheduleEntry> = entries
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|ext| ext == "json").unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "json")
+                .unwrap_or(false)
+        })
         .filter_map(|e| read_schedule_entry(&e.path()))
         .filter(|e| {
             // Recompute the expected verifier per entry — chat_id and id are
@@ -1277,9 +1718,15 @@ fn list_schedule_entries(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEnt
         .filter(|e| chat_id.map_or(true, |cid| e.chat_id == cid))
         .collect();
     result.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-    sched_debug(&format!("[list_schedule_entries] found {} entries: [{}]",
+    sched_debug(&format!(
+        "[list_schedule_entries] found {} entries: [{}]",
         result.len(),
-        result.iter().map(|e| format!("{}({})", e.id, e.schedule_type)).collect::<Vec<_>>().join(", ")));
+        result
+            .iter()
+            .map(|e| format!("{}({})", e.id, e.schedule_type))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
     result
 }
 
@@ -1293,13 +1740,21 @@ fn delete_schedule_entry(id: &str) -> bool {
     let path = dir.join(format!("{id}.json"));
     let existed = path.exists();
     let ok = fs::remove_file(&path).is_ok();
-    sched_debug(&format!("[delete_schedule_entry] path={}, existed={}, removed={}", path.display(), existed, ok));
+    sched_debug(&format!(
+        "[delete_schedule_entry] path={}, existed={}, removed={}",
+        path.display(),
+        existed,
+        ok
+    ));
 
     // Also remove the .result file if it exists
     let result_path = dir.join(format!("{id}.result"));
     if result_path.exists() {
         let _ = fs::remove_file(&result_path);
-        sched_debug(&format!("[delete_schedule_entry] also removed .result: {}", result_path.display()));
+        sched_debug(&format!(
+            "[delete_schedule_entry] also removed .result: {}",
+            result_path.display()
+        ));
     }
 
     ok
@@ -1317,7 +1772,10 @@ fn schedule_history_dir() -> Option<std::path::PathBuf> {
 /// (e.g. `../../etc/passwd`) into the resulting path.
 pub fn schedule_history_path_pub(id: &str) -> Option<std::path::PathBuf> {
     if !is_valid_schedule_id(id) {
-        sched_debug(&format!("[schedule_history_path_pub] rejected id={:?} (must match [0-9A-F]{{8}})", id));
+        sched_debug(&format!(
+            "[schedule_history_path_pub] rejected id={:?} (must match [0-9A-F]{{8}})",
+            id
+        ));
         return None;
     }
     schedule_history_dir().map(|d| d.join(format!("{}.log", id)))
@@ -1335,18 +1793,24 @@ fn append_schedule_history(
     chat_id: i64,
     bot_key: &str,
     prompt: &str,
-    status: &str,            // "ok" | "cancelled" | "error"
+    status: &str, // "ok" | "cancelled" | "error"
     response: &str,
     error: Option<&str>,
     workspace_path: &str,
     duration_ms: u64,
 ) {
     let Some(dir) = schedule_history_dir() else {
-        sched_debug(&format!("[append_schedule_history] id={}, no home dir → skip", schedule_id));
+        sched_debug(&format!(
+            "[append_schedule_history] id={}, no home dir → skip",
+            schedule_id
+        ));
         return;
     };
     if let Err(e) = fs::create_dir_all(&dir) {
-        sched_debug(&format!("[append_schedule_history] id={}, create_dir_all failed: {}", schedule_id, e));
+        sched_debug(&format!(
+            "[append_schedule_history] id={}, create_dir_all failed: {}",
+            schedule_id, e
+        ));
         return;
     }
 
@@ -1377,12 +1841,19 @@ fn append_schedule_history(
         "duration_ms": duration_ms,
     });
     if let Some(err) = error {
-        record.as_object_mut().unwrap().insert("error".to_string(), serde_json::json!(err));
+        record
+            .as_object_mut()
+            .unwrap()
+            .insert("error".to_string(), serde_json::json!(err));
     }
 
     let path = dir.join(format!("{}.log", schedule_id));
     let Some(_history_lock) = lock_schedule_history_file(&path) else {
-        sched_debug(&format!("[append_schedule_history] id={}, lock failed: {}", schedule_id, path.display()));
+        sched_debug(&format!(
+            "[append_schedule_history] id={}, lock failed: {}",
+            schedule_id,
+            path.display()
+        ));
         return;
     };
     redact_schedule_history_file_once_unlocked(&path);
@@ -1393,10 +1864,19 @@ fn append_schedule_history(
         .open(&path)
         .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
     match result {
-        Ok(_) => sched_debug(&format!("[append_schedule_history] id={}, status={}, bytes={}, path={}",
-            schedule_id, status, line.len(), path.display())),
-        Err(e) => sched_debug(&format!("[append_schedule_history] id={}, write failed: {}, path={}",
-            schedule_id, e, path.display())),
+        Ok(_) => sched_debug(&format!(
+            "[append_schedule_history] id={}, status={}, bytes={}, path={}",
+            schedule_id,
+            status,
+            line.len(),
+            path.display()
+        )),
+        Err(e) => sched_debug(&format!(
+            "[append_schedule_history] id={}, write failed: {}, path={}",
+            schedule_id,
+            e,
+            path.display()
+        )),
     }
 }
 
@@ -1432,7 +1912,10 @@ fn lock_schedule_history_file(path: &std::path::Path) -> Option<std::fs::File> {
 
 fn redact_schedule_history_file(path: &std::path::Path) {
     let Some(_history_lock) = lock_schedule_history_file(path) else {
-        sched_debug(&format!("[redact_schedule_history_file] lock failed: {}", path.display()));
+        sched_debug(&format!(
+            "[redact_schedule_history_file] lock failed: {}",
+            path.display()
+        ));
         return;
     };
     redact_schedule_history_file_once_unlocked(path);
@@ -1482,8 +1965,14 @@ fn redact_schedule_history_file_unlocked(path: &std::path::Path) -> bool {
 
         match serde_json::from_str::<serde_json::Value>(line) {
             Ok(mut record) => {
-                let legacy_key = record.get("bot_key").and_then(|v| v.as_str()).map(str::to_string);
-                let schedule_id = record.get("schedule_id").and_then(|v| v.as_str()).map(str::to_string);
+                let legacy_key = record
+                    .get("bot_key")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let schedule_id = record
+                    .get("schedule_id")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 let chat_id = record.get("chat_id").and_then(|v| v.as_i64());
 
                 if let (Some(legacy_key), Some(schedule_id), Some(chat_id)) =
@@ -1776,12 +2265,21 @@ mod live_schedule_tests {
 /// removing a schedule also clears its accumulated history (consistent with how
 /// `delete_schedule_entry` already removes the schedule's `.result` companion).
 fn delete_schedule_history(id: &str) {
-    let Some(dir) = schedule_history_dir() else { return; };
+    let Some(dir) = schedule_history_dir() else {
+        return;
+    };
     let path = dir.join(format!("{}.log", id));
     if path.exists() {
         match fs::remove_file(&path) {
-            Ok(_) => sched_debug(&format!("[delete_schedule_history] removed: {}", path.display())),
-            Err(e) => sched_debug(&format!("[delete_schedule_history] remove failed: {}, path={}", e, path.display())),
+            Ok(_) => sched_debug(&format!(
+                "[delete_schedule_history] removed: {}",
+                path.display()
+            )),
+            Err(e) => sched_debug(&format!(
+                "[delete_schedule_history] remove failed: {}, path={}",
+                e,
+                path.display()
+            )),
         }
     }
     let marker = schedule_history_redaction_marker_path(&path);
@@ -1801,7 +2299,10 @@ fn delete_schedule_history(id: &str) {
 /// `is_valid_schedule_id` for the path-traversal rationale.
 pub fn delete_schedule_history_pub(id: &str) {
     if !is_valid_schedule_id(id) {
-        sched_debug(&format!("[delete_schedule_history_pub] rejected id={:?} (must match [0-9A-F]{{8}})", id));
+        sched_debug(&format!(
+            "[delete_schedule_history_pub] rejected id={:?} (must match [0-9A-F]{{8}})",
+            id
+        ));
         return;
     }
     delete_schedule_history(id);
@@ -1819,7 +2320,10 @@ fn parse_relative_time(s: &str) -> Option<chrono::DateTime<chrono::Local>> {
     let num: i64 = match num_part.parse() {
         Ok(n) => n,
         Err(_) => {
-            sched_debug(&format!("[parse_relative_time] invalid number: {:?} → None", num_part));
+            sched_debug(&format!(
+                "[parse_relative_time] invalid number: {:?} → None",
+                num_part
+            ));
             return None;
         }
     };
@@ -1832,12 +2336,20 @@ fn parse_relative_time(s: &str) -> Option<chrono::DateTime<chrono::Local>> {
         "h" => num * 3600,
         "d" => num * 86400,
         _ => {
-            sched_debug(&format!("[parse_relative_time] unknown unit: {:?} → None", unit));
+            sched_debug(&format!(
+                "[parse_relative_time] unknown unit: {:?} → None",
+                unit
+            ));
             return None;
         }
     };
     let result = Some(chrono::Local::now() + chrono::Duration::seconds(seconds));
-    sched_debug(&format!("[parse_relative_time] → {:?}", result.as_ref().map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())));
+    sched_debug(&format!(
+        "[parse_relative_time] → {:?}",
+        result
+            .as_ref()
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+    ));
     result
 }
 
@@ -1849,7 +2361,11 @@ fn cron_matches(expr: &str, dt: chrono::DateTime<chrono::Local>) -> bool {
 
     let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != 5 {
-        sched_debug(&format!("[cron_matches] invalid field count: {} (expected 5) for expr={:?}", fields.len(), expr));
+        sched_debug(&format!(
+            "[cron_matches] invalid field count: {} (expected 5) for expr={:?}",
+            fields.len(),
+            expr
+        ));
         return false;
     }
 
@@ -1865,15 +2381,30 @@ fn cron_matches(expr: &str, dt: chrono::DateTime<chrono::Local>) -> bool {
     // Range start for each field: minute(0), hour(0), day-of-month(1), month(1), day-of-week(0)
     let range_starts = [0u32, 0, 1, 1, 0];
 
-    for (i, ((field, &val), &range_start)) in fields.iter().zip(values.iter()).zip(range_starts.iter()).enumerate() {
+    for (i, ((field, &val), &range_start)) in fields
+        .iter()
+        .zip(values.iter())
+        .zip(range_starts.iter())
+        .enumerate()
+    {
         let matched = cron_field_matches(field, val, range_start);
         if !matched {
-            sched_debug(&format!("[cron_matches] expr={:?}, dt={}, {}({})!={} → false",
-                expr, dt.format("%H:%M"), field_names[i], val, field));
+            sched_debug(&format!(
+                "[cron_matches] expr={:?}, dt={}, {}({})!={} → false",
+                expr,
+                dt.format("%H:%M"),
+                field_names[i],
+                val,
+                field
+            ));
             return false;
         }
     }
-    sched_debug(&format!("[cron_matches] expr={:?}, dt={} → true", expr, dt.format("%H:%M")));
+    sched_debug(&format!(
+        "[cron_matches] expr={:?}, dt={} → true",
+        expr,
+        dt.format("%H:%M")
+    ));
     true
 }
 
@@ -1884,55 +2415,97 @@ fn cron_matches(expr: &str, dt: chrono::DateTime<chrono::Local>) -> bool {
 /// only the public CLI surface needs this check, but the lower-level path
 /// helpers also enforce it as defense in depth.
 fn is_valid_schedule_id(id: &str) -> bool {
-    id.len() == 8 && id.bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+    id.len() == 8
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
 }
 
 /// Validate one comma-separated subexpression of a cron field. Mirrors the
 /// shape `cron_field_matches` actually accepts so we never write a schedule
 /// the matcher cannot interpret. `full_field` is included in errors to make
 /// the failure self-explanatory.
-fn validate_cron_part(part: &str, range_min: u32, range_max: u32, field_name: &str, full_field: &str) -> Result<(), String> {
+fn validate_cron_part(
+    part: &str,
+    range_min: u32,
+    range_max: u32,
+    field_name: &str,
+    full_field: &str,
+) -> Result<(), String> {
     // Step form: */n or a-b/n
     if let Some((range_part, step_str)) = part.split_once('/') {
         let step: u32 = step_str.parse().map_err(|_| {
-            format!("{}: invalid step '{}' in '{}'", field_name, step_str, full_field)
+            format!(
+                "{}: invalid step '{}' in '{}'",
+                field_name, step_str, full_field
+            )
         })?;
         if step == 0 {
-            return Err(format!("{}: step must be > 0 in '{}'", field_name, full_field));
+            return Err(format!(
+                "{}: step must be > 0 in '{}'",
+                field_name, full_field
+            ));
         }
         if range_part == "*" {
             return Ok(());
         }
         if let Some((start_str, end_str)) = range_part.split_once('-') {
             let start: u32 = start_str.parse().map_err(|_| {
-                format!("{}: invalid range start '{}' in '{}'", field_name, start_str, full_field)
+                format!(
+                    "{}: invalid range start '{}' in '{}'",
+                    field_name, start_str, full_field
+                )
             })?;
             let end: u32 = end_str.parse().map_err(|_| {
-                format!("{}: invalid range end '{}' in '{}'", field_name, end_str, full_field)
+                format!(
+                    "{}: invalid range end '{}' in '{}'",
+                    field_name, end_str, full_field
+                )
             })?;
             if start > end {
-                return Err(format!("{}: range {}-{} (start > end) in '{}'", field_name, start, end, full_field));
+                return Err(format!(
+                    "{}: range {}-{} (start > end) in '{}'",
+                    field_name, start, end, full_field
+                ));
             }
             if start < range_min || end > range_max {
-                return Err(format!("{}: range {}-{} out of bounds [{},{}] in '{}'", field_name, start, end, range_min, range_max, full_field));
+                return Err(format!(
+                    "{}: range {}-{} out of bounds [{},{}] in '{}'",
+                    field_name, start, end, range_min, range_max, full_field
+                ));
             }
             return Ok(());
         }
-        return Err(format!("{}: step requires '*/n' or 'a-b/n' (got '{}' in '{}')", field_name, part, full_field));
+        return Err(format!(
+            "{}: step requires '*/n' or 'a-b/n' (got '{}' in '{}')",
+            field_name, part, full_field
+        ));
     }
     // Range: a-b
     if let Some((start_str, end_str)) = part.split_once('-') {
         let start: u32 = start_str.parse().map_err(|_| {
-            format!("{}: invalid range start '{}' in '{}'", field_name, start_str, full_field)
+            format!(
+                "{}: invalid range start '{}' in '{}'",
+                field_name, start_str, full_field
+            )
         })?;
         let end: u32 = end_str.parse().map_err(|_| {
-            format!("{}: invalid range end '{}' in '{}'", field_name, end_str, full_field)
+            format!(
+                "{}: invalid range end '{}' in '{}'",
+                field_name, end_str, full_field
+            )
         })?;
         if start > end {
-            return Err(format!("{}: range {}-{} (start > end) in '{}'", field_name, start, end, full_field));
+            return Err(format!(
+                "{}: range {}-{} (start > end) in '{}'",
+                field_name, start, end, full_field
+            ));
         }
         if start < range_min || end > range_max {
-            return Err(format!("{}: range {}-{} out of bounds [{},{}] in '{}'", field_name, start, end, range_min, range_max, full_field));
+            return Err(format!(
+                "{}: range {}-{} out of bounds [{},{}] in '{}'",
+                field_name, start, end, range_min, range_max, full_field
+            ));
         }
         return Ok(());
     }
@@ -1954,13 +2527,23 @@ fn validate_cron_part(part: &str, range_min: u32, range_max: u32, field_name: &s
         } else {
             ""
         };
-        return Err(format!("{}: {} out of bounds [{},{}]{} in '{}'", field_name, n, range_min, range_max, hint, full_field));
+        return Err(format!(
+            "{}: {} out of bounds [{},{}]{} in '{}'",
+            field_name, n, range_min, range_max, hint, full_field
+        ));
     }
     Ok(())
 }
 
-fn validate_cron_field(field: &str, range_min: u32, range_max: u32, field_name: &str) -> Result<(), String> {
-    if field == "*" { return Ok(()); }
+fn validate_cron_field(
+    field: &str,
+    range_min: u32,
+    range_max: u32,
+    field_name: &str,
+) -> Result<(), String> {
+    if field == "*" {
+        return Ok(());
+    }
     for part in field.split(',') {
         let part = part.trim();
         if part.is_empty() {
@@ -2002,23 +2585,34 @@ fn validate_cron_expression(expr: &str) -> Result<(), String> {
 /// Supports: *, single number, comma-separated list, ranges (a-b), step (*/n, a-b/n)
 /// range_start: the minimum value for this field (0 for minute/hour/dow, 1 for day/month)
 fn cron_field_matches(field: &str, val: u32, range_start: u32) -> bool {
-    if field == "*" { return true; }
+    if field == "*" {
+        return true;
+    }
 
     for part in field.split(',') {
         let part = part.trim();
         // Handle step: */n or a-b/n
         if let Some((range_part, step_str)) = part.split_once('/') {
             if let Ok(step) = step_str.parse::<u32>() {
-                if step == 0 { continue; }
+                if step == 0 {
+                    continue;
+                }
                 if range_part == "*" {
                     if (val - range_start) % step == 0 {
-                        sched_debug(&format!("[cron_field_matches] field={}, val={}, */{}  → true", field, val, step));
+                        sched_debug(&format!(
+                            "[cron_field_matches] field={}, val={}, */{}  → true",
+                            field, val, step
+                        ));
                         return true;
                     }
                 } else if let Some((start_str, end_str)) = range_part.split_once('-') {
-                    if let (Ok(start), Ok(end)) = (start_str.parse::<u32>(), end_str.parse::<u32>()) {
+                    if let (Ok(start), Ok(end)) = (start_str.parse::<u32>(), end_str.parse::<u32>())
+                    {
                         if val >= start && val <= end && (val - start) % step == 0 {
-                            sched_debug(&format!("[cron_field_matches] field={}, val={}, {}-{}/{} → true", field, val, start, end, step));
+                            sched_debug(&format!(
+                                "[cron_field_matches] field={}, val={}, {}-{}/{} → true",
+                                field, val, start, end, step
+                            ));
                             return true;
                         }
                     }
@@ -2028,7 +2622,10 @@ fn cron_field_matches(field: &str, val: u32, range_start: u32) -> bool {
             // Range: a-b
             if let (Ok(start), Ok(end)) = (start_str.parse::<u32>(), end_str.parse::<u32>()) {
                 if val >= start && val <= end {
-                    sched_debug(&format!("[cron_field_matches] field={}, val={}, range {}-{} → true", field, val, start, end));
+                    sched_debug(&format!(
+                        "[cron_field_matches] field={}, val={}, range {}-{} → true",
+                        field, val, start, end
+                    ));
                     return true;
                 }
             }
@@ -2036,7 +2633,10 @@ fn cron_field_matches(field: &str, val: u32, range_start: u32) -> bool {
             // Single number
             if let Ok(n) = part.parse::<u32>() {
                 if val == n {
-                    sched_debug(&format!("[cron_field_matches] field={}, val={}, exact {} → true", field, val, n));
+                    sched_debug(&format!(
+                        "[cron_field_matches] field={}, val={}, exact {} → true",
+                        field, val, n
+                    ));
                     return true;
                 }
             }
@@ -2069,7 +2669,7 @@ pub struct ScheduleEntryData {
     pub prompt: String,
     pub schedule: String,
     pub schedule_type: String,
-    pub once: Option<bool>,       // only meaningful for cron (None for absolute)
+    pub once: Option<bool>, // only meaningful for cron (None for absolute)
     pub last_run: Option<String>,
     pub created_at: String,
     pub context_summary: Option<String>,
@@ -2139,12 +2739,19 @@ pub fn write_schedule_entry_pub(data: &ScheduleEntryData) -> Result<(), String> 
 }
 
 pub fn list_schedule_entries_pub(bot_key: &str, chat_id: Option<i64>) -> Vec<ScheduleEntryData> {
-    list_schedule_entries(bot_key, chat_id).iter().map(ScheduleEntryData::from).collect()
+    list_schedule_entries(bot_key, chat_id)
+        .iter()
+        .map(ScheduleEntryData::from)
+        .collect()
 }
 
 pub fn list_all_schedule_ids_pub() -> std::collections::HashSet<String> {
-    let Some(dir) = schedule_dir() else { return std::collections::HashSet::new() };
-    let Ok(entries) = fs::read_dir(&dir) else { return std::collections::HashSet::new() };
+    let Some(dir) = schedule_dir() else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return std::collections::HashSet::new();
+    };
     entries
         .filter_map(|e| e.ok())
         .filter_map(|e| {
@@ -2160,7 +2767,10 @@ pub fn list_all_schedule_ids_pub() -> std::collections::HashSet<String> {
 
 pub fn delete_schedule_entry_pub(id: &str) -> bool {
     if !is_valid_schedule_id(id) {
-        sched_debug(&format!("[delete_schedule_entry_pub] rejected id={:?} (must match [0-9A-F]{{8}})", id));
+        sched_debug(&format!(
+            "[delete_schedule_entry_pub] rejected id={:?} (must match [0-9A-F]{{8}})",
+            id
+        ));
         return false;
     }
     delete_schedule_entry(id)
@@ -2236,17 +2846,27 @@ fn load_cowork_guidelines() -> String {
         if cowork_path.exists() {
             if let Ok(content) = std::fs::read_to_string(&cowork_path) {
                 let trimmed = content.trim().to_string();
-                msg_debug(&format!("[load_cowork_guidelines] loaded from file: {}, len={}, empty={}",
-                    cowork_path.display(), trimmed.len(), trimmed.is_empty()));
+                msg_debug(&format!(
+                    "[load_cowork_guidelines] loaded from file: {}, len={}, empty={}",
+                    cowork_path.display(),
+                    trimmed.len(),
+                    trimmed.is_empty()
+                ));
                 return trimmed;
             } else {
-                msg_debug(&format!("[load_cowork_guidelines] failed to read file: {}", cowork_path.display()));
+                msg_debug(&format!(
+                    "[load_cowork_guidelines] failed to read file: {}",
+                    cowork_path.display()
+                ));
             }
         } else {
             // Auto-generate default file
             let _ = std::fs::create_dir_all(&prompt_dir);
             let _ = std::fs::write(&cowork_path, DEFAULT_COWORK_GUIDELINES);
-            msg_debug(&format!("[load_cowork_guidelines] created default file: {}", cowork_path.display()));
+            msg_debug(&format!(
+                "[load_cowork_guidelines] created default file: {}",
+                cowork_path.display()
+            ));
         }
     }
     msg_debug("[load_cowork_guidelines] using built-in default");
@@ -2254,7 +2874,19 @@ fn load_cowork_guidelines() -> String {
 }
 
 /// Build the system prompt for AI sessions
-fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &str, disabled_notice: &str, session_id: Option<&str>, bot_username: &str, bot_display_name: &str, user_message: Option<&str>, context_count: usize, platform: &str) -> String {
+fn build_system_prompt(
+    role: &str,
+    current_path: &str,
+    chat_id: i64,
+    bot_key: &str,
+    disabled_notice: &str,
+    session_id: Option<&str>,
+    bot_username: &str,
+    bot_display_name: &str,
+    user_message: Option<&str>,
+    context_count: usize,
+    platform: &str,
+) -> String {
     msg_debug(&format!("[build_system_prompt] chat_id={}, bot_username={:?}, bot_display_name={:?}, session_id={:?}, disabled_notice_len={}, role_len={}",
         chat_id, bot_username, bot_display_name, session_id, disabled_notice.len(), role.len()));
     let is_group_chat = chat_id < 0 && context_count > 0;
@@ -2286,43 +2918,65 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
         // Uses the tail-N variant so we don't load the whole JSONL into RAM
         // on every AI request when the chat history grows large.
         let recent_entries = read_group_chat_log_tail(chat_id, context_count, None);
-        let recent_lines: String = recent_entries.iter().map(|(_, entry)| {
-            let bot_label = match &entry.bot_display_name {
-                Some(dn) if !dn.is_empty() => format!("{}(@{})", dn, entry.bot),
-                _ => format!("@{}", entry.bot),
-            };
-            let from_info = entry.from.as_deref().map(|f| format!("({})", f)).unwrap_or_default();
-            let role_display = if entry.role == "user" {
-                format!("user→{}", bot_label)
-            } else {
-                bot_label
-            };
-            let display_text = if entry.role == "assistant" {
-                let parsed = parse_payload_auto(&entry.text);
-                if parsed.is_empty() {
-                    entry.text.clone()
+        let recent_lines: String = recent_entries
+            .iter()
+            .map(|(_, entry)| {
+                let bot_label = match &entry.bot_display_name {
+                    Some(dn) if !dn.is_empty() => format!("{}(@{})", dn, entry.bot),
+                    _ => format!("@{}", entry.bot),
+                };
+                let from_info = entry
+                    .from
+                    .as_deref()
+                    .map(|f| format!("({})", f))
+                    .unwrap_or_default();
+                let role_display = if entry.role == "user" {
+                    format!("user→{}", bot_label)
                 } else {
-                    format_raw_payload(&parsed)
-                }
-            } else {
-                entry.text.clone()
-            };
-            format!("  [{}] {}{}: {}\n", entry.ts, role_display, from_info, display_text)
-        }).collect();
+                    bot_label
+                };
+                let display_text = if entry.role == "assistant" {
+                    let parsed = parse_payload_auto(&entry.text);
+                    if parsed.is_empty() {
+                        entry.text.clone()
+                    } else {
+                        format_raw_payload(&parsed)
+                    }
+                } else {
+                    entry.text.clone()
+                };
+                format!(
+                    "  [{}] {}{}: {}\n",
+                    entry.ts, role_display, from_info, display_text
+                )
+            })
+            .collect();
 
         let recent_section = if recent_lines.is_empty() {
             String::from("\n(No recent entries)")
         } else {
-            format!("\nRecent entries (last {}):\n{}", recent_entries.len(), recent_lines)
+            format!(
+                "\nRecent entries (last {}):\n{}",
+                recent_entries.len(),
+                recent_lines
+            )
         };
 
         // Detect if another bot already answered the SAME user request
         let my_bot = bot_username.trim_start_matches('@').to_lowercase();
-        msg_debug(&format!("[dedup] my_bot={:?}, user_message={:?}, window_size={}",
-            my_bot, user_message.map(|s| truncate_str(s, 80)), recent_entries.len()));
+        msg_debug(&format!(
+            "[dedup] my_bot={:?}, user_message={:?}, window_size={}",
+            my_bot,
+            user_message.map(|s| truncate_str(s, 80)),
+            recent_entries.len()
+        ));
         let other_bot_answered_same = if let Some(user_msg) = user_message {
             let user_msg_trimmed = user_msg.trim();
-            msg_debug(&format!("[dedup] comparing user_msg_trimmed={:?} (len={})", truncate_str(user_msg_trimmed, 100), user_msg_trimmed.len()));
+            msg_debug(&format!(
+                "[dedup] comparing user_msg_trimmed={:?} (len={})",
+                truncate_str(user_msg_trimmed, 100),
+                user_msg_trimmed.len()
+            ));
             // If the log contains a "user" entry for ANOTHER bot with the same text,
             // that bot has already finished processing (entries are written after completion).
             let mut found = false;
@@ -2338,7 +2992,10 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
                     found = true;
                 }
             }
-            msg_debug(&format!("[dedup] result: other_bot_answered_same={}", found));
+            msg_debug(&format!(
+                "[dedup] result: other_bot_answered_same={}",
+                found
+            ));
             found
         } else {
             msg_debug("[dedup] user_message is None — skipping dedup check");
@@ -2365,19 +3022,28 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
         let all_bots = collect_group_chat_bots(chat_id);
         let my_bot = bot_username.trim_start_matches('@').to_lowercase();
         let bot_roster: String = if all_bots.len() > 1 {
-            let list: String = all_bots.iter().map(|(uname, dname)| {
-                let is_me = uname.to_lowercase() == my_bot;
-                match dname {
-                    Some(dn) if !dn.is_empty() => {
-                        if is_me { format!("  • {}(@{}) ← YOU\n", dn, uname) }
-                        else { format!("  • {}(@{})\n", dn, uname) }
+            let list: String = all_bots
+                .iter()
+                .map(|(uname, dname)| {
+                    let is_me = uname.to_lowercase() == my_bot;
+                    match dname {
+                        Some(dn) if !dn.is_empty() => {
+                            if is_me {
+                                format!("  • {}(@{}) ← YOU\n", dn, uname)
+                            } else {
+                                format!("  • {}(@{})\n", dn, uname)
+                            }
+                        }
+                        _ => {
+                            if is_me {
+                                format!("  • @{} ← YOU\n", uname)
+                            } else {
+                                format!("  • @{}\n", uname)
+                            }
+                        }
                     }
-                    _ => {
-                        if is_me { format!("  • @{} ← YOU\n", uname) }
-                        else { format!("  • @{}\n", uname) }
-                    }
-                }
-            }).collect();
+                })
+                .collect();
             format!("\nBots in this chat ({}):\n{}", all_bots.len(), list)
         } else {
             String::new()
@@ -2460,7 +3126,10 @@ fn build_system_prompt(role: &str, current_path: &str, chat_id: i64, bot_key: &s
     };
     let group_chat_cowork_section = if !bot_username.is_empty() && is_group_chat {
         let cowork_guidelines = load_cowork_guidelines();
-        msg_debug(&format!("[build_system_prompt] cowork_guidelines loaded, len={}", cowork_guidelines.len()));
+        msg_debug(&format!(
+            "[build_system_prompt] cowork_guidelines loaded, len={}",
+            cowork_guidelines.len()
+        ));
         format!(
             "\n\n\
              ── GROUP CHAT CO-WORK CONTEXT ──\n\
@@ -2587,17 +3256,19 @@ fn schedule_history_dir_for_prompt() -> String {
 /// Runs `Where.exe powershell.exe` once and caches the first match.
 fn detect_powershell_path() -> Option<&'static str> {
     static PS_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    PS_PATH.get_or_init(|| {
-        let output = std::process::Command::new("Where.exe")
-            .arg("powershell.exe")
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        stdout.lines().next().map(|s| s.trim().to_string())
-    }).as_deref()
+    PS_PATH
+        .get_or_init(|| {
+            let output = std::process::Command::new("Where.exe")
+                .arg("powershell.exe")
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            stdout.lines().next().map(|s| s.trim().to_string())
+        })
+        .as_deref()
 }
 
 /// Returns additional system prompt instructions specific to Codex models.
@@ -2618,8 +3289,7 @@ fn codex_extra_instructions() -> String {
 
     if cfg!(target_os = "windows") {
         let bin = shell_bin_path();
-        let ps_path = detect_powershell_path()
-            .unwrap_or("powershell.exe");
+        let ps_path = detect_powershell_path().unwrap_or("powershell.exe");
         // Shell environment info + cokacdir command guidance
         extra.push_str(&format!(
             "\n\n\
@@ -2669,10 +3339,47 @@ const LOOP_MAX_ITERATIONS: u16 = 5;
 struct QueuedMessage {
     /// Short hex ID for user-facing reference (e.g. "A394FDA")
     id: String,
-    text: String,
     user_display_name: String,
-    /// File/location upload records captured at queue time so the correct message gets them
-    pending_uploads: Vec<String>,
+    payload: QueuedPayload,
+}
+
+enum QueuedPayload {
+    Text {
+        text: String,
+        /// File/location upload records captured at queue time so the correct message gets them
+        pending_uploads: Vec<String>,
+    },
+    SttAudio {
+        msg: Message,
+        caption_text: Option<String>,
+    },
+    AlbumAttachments {
+        msgs: Vec<Message>,
+        caption_str: Option<String>,
+        require_prefix: bool,
+        bot_username: String,
+    },
+}
+
+impl QueuedMessage {
+    fn preview_text(&self) -> String {
+        match &self.payload {
+            QueuedPayload::Text { text, .. } => text.clone(),
+            QueuedPayload::SttAudio { .. } => "Audio upload: STT".to_string(),
+            QueuedPayload::AlbumAttachments { msgs, .. } => {
+                format!("Album: {} attachment(s)", msgs.len())
+            }
+        }
+    }
+
+    fn pending_uploads_len(&self) -> usize {
+        match &self.payload {
+            QueuedPayload::Text {
+                pending_uploads, ..
+            } => pending_uploads.len(),
+            QueuedPayload::SttAudio { .. } | QueuedPayload::AlbumAttachments { .. } => 0,
+        }
+    }
 }
 
 /// Generate a short uppercase hex ID (7 chars) for a queued message
@@ -2683,7 +3390,9 @@ fn generate_queue_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     // Mix in a simple hash to reduce collisions within the same millisecond
-    let hash = nanos.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let hash = nanos
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     format!("{:07X}", (hash >> 32) as u32 & 0x0FFF_FFFF)
 }
 
@@ -2716,7 +3425,7 @@ struct SharedData {
     /// Per-chat loop state for /loop command (self-verification loop)
     loop_states: HashMap<ChatId, LoopState>,
     /// Pending loop feedback to re-inject (separate from message_queues to bypass queue mode check)
-    loop_feedback: HashMap<ChatId, (String, String)>,  // (feedback_text, user_display_name)
+    loop_feedback: HashMap<ChatId, (String, String)>, // (feedback_text, user_display_name)
     /// Monotonic counter incremented on each /clear. Polling tasks capture it at spawn
     /// and skip session writeback if it changes — covers the case where /clear lands on
     /// a brand-new session whose session_id is None on both spawn and post-completion
@@ -2734,38 +3443,70 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
     if data.sessions.contains_key(&chat_id) {
         return;
     }
-    msg_debug(&format!("[auto-restore] no in-memory session for chat_id={}", chat_id.0));
-    let Some(last_path) = data.settings.last_sessions.get(&chat_id.0.to_string()).cloned() else {
-        msg_debug(&format!("[auto-restore] no last_path in settings for chat_id={}", chat_id.0));
+    msg_debug(&format!(
+        "[auto-restore] no in-memory session for chat_id={}",
+        chat_id.0
+    ));
+    let Some(last_path) = data
+        .settings
+        .last_sessions
+        .get(&chat_id.0.to_string())
+        .cloned()
+    else {
+        msg_debug(&format!(
+            "[auto-restore] no last_path in settings for chat_id={}",
+            chat_id.0
+        ));
         return;
     };
-    msg_debug(&format!("[auto-restore] last_path from settings: {:?}", last_path));
+    msg_debug(&format!(
+        "[auto-restore] last_path from settings: {:?}",
+        last_path
+    ));
     let is_dir = Path::new(&last_path).is_dir();
-    msg_debug(&format!("[auto-restore] is_dir({:?}) = {}", last_path, is_dir));
+    msg_debug(&format!(
+        "[auto-restore] is_dir({:?}) = {}",
+        last_path, is_dir
+    ));
     if !is_dir {
         return;
     }
     let auto_model = get_model(&data.settings, chat_id);
     let auto_provider = detect_provider(auto_model.as_deref());
-    msg_debug(&format!("[auto-restore] auto_provider={}, auto_model={:?}", auto_provider, auto_model));
-    msg_debug(&format!("[auto-restore] step1: load_existing_session(path={:?}, provider={:?})", last_path, auto_provider));
-    let existing = load_existing_session(&last_path, auto_provider)
-        .or_else(|| {
-            msg_debug("[auto-restore] step1 returned None → trying fallback from external source");
-            let provider = provider_to_session(auto_provider);
-            msg_debug(&format!("[auto-restore] step2: find_latest_session_by_cwd(path={:?}, provider={:?})", last_path, auto_provider));
-            if let Some(info) = find_latest_session_by_cwd(&last_path, provider) {
-                msg_debug(&format!("[auto-restore] step2 found: jsonl={}, session_id={}", info.jsonl_path.display(), info.session_id));
-                convert_and_save_session(&info, &last_path);
-                msg_debug("[auto-restore] step3: reload from ai_sessions after convert");
-                let reloaded = load_existing_session(&last_path, auto_provider);
-                msg_debug(&format!("[auto-restore] step3 result: {}", if reloaded.is_some() { "found" } else { "None" }));
-                reloaded
-            } else {
-                msg_debug("[auto-restore] step2 returned None → no external session found");
-                None
-            }
-        });
+    msg_debug(&format!(
+        "[auto-restore] auto_provider={}, auto_model={:?}",
+        auto_provider, auto_model
+    ));
+    msg_debug(&format!(
+        "[auto-restore] step1: load_existing_session(path={:?}, provider={:?})",
+        last_path, auto_provider
+    ));
+    let existing = load_existing_session(&last_path, auto_provider).or_else(|| {
+        msg_debug("[auto-restore] step1 returned None → trying fallback from external source");
+        let provider = provider_to_session(auto_provider);
+        msg_debug(&format!(
+            "[auto-restore] step2: find_latest_session_by_cwd(path={:?}, provider={:?})",
+            last_path, auto_provider
+        ));
+        if let Some(info) = find_latest_session_by_cwd(&last_path, provider) {
+            msg_debug(&format!(
+                "[auto-restore] step2 found: jsonl={}, session_id={}",
+                info.jsonl_path.display(),
+                info.session_id
+            ));
+            convert_and_save_session(&info, &last_path);
+            msg_debug("[auto-restore] step3: reload from ai_sessions after convert");
+            let reloaded = load_existing_session(&last_path, auto_provider);
+            msg_debug(&format!(
+                "[auto-restore] step3 result: {}",
+                if reloaded.is_some() { "found" } else { "None" }
+            ));
+            reloaded
+        } else {
+            msg_debug("[auto-restore] step2 returned None → no external session found");
+            None
+        }
+    });
     let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
         session_id: None,
         current_path: None,
@@ -2776,7 +3517,11 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
     session.current_path = Some(last_path.clone());
     let mut restored_active_session = false;
     if let Some((session_data, _)) = existing {
-        msg_debug(&format!("[auto-restore] SUCCESS: session_id={}, history_len={}", session_data.session_id, session_data.history.len()));
+        msg_debug(&format!(
+            "[auto-restore] SUCCESS: session_id={}, history_len={}",
+            session_data.session_id,
+            session_data.history.len()
+        ));
         if session_data_has_active_session(&session_data) {
             session.session_id = Some(session_data.session_id.clone());
             session.history = session_data.history.clone();
@@ -2802,19 +3547,22 @@ async fn auto_restore_session(state: &SharedState, chat_id: ChatId, user_name: &
         let dname = data.bot_display_name.clone();
         if !uname.is_empty() {
             let dn = if dname.is_empty() { None } else { Some(dname) };
-            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                bot: uname,
-                bot_display_name: dn,
-                role: "system".to_string(),
-                from: None,
-                text: if restored_active_session {
-                    format!("Session restored at {}", last_path)
-                } else {
-                    format!("Session started at {}", last_path)
+            append_group_chat_log(
+                chat_id.0,
+                &GroupChatLogEntry {
+                    ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    bot: uname,
+                    bot_display_name: dn,
+                    role: "system".to_string(),
+                    from: None,
+                    text: if restored_active_session {
+                        format!("Session restored at {}", last_path)
+                    } else {
+                        format!("Session started at {}", last_path)
+                    },
+                    clear: false,
                 },
-                clear: false,
-            });
+            );
         }
     }
 }
@@ -2833,12 +3581,18 @@ async fn auto_create_workspace_session(
     chat_id: ChatId,
     bot_token: &str,
 ) -> Option<(Option<String>, String)> {
-    msg_debug(&format!("[auto_workspace] chat_id={}, auto-creating workspace", chat_id.0));
+    msg_debug(&format!(
+        "[auto_workspace] chat_id={}, auto-creating workspace",
+        chat_id.0
+    ));
     let auto_path = {
         let home = match dirs::home_dir() {
             Some(h) => h,
             None => {
-                msg_debug(&format!("[auto_workspace] chat_id={}, home_dir() returned None", chat_id.0));
+                msg_debug(&format!(
+                    "[auto_workspace] chat_id={}, home_dir() returned None",
+                    chat_id.0
+                ));
                 return None;
             }
         };
@@ -2853,7 +3607,10 @@ async fn auto_create_workspace_session(
         match fs::create_dir_all(&new_dir) {
             Ok(_) => new_dir.display().to_string(),
             Err(e) => {
-                msg_debug(&format!("[auto_workspace] chat_id={}, create_dir_all failed: {}", chat_id.0, e));
+                msg_debug(&format!(
+                    "[auto_workspace] chat_id={}, create_dir_all failed: {}",
+                    chat_id.0, e
+                ));
                 return None;
             }
         }
@@ -2861,10 +3618,20 @@ async fn auto_create_workspace_session(
     // Re-check under lock: another concurrent message may have already created a session
     let (sid, path, was_new) = {
         let mut data = state.lock().await;
-        if let Some(existing) = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone()) {
-            msg_debug(&format!("[auto_workspace] chat_id={}, session already created by another message: {}", chat_id.0, existing));
+        if let Some(existing) = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone())
+        {
+            msg_debug(&format!(
+                "[auto_workspace] chat_id={}, session already created by another message: {}",
+                chat_id.0, existing
+            ));
             let _ = fs::remove_dir(&auto_path);
-            let sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+            let sid = data
+                .sessions
+                .get(&chat_id)
+                .and_then(|s| s.session_id.clone());
             (sid, existing, false)
         } else {
             let session = data.sessions.entry(chat_id).or_insert_with(|| ChatSession {
@@ -2877,9 +3644,14 @@ async fn auto_create_workspace_session(
             session.current_path = Some(auto_path.clone());
             session.session_id = None;
             session.history.clear();
-            data.settings.last_sessions.insert(chat_id.0.to_string(), auto_path.clone());
+            data.settings
+                .last_sessions
+                .insert(chat_id.0.to_string(), auto_path.clone());
             save_bot_settings(bot_token, &data.settings);
-            msg_debug(&format!("[auto_workspace] chat_id={}, new workspace session created: {}", chat_id.0, auto_path));
+            msg_debug(&format!(
+                "[auto_workspace] chat_id={}, new workspace session created: {}",
+                chat_id.0, auto_path
+            ));
             (None, auto_path, true)
         }
     };
@@ -2903,9 +3675,12 @@ async fn auto_create_workspace_session(
             notice.push_str(&format!("\nUse /{} to resume this session.", folder_name));
         }
         shared_rate_limit_wait(state, chat_id).await;
-        let _ = tg!("send_message", bot.send_message(chat_id, &notice)
-            .parse_mode(ParseMode::Html)
-            .await);
+        let _ = tg!(
+            "send_message",
+            bot.send_message(chat_id, &notice)
+                .parse_mode(ParseMode::Html)
+                .await
+        );
     }
     Some((sid, path))
 }
@@ -2940,6 +3715,20 @@ const DIRECT_MODE_DEFAULT: bool = false;
 const PUBLIC_MODE_DEFAULT: bool = false;
 /// Default debug mode state (global, not per-chat)
 const DEBUG_MODE_DEFAULT: bool = false;
+/// Maximum audio file size accepted for STT.
+const STT_AUDIO_MAX_BYTES: usize = 100 * 1024 * 1024;
+/// Maximum time to wait for the transcriptor process.
+const STT_TIMEOUT_SECS: u64 = 30 * 60;
+/// Maximum time to wait for Telegram audio download.
+const STT_DOWNLOAD_TIMEOUT_SECS: u64 = 10 * 60;
+/// Maximum time to wait for transcriptor binary download.
+const TRANSCRIPTOR_DOWNLOAD_TIMEOUT_SECS: u64 = 5 * 60;
+/// Maximum transcriptor binary size accepted during download.
+const TRANSCRIPTOR_MAX_BYTES: u64 = 200 * 1024 * 1024;
+const STT_PROGRESS_TEXT: &str = "Recognizing speech..";
+const STT_MODEL_LOAD_TEXT: &str = "Loading speech model..";
+const STT_MODEL_LOAD_NOTICE_DELAY: tokio::time::Duration = tokio::time::Duration::from_secs(5);
+const STT_STOPPED_TEXT: &str = "Speech recognition stopped.";
 
 /// Compute a short hash key from the bot token (first 16 chars of SHA-256 hex)
 pub fn token_hash(token: &str) -> String {
@@ -2989,7 +3778,8 @@ fn load_bot_settings(token: &str) -> BotSettings {
         return BotSettings::default();
     };
     let owner_user_id = entry.get("owner_user_id").and_then(|v| v.as_u64());
-    let last_sessions: HashMap<String, String> = entry.get("last_sessions")
+    let last_sessions: HashMap<String, String> = entry
+        .get("last_sessions")
         .and_then(|v| v.as_object())
         .map(|obj| {
             obj.iter()
@@ -3001,7 +3791,8 @@ fn load_bot_settings(token: &str) -> BotSettings {
     let allowed_tools = match entry.get("allowed_tools") {
         Some(serde_json::Value::Array(arr)) => {
             // Legacy migration: array → per-chat HashMap
-            let tool_list: Vec<String> = arr.iter()
+            let tool_list: Vec<String> = arr
+                .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect();
             if tool_list.is_empty() {
@@ -3019,7 +3810,8 @@ fn load_bot_settings(token: &str) -> BotSettings {
             obj.iter()
                 .filter_map(|(k, v)| {
                     v.as_array().map(|arr| {
-                        let tools: Vec<String> = arr.iter()
+                        let tools: Vec<String> = arr
+                            .iter()
                             .filter_map(|t| t.as_str().map(String::from))
                             .collect();
                         (k.clone(), tools)
@@ -3030,7 +3822,8 @@ fn load_bot_settings(token: &str) -> BotSettings {
         _ => HashMap::new(),
     };
 
-    let as_public_for_group_chat: HashMap<String, bool> = entry.get("as_public_for_group_chat")
+    let as_public_for_group_chat: HashMap<String, bool> = entry
+        .get("as_public_for_group_chat")
         .and_then(|v| v.as_object())
         .map(|obj| {
             obj.iter()
@@ -3039,7 +3832,8 @@ fn load_bot_settings(token: &str) -> BotSettings {
         })
         .unwrap_or_default();
 
-    let models: HashMap<String, String> = entry.get("models")
+    let models: HashMap<String, String> = entry
+        .get("models")
         .and_then(|v| v.as_object())
         .map(|obj| {
             obj.iter()
@@ -3048,96 +3842,167 @@ fn load_bot_settings(token: &str) -> BotSettings {
         })
         .unwrap_or_default();
 
-    let debug = entry.get("debug").and_then(|v| v.as_bool()).unwrap_or(DEBUG_MODE_DEFAULT);
+    let debug = entry
+        .get("debug")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(DEBUG_MODE_DEFAULT);
 
-    let silent: HashMap<String, bool> = entry.get("silent")
+    let silent: HashMap<String, bool> = entry
+        .get("silent")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let direct: HashMap<String, bool> = entry.get("direct")
+    let direct: HashMap<String, bool> = entry
+        .get("direct")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let context: HashMap<String, usize> = entry.get("context")
+    let context: HashMap<String, usize> = entry
+        .get("context")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize)))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_u64().map(|n| (k.clone(), n as usize)))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let instructions: HashMap<String, String> = entry.get("instructions")
+    let instructions: HashMap<String, String> = entry
+        .get("instructions")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let queue: HashMap<String, bool> = entry.get("queue")
+    let queue: HashMap<String, bool> = entry
+        .get("queue")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let username = entry.get("username")
+    let username = entry
+        .get("username")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
-    let display_name = entry.get("display_name")
+    let display_name = entry
+        .get("display_name")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
 
-    let greeting = entry.get("greeting").and_then(|v| v.as_bool()).unwrap_or(false);
+    let greeting = entry
+        .get("greeting")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let use_chrome: HashMap<String, bool> = entry.get("use_chrome")
+    let use_chrome: HashMap<String, bool> = entry
+        .get("use_chrome")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let end_hook: HashMap<String, String> = entry.get("end_hook")
+    let end_hook: HashMap<String, String> = entry
+        .get("end_hook")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let effort: HashMap<String, String> = entry.get("effort")
+    let effort: HashMap<String, String> = entry
+        .get("effort")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let codex_fast: HashMap<String, bool> = entry.get("codex_fast")
+    let codex_fast: HashMap<String, bool> = entry
+        .get("codex_fast")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_bool().map(|b| (k.clone(), b)))
+                .collect()
+        })
         .unwrap_or_default();
 
-    let claude_effort: HashMap<String, String> = entry.get("claude_effort")
+    let claude_effort: HashMap<String, String> = entry
+        .get("claude_effort")
         .and_then(|v| v.as_object())
-        .map(|obj| obj.iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
         .unwrap_or_default();
 
-    BotSettings { allowed_tools, last_sessions, owner_user_id, as_public_for_group_chat, models, debug, silent, direct, context, instructions, queue, username, display_name, greeting, use_chrome, end_hook, effort, codex_fast, claude_effort }
+    let stt_models: HashMap<String, String> = entry
+        .get("stt_models")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    BotSettings {
+        allowed_tools,
+        last_sessions,
+        owner_user_id,
+        as_public_for_group_chat,
+        models,
+        debug,
+        silent,
+        direct,
+        context,
+        instructions,
+        queue,
+        username,
+        display_name,
+        greeting,
+        use_chrome,
+        end_hook,
+        effort,
+        codex_fast,
+        claude_effort,
+        stt_models,
+    }
 }
 
 /// Save bot settings to bot_settings.json
 fn save_bot_settings(token: &str, settings: &BotSettings) {
-    let Some(path) = bot_settings_path() else { return };
+    let Some(path) = bot_settings_path() else {
+        return;
+    };
     // Ensure directory exists
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -3149,7 +4014,11 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
     }
     // Use file lock to prevent race condition when multiple bots save simultaneously
     let lock_path = path.with_extension("json.lock");
-    let lock_file = match fs::OpenOptions::new().create(true).write(true).open(&lock_path) {
+    let lock_file = match fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+    {
         Ok(f) => f,
         Err(_) => return,
     };
@@ -3184,6 +4053,7 @@ fn save_bot_settings(token: &str, settings: &BotSettings) {
         "effort": settings.effort,
         "codex_fast": settings.codex_fast,
         "claude_effort": settings.claude_effort,
+        "stt_models": settings.stt_models,
     });
     if let Some(owner_id) = settings.owner_user_id {
         entry["owner_user_id"] = serde_json::json!(owner_id);
@@ -3243,7 +4113,10 @@ pub fn resolve_token_by_hash(hash: &str) -> Option<String> {
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
     let obj = json.as_object()?;
     let entry = obj.get(hash)?;
-    entry.get("token").and_then(|v| v.as_str()).map(String::from)
+    entry
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Resolve bot username from its hash key by searching bot_settings.json
@@ -3266,7 +4139,10 @@ pub fn resolve_username_by_hash(hash: &str) -> Option<String> {
     let json: serde_json::Value = match serde_json::from_str(&content) {
         Ok(v) => v,
         Err(e) => {
-            msg_debug(&format!("[resolve_username_by_hash] JSON parse failed: {}", e));
+            msg_debug(&format!(
+                "[resolve_username_by_hash] JSON parse failed: {}",
+                e
+            ));
             return None;
         }
     };
@@ -3280,11 +4156,16 @@ pub fn resolve_username_by_hash(hash: &str) -> Option<String> {
     let entry = match obj.get(hash) {
         Some(e) => e,
         None => {
-            msg_debug(&format!("[resolve_username_by_hash] hash key not found: {}", hash));
+            msg_debug(&format!(
+                "[resolve_username_by_hash] hash key not found: {}",
+                hash
+            ));
             return None;
         }
     };
-    let result = entry.get("username").and_then(|v| v.as_str())
+    let result = entry
+        .get("username")
+        .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(String::from);
     msg_debug(&format!("[resolve_username_by_hash] result: {:?}", result));
@@ -3312,12 +4193,16 @@ pub fn bot_username_exists(username: &str) -> bool {
     };
     let target = username.to_lowercase();
     let found = obj.values().any(|entry| {
-        entry.get("username")
+        entry
+            .get("username")
             .and_then(|v| v.as_str())
             .map(|u| u.to_lowercase() == target)
             .unwrap_or(false)
     });
-    msg_debug(&format!("[bot_username_exists] target={}, found={}", target, found));
+    msg_debug(&format!(
+        "[bot_username_exists] target={}, found={}",
+        target, found
+    ));
     found
 }
 
@@ -3331,7 +4216,8 @@ pub fn resolve_display_name_by_username(username: &str) -> Option<String> {
     for entry in obj.values() {
         let uname = entry.get("username").and_then(|v| v.as_str()).unwrap_or("");
         if uname.to_lowercase() == target {
-            return entry.get("display_name")
+            return entry
+                .get("display_name")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from);
@@ -3358,7 +4244,11 @@ fn normalize_tool_name(name: &str) -> String {
 }
 
 fn command_name(text: &str) -> Option<&str> {
-    let token = text.strip_prefix('/')?.split_whitespace().next().unwrap_or("");
+    let token = text
+        .strip_prefix('/')?
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
     if token.is_empty() {
         return None;
     }
@@ -3366,7 +4256,9 @@ fn command_name(text: &str) -> Option<&str> {
 }
 
 fn command_args(text: &str) -> &str {
-    let Some(rest) = text.trim_start().strip_prefix('/') else { return ""; };
+    let Some(rest) = text.trim_start().strip_prefix('/') else {
+        return "";
+    };
     let mut parts = rest.splitn(2, char::is_whitespace);
     let _ = parts.next();
     parts.next().unwrap_or("").trim()
@@ -3386,7 +4278,9 @@ fn is_cmd(text: &str, name: &str) -> bool {
 /// `starts_with` so that adding a future command like `/silentmode` does
 /// not get mis-classified as owner-only just because it shares a prefix.
 fn is_owner_only_command(text: &str) -> bool {
-    let Some(name) = command_name(text) else { return false; };
+    let Some(name) = command_name(text) else {
+        return false;
+    };
     matches!(
         name,
         // `start` is intentionally NOT owner-only. Once a group is set to
@@ -3402,6 +4296,7 @@ fn is_owner_only_command(text: &str) -> bool {
             | "public"
             | "setpollingtime"
             | "model"
+            | "stt_model"
             | "effort"
             | "fast"
             | "greeting"
@@ -3422,31 +4317,48 @@ fn is_owner_only_command(text: &str) -> bool {
 
 /// All available tools with (description, is_destructive)
 const ALL_TOOLS: &[(&str, &str, bool)] = &[
-    ("Bash",            "Execute shell commands",                          true),
-    ("Read",            "Read file contents from the filesystem",          false),
-    ("Edit",            "Perform find-and-replace edits in files",         true),
-    ("Write",           "Create or overwrite files",                       true),
-    ("Glob",            "Find files by name pattern",                      false),
-    ("Grep",            "Search file contents with regex",                 false),
-    ("Task",            "Launch autonomous sub-agents for complex tasks",  true),
-    ("TaskOutput",      "Retrieve output from background tasks",           false),
-    ("TaskStop",        "Stop a running background task",                  false),
-    ("WebFetch",        "Fetch and process web page content",              true),
-    ("WebSearch",       "Search the web for up-to-date information",       true),
-    ("NotebookEdit",    "Edit Jupyter notebook cells",                     true),
-    ("Skill",           "Invoke slash-command skills",                     false),
-    ("TaskCreate",      "Create a structured task in the task list",       false),
-    ("TaskGet",         "Retrieve task details by ID",                     false),
-    ("TaskUpdate",      "Update task status or details",                   false),
-    ("TaskList",        "List all tasks and their status",                 false),
-    ("AskUserQuestion", "Ask the user a question (interactive)",           false),
-    ("EnterPlanMode",   "Enter planning mode (interactive)",               false),
-    ("ExitPlanMode",    "Exit planning mode (interactive)",                false),
+    ("Bash", "Execute shell commands", true),
+    ("Read", "Read file contents from the filesystem", false),
+    ("Edit", "Perform find-and-replace edits in files", true),
+    ("Write", "Create or overwrite files", true),
+    ("Glob", "Find files by name pattern", false),
+    ("Grep", "Search file contents with regex", false),
+    (
+        "Task",
+        "Launch autonomous sub-agents for complex tasks",
+        true,
+    ),
+    ("TaskOutput", "Retrieve output from background tasks", false),
+    ("TaskStop", "Stop a running background task", false),
+    ("WebFetch", "Fetch and process web page content", true),
+    (
+        "WebSearch",
+        "Search the web for up-to-date information",
+        true,
+    ),
+    ("NotebookEdit", "Edit Jupyter notebook cells", true),
+    ("Skill", "Invoke slash-command skills", false),
+    (
+        "TaskCreate",
+        "Create a structured task in the task list",
+        false,
+    ),
+    ("TaskGet", "Retrieve task details by ID", false),
+    ("TaskUpdate", "Update task status or details", false),
+    ("TaskList", "List all tasks and their status", false),
+    (
+        "AskUserQuestion",
+        "Ask the user a question (interactive)",
+        false,
+    ),
+    ("EnterPlanMode", "Enter planning mode (interactive)", false),
+    ("ExitPlanMode", "Exit planning mode (interactive)", false),
 ];
 
 /// Tool info: (description, is_destructive)
 fn tool_info(name: &str) -> (&'static str, bool) {
-    ALL_TOOLS.iter()
+    ALL_TOOLS
+        .iter()
         .find(|(n, _, _)| *n == name)
         .map(|(_, desc, destr)| (*desc, *destr))
         .unwrap_or(("Custom tool", false))
@@ -3454,7 +4366,11 @@ fn tool_info(name: &str) -> (&'static str, bool) {
 
 /// Format a risk badge for display
 fn risk_badge(destructive: bool) -> &'static str {
-    if destructive { "!!!" } else { "" }
+    if destructive {
+        "!!!"
+    } else {
+        ""
+    }
 }
 
 /// One unit of work dispatched into a chat's serial worker. Module-level
@@ -3552,7 +4468,9 @@ fn new_cancel_token() -> Arc<CancelToken> {
 
 fn new_cancel_token_for_owner(owner_dispatch_id: u64) -> Arc<CancelToken> {
     let token = Arc::new(CancelToken::new());
-    token.owner_dispatch_id.store(owner_dispatch_id, Ordering::Relaxed);
+    token
+        .owner_dispatch_id
+        .store(owner_dispatch_id, Ordering::Relaxed);
     token
 }
 
@@ -3615,7 +4533,10 @@ async fn reclaim_panicked_dispatch_token(
 
     if let Some(tok) = leaked {
         cancel_token_now(&tok);
-        msg_debug(&format!("[{} {}] reset busy slot after panic", context, chat_id.0));
+        msg_debug(&format!(
+            "[{} {}] reset busy slot after panic",
+            context, chat_id.0
+        ));
     }
 }
 
@@ -3643,8 +4564,7 @@ fn abort_request_tasks(tasks: &RequestTasks) {
     }
 }
 
-fn spawn_tracked_request_task<F, T>(tasks: RequestTasks, fut: F)
-    -> tokio::task::JoinHandle<T>
+fn spawn_tracked_request_task<F, T>(tasks: RequestTasks, fut: F) -> tokio::task::JoinHandle<T>
 where
     F: std::future::Future<Output = T> + Send + 'static,
     T: Send + 'static,
@@ -3652,16 +4572,48 @@ where
     let id = NEXT_REQUEST_TASK_ID.fetch_add(1, Ordering::Relaxed).max(1);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<RequestTaskGuard>();
     let handle = tokio::spawn(async move {
-        let _guard = ready_rx.await.expect("request task guard dropped before start");
+        let _guard = ready_rx
+            .await
+            .expect("request task guard dropped before start");
         fut.await
     });
     let abort = handle.abort_handle();
-    let guard = RequestTaskGuard { tasks: tasks.clone(), id };
+    let guard = RequestTaskGuard {
+        tasks: tasks.clone(),
+        id,
+    };
     if let Ok(mut task_map) = tasks.lock() {
         task_map.insert(id, abort);
     }
     let _ = ready_tx.send(guard);
     handle
+}
+
+fn monitor_dispatch_panic<T: Send + 'static>(
+    join: tokio::task::JoinHandle<T>,
+    state: SharedState,
+    chat_id: ChatId,
+    dispatch_id: u64,
+    context: &'static str,
+) {
+    tokio::spawn(async move {
+        let Err(join_err) = join.await else {
+            return;
+        };
+        if !join_err.is_panic() {
+            return;
+        }
+        let panic_str = redact_known_tokens(&join_err.to_string());
+        msg_debug(&format!(
+            "[{}] chat_id={}, background dispatch PANICKED: {}",
+            context, chat_id.0, panic_str
+        ));
+        eprintln!(
+            "  ⚠ Chat {} {} dispatch panicked: {} — recovering",
+            chat_id.0, context, panic_str
+        );
+        reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, context).await;
+    });
 }
 
 /// Spawn a tracked blocking task. NOTE: `AbortHandle::abort()` only signals
@@ -3670,8 +4622,7 @@ where
 /// the blocking work must come from the `CancelToken` (cancelled flag +
 /// SIGKILL to the child PID's process group) carried in by the caller, not
 /// from this map's abort handle.
-fn spawn_tracked_blocking_task<F>(tasks: RequestTasks, f: F)
-    -> tokio::task::JoinHandle<()>
+fn spawn_tracked_blocking_task<F>(tasks: RequestTasks, f: F) -> tokio::task::JoinHandle<()>
 where
     F: FnOnce() + Send + 'static,
 {
@@ -3684,7 +4635,10 @@ where
         f();
     });
     let abort = handle.abort_handle();
-    let guard = RequestTaskGuard { tasks: tasks.clone(), id };
+    let guard = RequestTaskGuard {
+        tasks: tasks.clone(),
+        id,
+    };
     if let Ok(mut task_map) = tasks.lock() {
         task_map.insert(id, abort);
     }
@@ -3697,8 +4651,10 @@ where
 /// (e.g. the spawning future was dropped between spawn and send). The same
 /// abort caveat applies: cancelling the JoinHandle does not preempt the
 /// blocking thread; rely on the `CancelToken` carried by `f` for shutdown.
-fn spawn_tracked_blocking_result<F, T>(tasks: RequestTasks, f: F)
-    -> tokio::task::JoinHandle<Option<T>>
+fn spawn_tracked_blocking_result<F, T>(
+    tasks: RequestTasks,
+    f: F,
+) -> tokio::task::JoinHandle<Option<T>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -3712,7 +4668,10 @@ where
         Some(f())
     });
     let abort = handle.abort_handle();
-    let guard = RequestTaskGuard { tasks: tasks.clone(), id };
+    let guard = RequestTaskGuard {
+        tasks: tasks.clone(),
+        id,
+    };
     if let Ok(mut task_map) = tasks.lock() {
         task_map.insert(id, abort);
     }
@@ -3795,9 +4754,22 @@ async fn ensure_chat_worker(
     let state_owned = state.clone();
     let token_owned = token.to_string();
     let username_owned = bot_username.to_string();
-    let handle = tokio::spawn(run_chat_worker(rx, bot_owned, state_owned, token_owned, username_owned, cid));
+    let handle = tokio::spawn(run_chat_worker(
+        rx,
+        bot_owned,
+        state_owned,
+        token_owned,
+        username_owned,
+        cid,
+    ));
     let abort = handle.abort_handle();
-    guard.insert(cid, ChatWorkerEntry { tx: tx.clone(), abort });
+    guard.insert(
+        cid,
+        ChatWorkerEntry {
+            tx: tx.clone(),
+            abort,
+        },
+    );
     tx
 }
 
@@ -3835,13 +4807,12 @@ async fn run_chat_worker(
         });
         match join.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => msg_debug(&format!(
-                "[chat_worker {}] handler error: {}", cid.0, e
-            )),
+            Ok(Err(e)) => msg_debug(&format!("[chat_worker {}] handler error: {}", cid.0, e)),
             Err(join_err) => {
                 let panic_str = redact_known_tokens(&join_err.to_string());
                 msg_debug(&format!(
-                    "[chat_worker {}] handler PANICKED: {}", cid.0, panic_str
+                    "[chat_worker {}] handler PANICKED: {}",
+                    cid.0, panic_str
                 ));
                 eprintln!(
                     "  ⚠ Chat {} handler panicked: {} — recovering",
@@ -3884,13 +4855,19 @@ async fn run_chat_worker(
                     // alone. The owner check above prevents touching a child process
                     // belonging to a scheduler or later handler.
                     cancel_token_now(&tok);
-                    msg_debug(&format!("[chat_worker {}] reset busy slot after panic", cid.0));
+                    msg_debug(&format!(
+                        "[chat_worker {}] reset busy slot after panic",
+                        cid.0
+                    ));
                     eprintln!("  ⚠ Chat {} busy slot reset (held by panicked task)", cid.0);
                 }
             }
         }
     }
-    msg_debug(&format!("[chat_worker {}] channel closed, worker exiting", cid.0));
+    msg_debug(&format!(
+        "[chat_worker {}] channel closed, worker exiting",
+        cid.0
+    ));
 }
 
 /// Dispatch a single unit to its real handler. Album fragments (size 1)
@@ -3913,9 +4890,7 @@ async fn process_unit(
     bot_username: &str,
 ) -> ResponseResult<()> {
     match unit {
-        DispatchUnit::Single(msg) => {
-            handle_message(bot, msg, state, token, bot_username).await
-        }
+        DispatchUnit::Single(msg) => handle_message(bot, msg, state, token, bot_username).await,
         DispatchUnit::Album(msgs) => {
             if msgs.len() < 2 {
                 if let Some(msg) = msgs.into_iter().next() {
@@ -3971,7 +4946,11 @@ async fn get_updates_with_retry(
                 };
                 msg_debug(&format!(
                     "[run_bot] {} attempt {}/{} failed (sleep {}ms): {}",
-                    label, attempt, max_attempts, backoff.as_millis(), e
+                    label,
+                    attempt,
+                    max_attempts,
+                    backoff.as_millis(),
+                    e
                 ));
                 last_err = Some(e);
                 if attempt < max_attempts {
@@ -3991,7 +4970,11 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
     // its token redacted.
     register_token_for_redaction(token);
     let api_base_url = api_url.unwrap_or("https://api.telegram.org");
-    msg_debug(&format!("[run_bot] api_url={:?}, api_base_url={}", api_url.is_some(), api_base_url));
+    msg_debug(&format!(
+        "[run_bot] api_url={:?}, api_base_url={}",
+        api_url.is_some(),
+        api_base_url
+    ));
     // The HTTP client timeout must exceed the long-polling timeout used in
     // `polling_loop` (30s, see `bot.get_updates().timeout(30)`). teloxide's
     // default_reqwest_settings ships a 17s timeout which closes the connection
@@ -4022,7 +5005,10 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         Ok(me) => {
             let uname = me.username.clone().unwrap_or_default().to_lowercase();
             let dname = me.first_name.clone();
-            msg_debug(&format!("[run_bot] get_me success: username={}, display_name={}, id={}", uname, dname, me.id));
+            msg_debug(&format!(
+                "[run_bot] get_me success: username={}, display_name={}, id={}",
+                uname, dname, me.id
+            ));
             println!("  ✓ Bot: {} (@{uname})", dname);
             (uname, dname)
         }
@@ -4035,7 +5021,10 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
 
     // Save username and display_name to bot_settings for CLI --message lookup
     if !bot_username.is_empty() {
-        msg_debug(&format!("[run_bot] saving username to bot_settings: {}", bot_username));
+        msg_debug(&format!(
+            "[run_bot] saving username to bot_settings: {}",
+            bot_username
+        ));
         bot_settings.username = bot_username.clone();
         bot_settings.display_name = bot_display_name.clone();
         save_bot_settings(token, &bot_settings);
@@ -4064,6 +5053,7 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         teloxide::types::BotCommand::new("allowed", "Add/remove tool (+name / -name)"),
         teloxide::types::BotCommand::new("setpollingtime", "Set API polling interval (ms)"),
         teloxide::types::BotCommand::new("model", "Set AI model"),
+        teloxide::types::BotCommand::new("stt_model", "Set speech recognition model"),
         teloxide::types::BotCommand::new("effort", "Set Claude/Codex effort level"),
         teloxide::types::BotCommand::new("fast", "Toggle Codex fast service tier"),
         teloxide::types::BotCommand::new("debug", "Toggle debug logging"),
@@ -4074,7 +5064,10 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         teloxide::types::BotCommand::new("query", "Send message to AI (/query@bot for groups)"),
         teloxide::types::BotCommand::new("instruction", "Set system instruction for this chat"),
         teloxide::types::BotCommand::new("instruction_clear", "Clear system instruction"),
-        teloxide::types::BotCommand::new("setendhook", "Set message to send when processing completes"),
+        teloxide::types::BotCommand::new(
+            "setendhook",
+            "Set message to send when processing completes",
+        ),
         teloxide::types::BotCommand::new("setendhook_clear", "Clear end hook message"),
     ];
     if let Err(e) = tg!("set_my_commands", bot.set_my_commands(commands).await) {
@@ -4131,7 +5124,13 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
     let scheduler_token = token.to_string();
     let scheduler_bot_username = bot_username.clone();
     let scheduler_bot_display_name = bot_display_name.clone();
-    let scheduler_handle = tokio::spawn(scheduler_loop(scheduler_bot, scheduler_state, scheduler_token, scheduler_bot_username, scheduler_bot_display_name));
+    let scheduler_handle = tokio::spawn(scheduler_loop(
+        scheduler_bot,
+        scheduler_state,
+        scheduler_token,
+        scheduler_bot_username,
+        scheduler_bot_display_name,
+    ));
     let scheduler_abort = scheduler_handle.abort_handle();
     let _scheduler_guard = AbortOnDrop(scheduler_abort);
 
@@ -4149,15 +5148,26 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         Ok(updates) => {
             if let Some(last) = updates.last() {
                 let next_offset = next_offset_after(last.id.0);
-                msg_debug(&format!("[run_bot] flush step 1: got last update_id={}, confirming with offset={}",
-                    last.id.0, next_offset));
-                match get_updates_with_retry(&bot, next_offset, FLUSH_MAX_ATTEMPTS, "flush step 2").await {
+                msg_debug(&format!(
+                    "[run_bot] flush step 1: got last update_id={}, confirming with offset={}",
+                    last.id.0, next_offset
+                ));
+                match get_updates_with_retry(&bot, next_offset, FLUSH_MAX_ATTEMPTS, "flush step 2")
+                    .await
+                {
                     Ok(_) => {
-                        msg_debug(&format!("[run_bot] flush step 2: confirmed offset={}", next_offset));
+                        msg_debug(&format!(
+                            "[run_bot] flush step 2: confirmed offset={}",
+                            next_offset
+                        ));
                         println!("  ✓ Flushed pending updates (up to id={})", last.id.0);
                     }
                     Err(e) => {
-                        eprintln!("  ✗ FATAL: failed to confirm pending updates after {} attempts: {}", FLUSH_MAX_ATTEMPTS, redact_err(&e));
+                        eprintln!(
+                            "  ✗ FATAL: failed to confirm pending updates after {} attempts: {}",
+                            FLUSH_MAX_ATTEMPTS,
+                            redact_err(&e)
+                        );
                         eprintln!("    Aborting to prevent processing stale messages.");
                         // Return Fatal instead of `process::exit(1)` so the
                         // RAII guards installed earlier in this function run:
@@ -4178,7 +5188,11 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
             }
         }
         Err(e) => {
-            eprintln!("  ✗ FATAL: failed to fetch pending updates after {} attempts: {}", FLUSH_MAX_ATTEMPTS, redact_err(&e));
+            eprintln!(
+                "  ✗ FATAL: failed to fetch pending updates after {} attempts: {}",
+                FLUSH_MAX_ATTEMPTS,
+                redact_err(&e)
+            );
             eprintln!("    Cannot safely start polling without flushing — aborting.");
             // See comment on the symmetric path above: return Fatal so the
             // RAII guards run and sibling bots survive in multi-bot mode.
@@ -4225,7 +5239,14 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
         let username_clone = username_for_loop.clone();
 
         let polling_handle = tokio::spawn(async move {
-            polling_loop(bot_clone, state_clone, workers_clone, token_clone, username_clone).await
+            polling_loop(
+                bot_clone,
+                state_clone,
+                workers_clone,
+                token_clone,
+                username_clone,
+            )
+            .await
         });
         let _polling_guard = AbortOnDrop(polling_handle.abort_handle());
         let task_result = polling_handle.await;
@@ -4241,8 +5262,14 @@ pub async fn run_bot(token: &str, api_url: Option<&str>) -> BotExit {
             Err(e) => {
                 // Task panicked — likely network disconnection or runtime issue
                 let ran_for = loop_start.elapsed();
-                msg_debug(&format!("[run_bot] polling task crashed after {:.1?}: {}", ran_for, e));
-                println!("  ⚠ Bot disconnected — reconnecting in {}s...", reconnect_backoff_secs);
+                msg_debug(&format!(
+                    "[run_bot] polling task crashed after {:.1?}: {}",
+                    ran_for, e
+                ));
+                println!(
+                    "  ⚠ Bot disconnected — reconnecting in {}s...",
+                    reconnect_backoff_secs
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(reconnect_backoff_secs)).await;
 
                 // Reset backoff if the bot was stable (>60s) before crashing
@@ -4288,7 +5315,8 @@ async fn polling_loop(
     let mut offset: i32 = 0;
     let mut transient_backoff_ms: u64 = 500;
     loop {
-        let result = bot.get_updates()
+        let result = bot
+            .get_updates()
             .offset(offset)
             .timeout(30)
             .limit(100)
@@ -4304,7 +5332,10 @@ async fn polling_loop(
                 if updates.is_empty() {
                     continue;
                 }
-                msg_debug(&format!("[polling_loop] batch: {} update(s)", updates.len()));
+                msg_debug(&format!(
+                    "[polling_loop] batch: {} update(s)",
+                    updates.len()
+                ));
                 process_batch(&bot, updates, &state, &workers, &token, &bot_username).await;
             }
             Err(e) => {
@@ -4318,7 +5349,10 @@ async fn polling_loop(
                 // (the server told us exactly how long to wait).
                 let (sleep_dur, is_retry_after) = match &e {
                     teloxide::RequestError::RetryAfter(s) => (s.duration(), true),
-                    _ => (std::time::Duration::from_millis(transient_backoff_ms), false),
+                    _ => (
+                        std::time::Duration::from_millis(transient_backoff_ms),
+                        false,
+                    ),
                 };
                 msg_debug(&format!(
                     "[polling_loop] getUpdates error (sleeping {}ms{}): {}",
@@ -4402,7 +5436,7 @@ async fn process_batch(
         if let DispatchUnit::Album(ref msgs) = unit {
             if msgs.len() >= 2 {
                 msg_debug(&format!(
-                    "[process_batch] atomic album: {} photo(s) in one batch",
+                    "[process_batch] atomic album: {} attachment(s) in one batch",
                     msgs.len()
                 ));
             }
@@ -4428,21 +5462,2251 @@ async fn process_batch(
     }
 }
 
+#[derive(Clone)]
+struct SttAudioUpload {
+    file_id: String,
+    file_name: String,
+    file_size_hint: u32,
+}
+
+fn audio_extension_from_mime(mime: Option<&str>) -> &'static str {
+    match mime.unwrap_or("").to_ascii_lowercase().as_str() {
+        "audio/aac" => "aac",
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/m4a" | "audio/mp4" | "audio/x-m4a" => "m4a",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" | "audio/opus" => "ogg",
+        "audio/wav" | "audio/wave" | "audio/x-wav" => "wav",
+        "audio/webm" => "webm",
+        _ => "audio",
+    }
+}
+
+fn is_audio_file_name(name: &str) -> bool {
+    let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "aac"
+            | "aif"
+            | "aiff"
+            | "amr"
+            | "caf"
+            | "flac"
+            | "m4a"
+            | "mp3"
+            | "oga"
+            | "ogg"
+            | "opus"
+            | "wav"
+            | "webm"
+            | "wma"
+    )
+}
+
+fn stt_audio_upload_info(msg: &Message) -> Option<SttAudioUpload> {
+    if let Some(voice) = msg.voice() {
+        let mime = voice.mime_type.as_ref().map(|m| m.essence_str());
+        return Some(SttAudioUpload {
+            file_id: voice.file.id.clone(),
+            file_name: format!(
+                "voice_{}.{}",
+                voice.file.unique_id,
+                audio_extension_from_mime(mime).trim_start_matches('.')
+            ),
+            file_size_hint: voice.file.size,
+        });
+    }
+    if let Some(audio) = msg.audio() {
+        let mime = audio.mime_type.as_ref().map(|m| m.essence_str());
+        let file_name = audio.file_name.clone().unwrap_or_else(|| {
+            format!(
+                "audio_{}.{}",
+                audio.file.unique_id,
+                audio_extension_from_mime(mime)
+            )
+        });
+        return Some(SttAudioUpload {
+            file_id: audio.file.id.clone(),
+            file_name,
+            file_size_hint: audio.file.size,
+        });
+    }
+    if let Some(doc) = msg.document() {
+        let mime = doc.mime_type.as_ref().map(|m| m.essence_str());
+        let mime_is_audio = mime
+            .map(|m| m.to_ascii_lowercase().starts_with("audio/"))
+            .unwrap_or(false);
+        let name_is_audio = doc
+            .file_name
+            .as_deref()
+            .map(is_audio_file_name)
+            .unwrap_or(false);
+        if mime_is_audio || name_is_audio {
+            let file_name = doc.file_name.clone().unwrap_or_else(|| {
+                format!(
+                    "audio_{}.{}",
+                    doc.file.unique_id,
+                    audio_extension_from_mime(mime)
+                )
+            });
+            return Some(SttAudioUpload {
+                file_id: doc.file.id.clone(),
+                file_name,
+                file_size_hint: doc.file.size,
+            });
+        }
+    }
+    None
+}
+
+fn transcriptor_bin_path() -> Result<PathBuf, String> {
+    let Some(home) = dirs::home_dir() else {
+        return Err("Cannot determine home directory.".to_string());
+    };
+    let binary_name = if cfg!(windows) {
+        "transcriptor.exe"
+    } else {
+        "transcriptor"
+    };
+    Ok(home.join(".cokacdir").join("bin").join(binary_name))
+}
+
+fn transcriptor_artifact_name() -> Result<&'static str, String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "aarch64") => Ok("transcriptor-linux-aarch64"),
+        ("linux", "x86_64") => Ok("transcriptor-linux-x86_64"),
+        ("macos", "aarch64") => Ok("transcriptor-macos-aarch64"),
+        ("macos", "x86_64") => Ok("transcriptor-macos-x86_64"),
+        ("windows", "aarch64") => Ok("transcriptor-windows-aarch64.exe"),
+        ("windows", "x86_64") => Ok("transcriptor-windows-x86_64.exe"),
+        (os, arch) => Err(format!("Unsupported transcriptor target: {os}-{arch}")),
+    }
+}
+
+fn transcriptor_binary_is_present(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+fn stt_file_debug_summary(path: &Path) -> String {
+    match fs::metadata(path) {
+        Ok(meta) => format!(
+            "path={} exists=true file={} len={} readonly={}",
+            path.display(),
+            meta.is_file(),
+            meta.len(),
+            meta.permissions().readonly()
+        ),
+        Err(e) => format!("path={} exists=false error={}", path.display(), e),
+    }
+}
+
+fn stt_env_debug_summary() -> String {
+    fn env_state(name: &str, path_like: bool) -> String {
+        match std::env::var(name) {
+            Ok(value) if value.is_empty() => format!("{name}=empty"),
+            Ok(value) if path_like => {
+                let path = Path::new(&value);
+                format!(
+                    "{}=set(len={}, exists={}, is_file={}, is_dir={})",
+                    name,
+                    value.len(),
+                    path.exists(),
+                    path.is_file(),
+                    path.is_dir()
+                )
+            }
+            Ok(value) => format!("{name}=set({})", truncate_str(&value, 80)),
+            Err(std::env::VarError::NotPresent) => format!("{name}=unset"),
+            Err(std::env::VarError::NotUnicode(_)) => format!("{name}=not_unicode"),
+        }
+    }
+
+    [
+        env_state("TRANSCRIPTOR_MODEL", true),
+        env_state("TRANSCRIPTOR_HOME", true),
+        env_state("TRANSCRIPTOR_LANGUAGE", false),
+        env_state("TRANSCRIPTOR_THREADS", false),
+    ]
+    .join(", ")
+}
+
+fn stt_stdout_shape(stdout: &str) -> String {
+    let trimmed = stdout.trim();
+    let first = trimmed.chars().next();
+    format!(
+        "trimmed_len={}, first_non_ws={:?}, jsonish={}",
+        trimmed.len(),
+        first,
+        matches!(first, Some('{') | Some('['))
+    )
+}
+
+fn stt_stderr_preview(stderr: &str) -> String {
+    let trimmed = stderr.trim();
+    if trimmed.is_empty() {
+        "<empty>".to_string()
+    } else {
+        truncate_str(trimmed, 500)
+    }
+}
+
+fn make_transcriptor_executable(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)
+            .map_err(|e| format!("Failed to stat transcriptor: {e}"))?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms)
+            .map_err(|e| format!("Failed to set transcriptor executable permission: {e}"))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+struct TranscriptorBinaryFileLock {
+    _file: std::fs::File,
+}
+
+fn transcriptor_lock_path(path: &Path) -> Result<PathBuf, String> {
+    let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err("Invalid transcriptor lock path.".to_string());
+    };
+    Ok(path.with_file_name(format!("{file_name}.lock")))
+}
+
+async fn acquire_transcriptor_binary_mutex(
+    cancel_token: Option<&Arc<CancelToken>>,
+    trace_id: &str,
+) -> Result<tokio::sync::MutexGuard<'static, ()>, String> {
+    let mutex = TRANSCRIPTOR_BINARY_MUTEX.get_or_init(|| Mutex::new(()));
+    let lock_fut = mutex.lock();
+    tokio::pin!(lock_fut);
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            guard = &mut lock_fut => {
+                msg_debug(&format!("[stt:{trace_id}:bin] in-process install lock acquired"));
+                return Ok(guard);
+            }
+            _ = interval.tick() => {
+                if stt_cancelled(cancel_token) {
+                    msg_debug(&format!("[stt:{trace_id}:bin] cancelled while waiting for in-process install lock"));
+                    return Err(stt_cancelled_error());
+                }
+            }
+        }
+    }
+}
+
+async fn acquire_transcriptor_binary_file_lock(
+    path: &Path,
+    cancel_token: Option<&Arc<CancelToken>>,
+    trace_id: &str,
+) -> Result<TranscriptorBinaryFileLock, String> {
+    use fs2::FileExt;
+
+    let lock_path = transcriptor_lock_path(path)?;
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("Failed to create transcriptor lock directory: {e}"))?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| format!("Failed to open transcriptor install lock: {e}"))?;
+
+    let mut waited = false;
+    loop {
+        if stt_cancelled(cancel_token) {
+            msg_debug(&format!(
+                "[stt:{trace_id}:bin] cancelled while waiting for file install lock"
+            ));
+            return Err(stt_cancelled_error());
+        }
+        match file.try_lock_exclusive() {
+            Ok(()) => {
+                if waited {
+                    msg_debug(&format!(
+                        "[stt:{trace_id}:bin] file install lock acquired after waiting path={}",
+                        lock_path.display()
+                    ));
+                } else {
+                    msg_debug(&format!(
+                        "[stt:{trace_id}:bin] file install lock acquired path={}",
+                        lock_path.display()
+                    ));
+                }
+                return Ok(TranscriptorBinaryFileLock { _file: file });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if !waited {
+                    msg_debug(&format!(
+                        "[stt:{trace_id}:bin] file install lock contended path={} err={}",
+                        lock_path.display(),
+                        truncate_str(&e.to_string(), 300)
+                    ));
+                    waited = true;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => {
+                return Err(format!("Failed to lock transcriptor install lock: {e}"));
+            }
+        }
+    }
+}
+
+async fn transcriptor_binary_supports_progress(path: &Path, trace_id: &str) -> bool {
+    let mut cmd = tokio::process::Command::new(path);
+    cmd.arg("--help")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let output =
+        match tokio::time::timeout(tokio::time::Duration::from_secs(10), cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => {
+                msg_debug(&format!(
+                    "[stt:{trace_id}:bin] capability check failed to run --help: {}",
+                    truncate_str(&e.to_string(), 300)
+                ));
+                return false;
+            }
+            Err(_) => {
+                msg_debug(&format!("[stt:{trace_id}:bin] capability check timed out"));
+                return false;
+            }
+        };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{stdout}\n{stderr}");
+    let supports = combined.contains("--progress");
+    msg_debug(&format!(
+        "[stt:{trace_id}:bin] capability check status={} supports_progress={} help_preview={:?}",
+        output.status,
+        supports,
+        truncate_str(combined.trim(), 500)
+    ));
+    supports
+}
+
+async fn ensure_transcriptor_binary(
+    cancel_token: Option<&Arc<CancelToken>>,
+    trace_id: &str,
+) -> Result<PathBuf, String> {
+    if stt_cancelled(cancel_token) {
+        msg_debug(&format!("[stt:{trace_id}:bin] cancelled before ensure"));
+        return Err(stt_cancelled_error());
+    }
+    let artifact = transcriptor_artifact_name()?;
+    let path = transcriptor_bin_path()?;
+    msg_debug(&format!(
+        "[stt:{trace_id}:bin] ensure start artifact={}, path={}",
+        artifact,
+        path.display()
+    ));
+    let Some(bin_dir) = path.parent() else {
+        return Err("Invalid transcriptor path.".to_string());
+    };
+    fs::create_dir_all(bin_dir)
+        .map_err(|e| format!("Failed to create transcriptor bin directory: {e}"))?;
+
+    let _in_process_lock = acquire_transcriptor_binary_mutex(cancel_token, trace_id).await?;
+    let _file_lock = acquire_transcriptor_binary_file_lock(&path, cancel_token, trace_id).await?;
+    if stt_cancelled(cancel_token) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:bin] cancelled after install lock"
+        ));
+        return Err(stt_cancelled_error());
+    }
+
+    if transcriptor_binary_is_present(&path) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:bin] existing binary {}",
+            stt_file_debug_summary(&path)
+        ));
+        make_transcriptor_executable(&path)?;
+        if transcriptor_binary_supports_progress(&path, trace_id).await {
+            msg_debug(&format!("[stt:{trace_id}:bin] existing binary accepted"));
+            return Ok(path);
+        }
+        msg_debug(&format!(
+            "[stt:{trace_id}:bin] existing binary lacks --progress support, replacing"
+        ));
+    }
+
+    if let Ok(meta) = fs::metadata(&path) {
+        if meta.is_file() && meta.len() == 0 {
+            msg_debug(&format!(
+                "[stt:{trace_id}:bin] removing zero-byte binary before download"
+            ));
+            match fs::remove_file(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "Failed to remove zero-byte transcriptor binary: {e}"
+                    ))
+                }
+            }
+        }
+    }
+
+    let url =
+        format!("https://raw.githubusercontent.com/kstost/transcriptor/main/dist_beta/{artifact}");
+    msg_debug(&format!(
+        "[stt:{trace_id}:bin] downloading artifact={} timeout_secs={} max_bytes={}",
+        artifact, TRANSCRIPTOR_DOWNLOAD_TIMEOUT_SECS, TRANSCRIPTOR_MAX_BYTES
+    ));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(
+            TRANSCRIPTOR_DOWNLOAD_TIMEOUT_SECS,
+        ))
+        .build()
+        .map_err(|e| format!("Failed to create transcriptor downloader: {e}"))?;
+    let mut resp = await_stt_or_cancel(client.get(&url).send(), cancel_token)
+        .await?
+        .map_err(|e| format!("Failed to download transcriptor: {e}"))?;
+    msg_debug(&format!(
+        "[stt:{trace_id}:bin] download response status={} content_length={:?}",
+        resp.status(),
+        resp.content_length()
+    ));
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Failed to download transcriptor: HTTP {}",
+            resp.status()
+        ));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > TRANSCRIPTOR_MAX_BYTES {
+            return Err(format!(
+                "Downloaded transcriptor is too large ({:.1}MB).",
+                len as f64 / (1024.0 * 1024.0)
+            ));
+        }
+    }
+
+    let tmp_path = bin_dir.join(format!(
+        ".transcriptor.download.{:08x}",
+        rand::random::<u32>()
+    ));
+    let write_result: Result<u64, String> = async {
+        use std::io::Write;
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|e| format!("Failed to create transcriptor temp file: {e}"))?;
+        let mut hasher = Sha256::new();
+        let mut downloaded = 0u64;
+        loop {
+            let Some(chunk) = await_stt_or_cancel(resp.chunk(), cancel_token)
+                .await?
+                .map_err(|e| format!("Failed to read transcriptor download: {e}"))?
+            else {
+                break;
+            };
+            downloaded = downloaded
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| "Transcriptor download size overflow.".to_string())?;
+            if downloaded > TRANSCRIPTOR_MAX_BYTES {
+                return Err(format!(
+                    "Downloaded transcriptor is too large ({:.1}MB).",
+                    downloaded as f64 / (1024.0 * 1024.0)
+                ));
+            }
+            hasher.update(&chunk);
+            out.write_all(&chunk)
+                .map_err(|e| format!("Failed to write transcriptor download: {e}"))?;
+        }
+        if downloaded == 0 {
+            return Err("Downloaded transcriptor is empty.".to_string());
+        }
+        let actual_sha256 = format!("{:x}", hasher.finalize());
+        msg_debug(&format!(
+            "[stt:{trace_id}:bin] download completed bytes={} actual_sha256={}",
+            downloaded, actual_sha256
+        ));
+        out.flush()
+            .map_err(|e| format!("Failed to flush transcriptor download: {e}"))?;
+        Ok(downloaded)
+    }
+    .await;
+    let downloaded = match write_result {
+        Ok(downloaded) => downloaded,
+        Err(e) => {
+            msg_debug(&format!(
+                "[stt:{trace_id}:bin] download/write failed: {}",
+                truncate_str(&e, 500)
+            ));
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
+    if stt_cancelled(cancel_token) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:bin] cancelled after download bytes={downloaded}"
+        ));
+        let _ = fs::remove_file(&tmp_path);
+        return Err(stt_cancelled_error());
+    }
+    if let Err(e) = make_transcriptor_executable(&tmp_path) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:bin] chmod failed: {}",
+            truncate_str(&e, 500)
+        ));
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    if path.exists() {
+        match fs::remove_file(&path) {
+            Ok(_) => msg_debug(&format!(
+                "[stt:{trace_id}:bin] removed old binary before install"
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                msg_debug(&format!(
+                    "[stt:{trace_id}:bin] failed to remove old binary before install: {}",
+                    truncate_str(&e.to_string(), 500)
+                ));
+                let _ = fs::remove_file(&tmp_path);
+                return Err(format!("Failed to replace old transcriptor binary: {e}"));
+            }
+        }
+    }
+
+    match fs::rename(&tmp_path, &path) {
+        Ok(_) => {}
+        Err(e) => {
+            if transcriptor_binary_is_present(&path) {
+                msg_debug(&format!(
+                    "[stt:{trace_id}:bin] install rename failed but destination exists: {}",
+                    truncate_str(&e.to_string(), 500)
+                ));
+                let _ = fs::remove_file(&tmp_path);
+            } else {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(format!("Failed to install transcriptor: {e}"));
+            }
+        }
+    }
+    make_transcriptor_executable(&path)?;
+    msg_debug(&format!(
+        "[stt:{trace_id}:bin] installed binary bytes={} {}",
+        downloaded,
+        stt_file_debug_summary(&path)
+    ));
+    if !transcriptor_binary_supports_progress(&path, trace_id).await {
+        return Err("Downloaded transcriptor does not support progress events.".to_string());
+    }
+    Ok(path)
+}
+
+fn stt_temp_dir() -> Result<PathBuf, String> {
+    let Some(home) = dirs::home_dir() else {
+        return Err("Cannot determine home directory.".to_string());
+    };
+    Ok(home.join(".cokacdir").join("stttemp"))
+}
+
+fn cleanup_stt_temp_dir(dir: &Path) {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if now
+            .duration_since(modified)
+            .map(|age| age > TTL)
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn safe_audio_temp_extension(file_name: &str) -> Option<String> {
+    let ext = Path::new(file_name)
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase();
+    if ext.len() <= 12 && ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(ext)
+    } else {
+        None
+    }
+}
+
+fn stt_temp_path_for(file_name: &str) -> Result<PathBuf, String> {
+    let dir = stt_temp_dir()?;
+    fs::create_dir_all(&dir).map_err(|e| format!("Failed to create STT temp directory: {e}"))?;
+    cleanup_stt_temp_dir(&dir);
+    let stamp = chrono::Local::now().timestamp_millis();
+    let rand = rand::random::<u32>();
+    let name = match safe_audio_temp_extension(file_name) {
+        Some(ext) => format!("stt_{stamp}_{rand:08x}.{ext}"),
+        None => format!("stt_{stamp}_{rand:08x}.audio"),
+    };
+    Ok(dir.join(name))
+}
+
+fn stt_audio_too_large_message(bytes: u64) -> String {
+    format!(
+        "Audio file too large ({:.1}MB). Maximum STT size is {:.0}MB.",
+        bytes as f64 / (1024.0 * 1024.0),
+        STT_AUDIO_MAX_BYTES as f64 / (1024.0 * 1024.0)
+    )
+}
+
+fn stt_cancelled(cancel_token: Option<&Arc<CancelToken>>) -> bool {
+    cancel_token
+        .map(|token| token.cancelled.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+fn stt_cancelled_error() -> String {
+    "Audio transcription cancelled.".to_string()
+}
+
+async fn await_stt_or_cancel<F, T>(
+    future: F,
+    cancel_token: Option<&Arc<CancelToken>>,
+) -> Result<T, String>
+where
+    F: std::future::IntoFuture<Output = T>,
+{
+    let future = future.into_future();
+    let Some(token) = cancel_token else {
+        return Ok(future.await);
+    };
+    if stt_cancelled(Some(token)) {
+        return Err(stt_cancelled_error());
+    }
+
+    tokio::pin!(future);
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            output = &mut future => return Ok(output),
+            _ = interval.tick() => {
+                if stt_cancelled(Some(token)) {
+                    return Err(stt_cancelled_error());
+                }
+            }
+        }
+    }
+}
+
+async fn download_stt_audio_to_temp(
+    bot: &Bot,
+    chat_id: ChatId,
+    info: &SttAudioUpload,
+    state: &SharedState,
+    cancel_token: Option<&Arc<CancelToken>>,
+    trace_id: &str,
+) -> Result<PathBuf, String> {
+    let file_ext = safe_audio_temp_extension(&info.file_name).unwrap_or_else(|| "none".to_string());
+    msg_debug(&format!(
+        "[stt:{trace_id}:download] start chat_id={} file_name_len={} ext={} size_hint={} max_bytes={}",
+        chat_id.0,
+        info.file_name.len(),
+        file_ext,
+        info.file_size_hint,
+        STT_AUDIO_MAX_BYTES
+    ));
+    if stt_cancelled(cancel_token) {
+        msg_debug(&format!("[stt:{trace_id}:download] cancelled before start"));
+        return Err(stt_cancelled_error());
+    }
+    if info.file_size_hint != u32::MAX
+        && u64::from(info.file_size_hint) > STT_AUDIO_MAX_BYTES as u64
+    {
+        msg_debug(&format!(
+            "[stt:{trace_id}:download] rejected by size hint bytes={}",
+            info.file_size_hint
+        ));
+        return Err(stt_audio_too_large_message(u64::from(info.file_size_hint)));
+    }
+
+    shared_rate_limit_wait(state, chat_id).await;
+    if stt_cancelled(cancel_token) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:download] cancelled after rate-limit wait"
+        ));
+        return Err(stt_cancelled_error());
+    }
+    let file_result = await_stt_or_cancel(bot.get_file(&info.file_id), cancel_token).await?;
+    let file = match tg!("get_file", file_result) {
+        Ok(file) => file,
+        Err(e) => {
+            msg_debug(&format!(
+                "[stt:{trace_id}:download] get_file failed: {}",
+                redact_err(&e)
+            ));
+            return Err(format!("getFile failed: {}", redact_err(&e)));
+        }
+    };
+    msg_debug(&format!(
+        "[stt:{trace_id}:download] get_file ok telegram_path_len={}",
+        file.path.len()
+    ));
+    let base = {
+        let data = state.lock().await;
+        data.api_base_url.clone()
+    };
+    let token = bot.token().to_string();
+    let url = format!("{}/file/bot{}/{}", base, token, file.path);
+    let scrub =
+        |e: reqwest::Error| -> String { e.to_string().replace(&token, "<bot_token_redacted>") };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(STT_DOWNLOAD_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("Failed to create audio downloader: {e}"))?;
+    let mut resp = await_stt_or_cancel(client.get(&url).send(), cancel_token)
+        .await?
+        .map_err(|e| format!("Audio download failed: {}", scrub(e)))?;
+    msg_debug(&format!(
+        "[stt:{trace_id}:download] http response status={} content_length={:?}",
+        resp.status(),
+        resp.content_length()
+    ));
+    if !resp.status().is_success() {
+        return Err(format!("Audio download failed: HTTP {}", resp.status()));
+    }
+    if let Some(len) = resp.content_length() {
+        if len > STT_AUDIO_MAX_BYTES as u64 {
+            return Err(stt_audio_too_large_message(len));
+        }
+    }
+    if stt_cancelled(cancel_token) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:download] cancelled before temp write"
+        ));
+        return Err(stt_cancelled_error());
+    }
+
+    let temp_path = stt_temp_path_for(&info.file_name)?;
+    msg_debug(&format!(
+        "[stt:{trace_id}:download] temp path allocated {}",
+        stt_file_debug_summary(&temp_path)
+    ));
+    let write_result: Result<u64, String> = async {
+        use std::io::Write;
+        let mut out = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| format!("Failed to create STT temp file: {e}"))?;
+        let mut downloaded = 0u64;
+        loop {
+            let Some(chunk) = await_stt_or_cancel(resp.chunk(), cancel_token)
+                .await?
+                .map_err(|e| format!("Audio download read failed: {}", scrub(e)))?
+            else {
+                break;
+            };
+            downloaded = downloaded
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| "Audio download size overflow.".to_string())?;
+            if downloaded > STT_AUDIO_MAX_BYTES as u64 {
+                return Err(stt_audio_too_large_message(downloaded));
+            }
+            if stt_cancelled(cancel_token) {
+                msg_debug(&format!(
+                    "[stt:{trace_id}:download] cancelled while writing downloaded={}",
+                    downloaded
+                ));
+                return Err(stt_cancelled_error());
+            }
+            out.write_all(&chunk)
+                .map_err(|e| format!("Failed to write STT temp file: {e}"))?;
+        }
+        if downloaded == 0 {
+            return Err("Audio download produced an empty file.".to_string());
+        }
+        out.flush()
+            .map_err(|e| format!("Failed to flush STT temp file: {e}"))?;
+        Ok(downloaded)
+    }
+    .await;
+    let downloaded = match write_result {
+        Ok(downloaded) => downloaded,
+        Err(e) => {
+            msg_debug(&format!(
+                "[stt:{trace_id}:download] write failed: {}",
+                truncate_str(&e, 500)
+            ));
+            let _ = fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    };
+    msg_debug(&format!(
+        "[stt:{trace_id}:download] completed bytes={} {}",
+        downloaded,
+        stt_file_debug_summary(&temp_path)
+    ));
+    Ok(temp_path)
+}
+
+struct SttProgressReporter {
+    bot: Bot,
+    chat_id: ChatId,
+    state: SharedState,
+    progress_message_id: Option<teloxide::types::MessageId>,
+    context: String,
+    last_text: String,
+    last_edit: Option<tokio::time::Instant>,
+    last_download_percent: Option<f64>,
+    model_load_started_at: Option<tokio::time::Instant>,
+    model_load_notice_shown: bool,
+}
+
+impl SttProgressReporter {
+    fn new(
+        bot: Bot,
+        chat_id: ChatId,
+        state: SharedState,
+        progress_message_id: Option<teloxide::types::MessageId>,
+        context: String,
+    ) -> Self {
+        Self {
+            bot,
+            chat_id,
+            state,
+            progress_message_id,
+            context,
+            last_text: STT_PROGRESS_TEXT.to_string(),
+            last_edit: None,
+            last_download_percent: None,
+            model_load_started_at: None,
+            model_load_notice_shown: false,
+        }
+    }
+
+    async fn set_text(&mut self, text: String, force: bool) -> bool {
+        let Some(message_id) = self.progress_message_id else {
+            return false;
+        };
+        if text == self.last_text {
+            return false;
+        }
+        let now = tokio::time::Instant::now();
+        if !force {
+            if let Some(last) = self.last_edit {
+                if now.duration_since(last) < tokio::time::Duration::from_secs(5) {
+                    return false;
+                }
+            }
+        }
+
+        shared_rate_limit_wait(&self.state, self.chat_id).await;
+        match tg!(
+            "edit_message",
+            &self.state,
+            self.chat_id,
+            self.bot
+                .edit_message_text(self.chat_id, message_id, &text)
+                .await
+        ) {
+            Ok(_) => {
+                msg_debug(&format!(
+                    "[stt:{}] chat_id={}, progress event edit id={} text={:?}",
+                    self.context,
+                    self.chat_id.0,
+                    message_id.0,
+                    truncate_str(&text, 160)
+                ));
+                self.last_text = text;
+                self.last_edit = Some(tokio::time::Instant::now());
+                true
+            }
+            Err(e) => {
+                msg_debug(&format!(
+                    "[stt:{}] chat_id={}, progress event edit failed id={}: {}",
+                    self.context,
+                    self.chat_id.0,
+                    message_id.0,
+                    redact_err(&e)
+                ));
+                false
+            }
+        }
+    }
+
+    async fn handle_event(&mut self, event: &serde_json::Value) {
+        let Some(name) = event.get("event").and_then(|v| v.as_str()) else {
+            return;
+        };
+        match name {
+            "model_download_required" | "model_download_started" => {
+                self.last_download_percent = None;
+                let text = stt_download_progress_text(event)
+                    .unwrap_or_else(|| "Downloading speech model..".to_string());
+                let edited = self.set_text(text, true).await;
+                if edited {
+                    self.last_download_percent = event.get("percent").and_then(|v| v.as_f64());
+                }
+            }
+            "model_download_progress" => {
+                let percent = event.get("percent").and_then(|v| v.as_f64());
+                if let Some(percent) = percent {
+                    let should_try = self
+                        .last_download_percent
+                        .map(|last| percent >= 100.0 || percent - last >= 5.0)
+                        .unwrap_or(true);
+                    if !should_try {
+                        return;
+                    }
+                }
+                let text = stt_download_progress_text(event)
+                    .unwrap_or_else(|| "Downloading speech model..".to_string());
+                let force = percent.map(|p| p >= 100.0).unwrap_or(false);
+                let edited = self.set_text(text, force).await;
+                if edited {
+                    self.last_download_percent = percent;
+                }
+            }
+            "model_download_finished" => {
+                let text = stt_download_progress_text(event)
+                    .unwrap_or_else(|| "Downloading speech model: 100%".to_string());
+                let edited = self.set_text(text, true).await;
+                if edited {
+                    self.last_download_percent = Some(100.0);
+                }
+            }
+            "model_load_started" => {
+                self.model_load_started_at = Some(tokio::time::Instant::now());
+                self.model_load_notice_shown = false;
+                msg_debug(&format!(
+                    "[stt:{}] chat_id={}, model load started; delaying visible notice by {}s",
+                    self.context,
+                    self.chat_id.0,
+                    STT_MODEL_LOAD_NOTICE_DELAY.as_secs()
+                ));
+            }
+            "whisper_inference_started" => {
+                self.model_load_started_at = None;
+                self.model_load_notice_shown = false;
+                let _ = self.set_text(STT_PROGRESS_TEXT.to_string(), true).await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn maybe_show_delayed_model_load_notice(&mut self) {
+        if self.model_load_notice_shown {
+            return;
+        }
+        let Some(started_at) = self.model_load_started_at else {
+            return;
+        };
+        if tokio::time::Instant::now().duration_since(started_at) < STT_MODEL_LOAD_NOTICE_DELAY {
+            return;
+        }
+        let _ = self.set_text(STT_MODEL_LOAD_TEXT.to_string(), true).await;
+        self.model_load_notice_shown = true;
+    }
+}
+
+fn stt_download_progress_text(event: &serde_json::Value) -> Option<String> {
+    let model = event
+        .get("model_name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("model");
+    let downloaded = event.get("downloaded_bytes").and_then(|v| v.as_u64());
+    let total = event.get("total_bytes").and_then(|v| v.as_u64());
+    let percent = event.get("percent").and_then(|v| v.as_f64());
+
+    match (downloaded, total, percent) {
+        (Some(downloaded), Some(total), Some(percent)) if total > 0 => Some(format!(
+            "Downloading speech model {model}: {:.0}% ({:.1}/{:.1} MB)",
+            percent,
+            downloaded as f64 / (1024.0 * 1024.0),
+            total as f64 / (1024.0 * 1024.0)
+        )),
+        (Some(downloaded), _, _) => Some(format!(
+            "Downloading speech model {model}: {:.1} MB",
+            downloaded as f64 / (1024.0 * 1024.0)
+        )),
+        _ => Some(format!("Downloading speech model {model}..")),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SttModelArgMode {
+    InheritTranscriptorDefaults,
+    ExplicitPath,
+    ModelNameOverride,
+}
+
+fn stt_model_arg_mode(setting: Option<&str>) -> SttModelArgMode {
+    let Some(setting) = setting.map(str::trim).filter(|s| !s.is_empty()) else {
+        return SttModelArgMode::InheritTranscriptorDefaults;
+    };
+    if setting.strip_prefix("path:").is_some() {
+        SttModelArgMode::ExplicitPath
+    } else {
+        SttModelArgMode::ModelNameOverride
+    }
+}
+
+fn apply_stt_model_args(
+    cmd: &mut tokio::process::Command,
+    setting: Option<&str>,
+) -> SttModelArgMode {
+    let mode = stt_model_arg_mode(setting);
+    match mode {
+        SttModelArgMode::InheritTranscriptorDefaults => {}
+        SttModelArgMode::ExplicitPath => {
+            let setting = setting.unwrap_or("").trim();
+            let path = setting.strip_prefix("path:").unwrap_or("").trim();
+            cmd.arg("--model").arg(expand_user_path(path));
+        }
+        SttModelArgMode::ModelNameOverride => {
+            let setting = setting.unwrap_or("").trim();
+            // transcriptor's documented precedence puts TRANSCRIPTOR_MODEL
+            // above --model-name. A per-chat cokacdir model name must therefore
+            // suppress only that inherited model-path env var for this child.
+            cmd.env_remove("TRANSCRIPTOR_MODEL");
+            cmd.arg("--model-name").arg(setting);
+        }
+    }
+    mode
+}
+
+async fn run_transcriptor(
+    audio_path: &Path,
+    stt_model_setting: Option<String>,
+    mut progress: Option<SttProgressReporter>,
+    cancel_token: Option<Arc<CancelToken>>,
+    trace_id: &str,
+) -> Result<String, String> {
+    msg_debug(&format!(
+        "[stt:{trace_id}:run] start audio={} stt_model={} env=[{}]",
+        stt_file_debug_summary(audio_path),
+        stt_model_setting_display(stt_model_setting.as_deref()),
+        stt_env_debug_summary()
+    ));
+    if stt_cancelled(cancel_token.as_ref()) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:run] cancelled before binary ensure"
+        ));
+        return Err(stt_cancelled_error());
+    }
+    let bin = ensure_transcriptor_binary(cancel_token.as_ref(), trace_id).await?;
+    msg_debug(&format!(
+        "[stt:{trace_id}:run] binary ready {}",
+        stt_file_debug_summary(&bin)
+    ));
+    let mut cmd = tokio::process::Command::new(&bin);
+    cmd.arg("--progress").arg("json");
+    let stt_model_arg_mode = apply_stt_model_args(&mut cmd, stt_model_setting.as_deref());
+    msg_debug(&format!(
+        "[stt:{trace_id}:run] model_arg_mode={:?} transcriptor_model_env_removed={}",
+        stt_model_arg_mode,
+        stt_model_arg_mode == SttModelArgMode::ModelNameOverride
+    ));
+    cmd.arg(audio_path);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    claude::attach_cancel_cgroup_tokio(&mut cmd, cancel_token.as_ref());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to run transcriptor: {e}"))?;
+    let child_pid = child.id();
+    msg_debug(&format!("[stt:{trace_id}:run] spawned pid={:?}", child_pid));
+    if let (Some(token), Some(pid)) = (cancel_token.as_ref(), child_pid) {
+        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(pid);
+    }
+    if stt_cancelled(cancel_token.as_ref()) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:run] cancelled immediately after spawn pid={:?}",
+            child_pid
+        ));
+        if let Some(token) = cancel_token.as_ref() {
+            token.cancel_now();
+        }
+    }
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture transcriptor stdout.".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture transcriptor stderr.".to_string())?;
+
+    let stdout_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut buf = Vec::new();
+        reader
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|e| format!("Failed to read transcriptor stdout: {e}"))?;
+        Ok::<Vec<u8>, String>(buf)
+    });
+
+    let (progress_tx, mut progress_rx) =
+        tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let trace_id_for_stderr = trace_id.to_string();
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = tokio::io::BufReader::new(stderr).lines();
+        let mut stderr_text = String::new();
+        while let Some(line) = reader
+            .next_line()
+            .await
+            .map_err(|e| format!("Failed to read transcriptor stderr: {e}"))?
+        {
+            if !stderr_text.is_empty() {
+                stderr_text.push('\n');
+            }
+            stderr_text.push_str(&line);
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(value) => {
+                    msg_debug(&format!(
+                        "[stt:{trace_id_for_stderr}:progress] {}",
+                        truncate_str(&line, 500)
+                    ));
+                    let _ = progress_tx.send(value);
+                }
+                Err(_) => {
+                    msg_debug(&format!(
+                        "[stt:{trace_id_for_stderr}:stderr] {}",
+                        truncate_str(&line, 500)
+                    ));
+                }
+            }
+        }
+        Ok::<String, String>(stderr_text)
+    });
+
+    let mut wait_status: Option<std::process::ExitStatus> = None;
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut progress_open = true;
+    {
+        let mut wait_fut = Box::pin(child.wait());
+        let mut deadline = Box::pin(tokio::time::sleep(tokio::time::Duration::from_secs(
+            STT_TIMEOUT_SECS,
+        )));
+        let mut cancel_interval = tokio::time::interval(tokio::time::Duration::from_millis(100));
+        loop {
+            tokio::select! {
+                status = &mut wait_fut => {
+                    wait_status = Some(status.map_err(|e| format!("Failed to run transcriptor: {e}"))?);
+                    break;
+                }
+                _ = &mut deadline => {
+                    timed_out = true;
+                    break;
+                }
+                _ = cancel_interval.tick() => {
+                    if stt_cancelled(cancel_token.as_ref()) {
+                        cancelled = true;
+                        break;
+                    }
+                    if let Some(progress) = progress.as_mut() {
+                        progress.maybe_show_delayed_model_load_notice().await;
+                    }
+                }
+                event = progress_rx.recv(), if progress_open => {
+                    match event {
+                        Some(event) => {
+                            if let Some(progress) = progress.as_mut() {
+                                progress.handle_event(&event).await;
+                            }
+                        }
+                        None => {
+                            progress_open = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if timed_out || cancelled {
+        if let Some(token) = cancel_token.as_ref() {
+            token.cancel_now();
+        } else {
+            let _ = child.start_kill();
+        }
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(3), child.wait()).await;
+        if let Some(token) = cancel_token.as_ref() {
+            let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+            if *guard == child_pid {
+                *guard = None;
+            }
+        }
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(3), stdout_task).await;
+        let _ = tokio::time::timeout(tokio::time::Duration::from_secs(3), stderr_task).await;
+        if timed_out {
+            msg_debug(&format!(
+                "[stt:{trace_id}:run] timeout after {}s pid={:?}",
+                STT_TIMEOUT_SECS, child_pid
+            ));
+            return Err("Audio transcription timed out.".to_string());
+        }
+        msg_debug(&format!(
+            "[stt:{trace_id}:run] cancelled while waiting pid={:?}",
+            child_pid
+        ));
+        return Err(stt_cancelled_error());
+    }
+
+    let status = wait_status.ok_or_else(|| "transcriptor exited without status.".to_string())?;
+    while let Ok(event) = progress_rx.try_recv() {
+        if let Some(progress) = progress.as_mut() {
+            progress.handle_event(&event).await;
+        }
+    }
+
+    let stdout_bytes = stdout_task
+        .await
+        .map_err(|e| format!("transcriptor stdout task failed: {e}"))??;
+    let stderr = stderr_task
+        .await
+        .map_err(|e| format!("transcriptor stderr task failed: {e}"))??;
+
+    if let Some(token) = cancel_token.as_ref() {
+        let mut guard = token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+        if *guard == child_pid {
+            *guard = None;
+        }
+    }
+    if stt_cancelled(cancel_token.as_ref()) {
+        msg_debug(&format!(
+            "[stt:{trace_id}:run] cancelled after process output pid={:?}",
+            child_pid
+        ));
+        return Err(stt_cancelled_error());
+    }
+
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    msg_debug(&format!(
+        "[stt:{trace_id}:run] output status={} code={:?} success={} stdout_bytes={} stdout_sha256={} stdout_shape=[{}] stderr_bytes={} stderr_preview={:?}",
+        status,
+        status.code(),
+        status.success(),
+        stdout_bytes.len(),
+        sha256_hex_bytes(&stdout_bytes),
+        stt_stdout_shape(&stdout),
+        stderr.len(),
+        stt_stderr_preview(&stderr)
+    ));
+    if !status.success() {
+        msg_debug(&format!(
+            "[stt:{trace_id}:run] nonzero exit status={} stderr_preview={:?}",
+            status,
+            stt_stderr_preview(&stderr)
+        ));
+        return Err(format!(
+            "transcriptor exited with {}: {}",
+            status,
+            truncate_str(stderr.trim(), 500)
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| {
+            msg_debug(&format!(
+                "[stt:{trace_id}:run] json parse failed: error={} stdout_bytes={} stdout_sha256={} stdout_shape=[{}] stderr_preview={:?}",
+                e,
+                stdout_bytes.len(),
+                sha256_hex_bytes(&stdout_bytes),
+                stt_stdout_shape(&stdout),
+                stt_stderr_preview(&stderr)
+            ));
+            format!("Invalid transcriptor JSON output: {e}")
+        })?;
+    let text = value
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        msg_debug(&format!(
+            "[stt:{trace_id}:run] json parsed but text empty keys={:?}",
+            value
+                .as_object()
+                .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default()
+        ));
+        return Err("Transcription produced no text.".to_string());
+    }
+    msg_debug(&format!(
+        "[stt:{trace_id}:run] success transcript_chars={}",
+        text.chars().count()
+    ));
+    Ok(text)
+}
+
+async fn transcribe_audio_message(
+    bot: &Bot,
+    chat_id: ChatId,
+    msg: &Message,
+    state: &SharedState,
+    progress_message_id: Option<teloxide::types::MessageId>,
+    cancel_token: Option<Arc<CancelToken>>,
+) -> Result<String, String> {
+    let trace_id = format!("{:08x}", rand::random::<u32>());
+    msg_debug(&format!(
+        "[stt:{trace_id}:message] start chat_id={} message_id={}",
+        chat_id.0, msg.id.0
+    ));
+    let Some(info) = stt_audio_upload_info(msg) else {
+        msg_debug(&format!(
+            "[stt:{trace_id}:message] rejected: message is not audio upload"
+        ));
+        return Err("Message is not an audio upload.".to_string());
+    };
+    msg_debug(&format!(
+        "[stt:{trace_id}:message] audio detected file_name_len={} size_hint={}",
+        info.file_name.len(),
+        info.file_size_hint
+    ));
+    let temp_path =
+        download_stt_audio_to_temp(bot, chat_id, &info, state, cancel_token.as_ref(), &trace_id)
+            .await?;
+    let stt_model_setting = {
+        let data = state.lock().await;
+        get_stt_model(&data.settings, chat_id)
+    };
+    let progress = Some(SttProgressReporter::new(
+        bot.clone(),
+        chat_id,
+        state.clone(),
+        progress_message_id,
+        format!("{trace_id}:progress"),
+    ));
+    let result = run_transcriptor(
+        &temp_path,
+        stt_model_setting,
+        progress,
+        cancel_token,
+        &trace_id,
+    )
+    .await;
+    match &result {
+        Ok(text) => msg_debug(&format!(
+            "[stt:{trace_id}:message] transcriptor ok transcript_chars={}",
+            text.chars().count()
+        )),
+        Err(e) => msg_debug(&format!(
+            "[stt:{trace_id}:message] transcriptor error={}",
+            truncate_str(e, 500)
+        )),
+    }
+    match fs::remove_file(&temp_path) {
+        Ok(_) => msg_debug(&format!(
+            "[stt:{trace_id}:message] temp removed path={}",
+            temp_path.display()
+        )),
+        Err(e) => msg_debug(&format!(
+            "[stt:{trace_id}:message] temp remove failed path={} error={}",
+            temp_path.display(),
+            e
+        )),
+    }
+    result
+}
+
+fn build_stt_request_text(caption_text: Option<String>, transcripts: &[String]) -> Option<String> {
+    let cleaned: Vec<String> = transcripts
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+    let transcript_block = match cleaned.len() {
+        0 => String::new(),
+        1 => cleaned[0].clone(),
+        _ => cleaned
+            .iter()
+            .enumerate()
+            .map(|(idx, text)| format!("[Audio {}]\n{}", idx + 1, text))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    };
+    let caption = caption_text
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty());
+    match (caption, transcript_block.is_empty()) {
+        (Some(c), false) => Some(format!("{c}\n\n[Transcribed audio]\n{transcript_block}")),
+        (Some(c), true) => Some(c),
+        (None, false) => Some(transcript_block),
+        (None, true) => None,
+    }
+}
+
+fn build_stt_confirmation_text(transcripts: &[String]) -> Option<String> {
+    let cleaned: Vec<String> = transcripts
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect();
+
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    Some(
+        cleaned
+            .iter()
+            .map(|text| format!("🗣️ {text}"))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
+}
+
+fn build_stt_error_text(err: &str) -> String {
+    format!("Audio transcription failed: {}", truncate_str(err, 500))
+}
+
+async fn send_stt_progress_message(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    context: &str,
+) -> Option<teloxide::types::MessageId> {
+    shared_rate_limit_wait(state, chat_id).await;
+    match tg!(
+        "send_message",
+        bot.send_message(chat_id, STT_PROGRESS_TEXT).await
+    ) {
+        Ok(msg) => {
+            msg_debug(&format!(
+                "[stt:{}] chat_id={}, progress message sent id={}",
+                context, chat_id.0, msg.id.0
+            ));
+            Some(msg.id)
+        }
+        Err(e) => {
+            msg_debug(&format!(
+                "[stt:{}] chat_id={}, progress message send failed: {}",
+                context,
+                chat_id.0,
+                redact_err(&e)
+            ));
+            None
+        }
+    }
+}
+
+async fn edit_stt_progress_or_send(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    progress_message_id: Option<teloxide::types::MessageId>,
+    text: &str,
+    long_fallback_notice: &str,
+    context: &str,
+) -> ResponseResult<()> {
+    if let Some(message_id) = progress_message_id {
+        if text.len() <= TELEGRAM_MSG_LIMIT {
+            shared_rate_limit_wait(state, chat_id).await;
+            match tg!(
+                "edit_message",
+                bot.edit_message_text(chat_id, message_id, text).await
+            ) {
+                Ok(_) => {
+                    msg_debug(&format!(
+                        "[stt:{}] chat_id={}, progress message edited id={} len={}",
+                        context,
+                        chat_id.0,
+                        message_id.0,
+                        text.len()
+                    ));
+                    return Ok(());
+                }
+                Err(e) => {
+                    msg_debug(&format!(
+                        "[stt:{}] chat_id={}, progress message edit failed id={}: {}",
+                        context,
+                        chat_id.0,
+                        message_id.0,
+                        redact_err(&e)
+                    ));
+                }
+            }
+        } else {
+            shared_rate_limit_wait(state, chat_id).await;
+            if let Err(e) = tg!(
+                "edit_message",
+                bot.edit_message_text(chat_id, message_id, long_fallback_notice)
+                    .await
+            ) {
+                msg_debug(&format!(
+                    "[stt:{}] chat_id={}, long-result notice edit failed id={}: {}",
+                    context,
+                    chat_id.0,
+                    message_id.0,
+                    redact_err(&e)
+                ));
+            }
+        }
+    }
+
+    send_long_message(bot, chat_id, text, None, state).await
+}
+
+async fn send_stt_confirmation(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    progress_message_id: Option<teloxide::types::MessageId>,
+    transcripts: &[String],
+) -> ResponseResult<()> {
+    if let Some(text) = build_stt_confirmation_text(transcripts) {
+        edit_stt_progress_or_send(
+            bot,
+            chat_id,
+            state,
+            progress_message_id,
+            &text,
+            "🗣️ Speech recognized. Sending long result below.",
+            "confirmation",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn send_stt_error(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    progress_message_id: Option<teloxide::types::MessageId>,
+    err: &str,
+) -> ResponseResult<()> {
+    let text = build_stt_error_text(err);
+    edit_stt_progress_or_send(
+        bot,
+        chat_id,
+        state,
+        progress_message_id,
+        &text,
+        "Audio transcription failed. Sending details below.",
+        "error",
+    )
+    .await?;
+    Ok(())
+}
+
+async fn mark_stt_progress_stopped(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    progress_message_id: Option<teloxide::types::MessageId>,
+    context: &str,
+) {
+    if let Err(e) = edit_stt_progress_or_send(
+        bot,
+        chat_id,
+        state,
+        progress_message_id,
+        STT_STOPPED_TEXT,
+        STT_STOPPED_TEXT,
+        context,
+    )
+    .await
+    {
+        msg_debug(&format!(
+            "[stt:{}] chat_id={}, failed to mark progress stopped: {}",
+            context,
+            chat_id.0,
+            redact_err(&e)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod stt_confirmation_tests {
+    use std::path::Path;
+
+    use super::{
+        build_stt_confirmation_text, normalize_stt_model_setting, stt_model_arg_mode,
+        stt_model_setting_display, transcriptor_lock_path, SttModelArgMode,
+    };
+
+    #[test]
+    fn stt_confirmation_uses_speaking_emoji_with_space() {
+        let transcripts = vec![" 안녕하세요 ".to_string()];
+
+        assert_eq!(
+            build_stt_confirmation_text(&transcripts).as_deref(),
+            Some("🗣️ 안녕하세요")
+        );
+    }
+
+    #[test]
+    fn stt_confirmation_prefixes_each_transcript() {
+        let transcripts = vec!["첫 번째".to_string(), "두 번째".to_string()];
+
+        assert_eq!(
+            build_stt_confirmation_text(&transcripts).as_deref(),
+            Some("🗣️ 첫 번째\n\n🗣️ 두 번째")
+        );
+    }
+
+    #[test]
+    fn stt_model_setting_accepts_model_name() {
+        assert_eq!(
+            normalize_stt_model_setting("large-v3-turbo").unwrap(),
+            Some("large-v3-turbo".to_string())
+        );
+    }
+
+    #[test]
+    fn stt_model_setting_accepts_explicit_path() {
+        assert_eq!(
+            normalize_stt_model_setting("path:/models/ggml-small.bin").unwrap(),
+            Some("path:/models/ggml-small.bin".to_string())
+        );
+    }
+
+    #[test]
+    fn stt_model_setting_reset_clears_override() {
+        assert_eq!(normalize_stt_model_setting("reset").unwrap(), None);
+    }
+
+    #[test]
+    fn stt_model_display_shows_transcriptor_default_when_unset() {
+        assert_eq!(
+            stt_model_setting_display(None),
+            "default (transcriptor env/config/base)"
+        );
+    }
+
+    #[test]
+    fn stt_model_name_uses_model_name_override_mode() {
+        assert_eq!(
+            stt_model_arg_mode(Some("small")),
+            SttModelArgMode::ModelNameOverride
+        );
+    }
+
+    #[test]
+    fn stt_model_path_uses_explicit_path_mode() {
+        assert_eq!(
+            stt_model_arg_mode(Some("path:/models/ggml-small.bin")),
+            SttModelArgMode::ExplicitPath
+        );
+    }
+
+    #[test]
+    fn stt_model_unset_inherits_transcriptor_defaults() {
+        assert_eq!(
+            stt_model_arg_mode(None),
+            SttModelArgMode::InheritTranscriptorDefaults
+        );
+    }
+
+    #[test]
+    fn transcriptor_lock_path_keeps_binary_extension_visible() {
+        assert_eq!(
+            transcriptor_lock_path(Path::new("/tmp/transcriptor.exe")).unwrap(),
+            Path::new("/tmp/transcriptor.exe.lock")
+        );
+    }
+}
+
+async fn cleanup_reserved_stt_slot(
+    bot: &Bot,
+    chat_id: ChatId,
+    state: &SharedState,
+    expected_token: &Arc<CancelToken>,
+) {
+    let (removed_slot, stop_msg_id) = {
+        let mut data = state.lock().await;
+        let should_remove = data
+            .cancel_tokens
+            .get(&chat_id)
+            .map(|token| Arc::ptr_eq(token, expected_token))
+            .unwrap_or(false);
+        if should_remove {
+            remove_cancel_token_locked(&mut data, chat_id);
+            (true, data.stop_message_ids.remove(&chat_id))
+        } else {
+            msg_debug(&format!(
+                "[stt_cleanup] chat_id={}, token already taken over or removed",
+                chat_id.0
+            ));
+            (false, None)
+        }
+    };
+    if let Some(msg_id) = stop_msg_id {
+        shared_rate_limit_wait(state, chat_id).await;
+        let _ = tg!("delete_message", bot.delete_message(chat_id, msg_id).await);
+    }
+    if removed_slot {
+        msg_debug(&format!(
+            "[queue:trigger] chat_id={}, source=stt_cleanup",
+            chat_id.0
+        ));
+        process_next_queued_message(bot, chat_id, state).await;
+    }
+}
+
+async fn rollback_album_upload_records(
+    state: &SharedState,
+    chat_id: ChatId,
+    upload_records: &[String],
+    reason: &str,
+) {
+    if upload_records.is_empty() {
+        return;
+    }
+
+    let (pending_removed, history_removed) = {
+        let mut data = state.lock().await;
+        let upload_model = get_model(&data.settings, chat_id);
+        let provider = detect_provider(upload_model.as_deref());
+        let Some(session) = data.sessions.get_mut(&chat_id) else {
+            return;
+        };
+        let pending_removed = session.remove_pending_upload_records(upload_records);
+        let history_removed = session.remove_user_history_records(upload_records);
+        if pending_removed > 0 || history_removed > 0 {
+            if let Some(save_dir) = session.current_path.clone() {
+                save_session_to_file(session, &save_dir, provider);
+            }
+        }
+        (pending_removed, history_removed)
+    };
+
+    if pending_removed > 0 || history_removed > 0 {
+        msg_debug(&format!(
+            "[album_batch] chat_id={}, rolled back album upload records after {} (pending={}, history={})",
+            chat_id.0, reason, pending_removed, history_removed
+        ));
+    }
+}
+
+async fn process_reserved_stt_message(
+    bot: Bot,
+    chat_id: ChatId,
+    msg: Message,
+    state: SharedState,
+    user_name: String,
+    caption_text: Option<String>,
+    cancel_token: Arc<CancelToken>,
+) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    if cancel_token.cancelled.load(Ordering::Relaxed) {
+        println!("  [{ts}] ■ [{user_name}] STT cancelled before start");
+        cleanup_reserved_stt_slot(&bot, chat_id, &state, &cancel_token).await;
+        return;
+    }
+
+    let progress_message_id = send_stt_progress_message(&bot, chat_id, &state, "single").await;
+
+    let transcript = match transcribe_audio_message(
+        &bot,
+        chat_id,
+        &msg,
+        &state,
+        progress_message_id,
+        Some(cancel_token.clone()),
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(e) => {
+            if cancel_token.cancelled.load(Ordering::Relaxed) {
+                println!("  [{ts}] ■ [{user_name}] STT stopped");
+                mark_stt_progress_stopped(
+                    &bot,
+                    chat_id,
+                    &state,
+                    progress_message_id,
+                    "single_cancelled",
+                )
+                .await;
+                cleanup_reserved_stt_slot(&bot, chat_id, &state, &cancel_token).await;
+                return;
+            }
+            msg_debug(&format!(
+                "[stt:single] chat_id={}, stt failed: {}",
+                chat_id.0, e
+            ));
+            println!("  [{ts}]   ⚠ STT failed: {}", truncate_str(&e, 200));
+            let _ = send_stt_error(&bot, chat_id, &state, progress_message_id, &e).await;
+            cleanup_reserved_stt_slot(&bot, chat_id, &state, &cancel_token).await;
+            return;
+        }
+    };
+
+    if cancel_token.cancelled.load(Ordering::Relaxed) {
+        println!("  [{ts}] ■ [{user_name}] STT stopped");
+        mark_stt_progress_stopped(
+            &bot,
+            chat_id,
+            &state,
+            progress_message_id,
+            "single_cancelled",
+        )
+        .await;
+        cleanup_reserved_stt_slot(&bot, chat_id, &state, &cancel_token).await;
+        return;
+    }
+    println!("  [{ts}] ▶ [{user_name}] STT complete");
+
+    if let Err(e) = send_stt_confirmation(
+        &bot,
+        chat_id,
+        &state,
+        progress_message_id,
+        std::slice::from_ref(&transcript),
+    )
+    .await
+    {
+        msg_debug(&format!(
+            "[stt:single] chat_id={}, confirmation failed: {}",
+            chat_id.0,
+            redact_err(&e)
+        ));
+        cleanup_reserved_stt_slot(&bot, chat_id, &state, &cancel_token).await;
+        return;
+    }
+
+    if cancel_token.cancelled.load(Ordering::Relaxed) {
+        println!("  [{ts}] ■ [{user_name}] STT stopped");
+        mark_stt_progress_stopped(
+            &bot,
+            chat_id,
+            &state,
+            progress_message_id,
+            "single_cancelled",
+        )
+        .await;
+        cleanup_reserved_stt_slot(&bot, chat_id, &state, &cancel_token).await;
+        return;
+    }
+
+    let Some(request_text) = build_stt_request_text(caption_text, &[transcript]) else {
+        let err = "Transcription produced no text.";
+        let _ = send_stt_error(&bot, chat_id, &state, progress_message_id, err).await;
+        cleanup_reserved_stt_slot(&bot, chat_id, &state, &cancel_token).await;
+        return;
+    };
+
+    let result = handle_text_message(&bot, chat_id, &request_text, &state, &user_name, true).await;
+    if let Err(e) = result {
+        msg_debug(&format!(
+            "[stt:single] chat_id={}, dispatch failed: {}",
+            chat_id.0,
+            redact_err(&e)
+        ));
+        cleanup_reserved_stt_slot(&bot, chat_id, &state, &cancel_token).await;
+    }
+}
+
+async fn start_stt_message_task(
+    bot: Bot,
+    chat_id: ChatId,
+    msg: Message,
+    state: SharedState,
+    user_name: String,
+    caption_text: Option<String>,
+) -> ResponseResult<()> {
+    enum SttAdmission {
+        Start {
+            request_tasks: RequestTasks,
+            cancel_token: Arc<CancelToken>,
+            msg: Message,
+            user_name: String,
+            caption_text: Option<String>,
+        },
+        Queued {
+            id: String,
+            preview: String,
+        },
+        Redirect {
+            preview: String,
+            replaced: bool,
+        },
+        QueueFull,
+    }
+
+    let dispatch_id = next_dispatch_id();
+    let cancel_token = new_cancel_token_for_owner(dispatch_id);
+    let admission = {
+        let mut data = state.lock().await;
+        let request_tasks = data.request_tasks.clone();
+        if data.cancel_tokens.contains_key(&chat_id) {
+            msg_debug(&format!(
+                "[stt:single] chat_id={}, slot busy at admission",
+                chat_id.0
+            ));
+            let qkey = chat_id.0.to_string();
+            let qmode = data
+                .settings
+                .queue
+                .get(&qkey)
+                .copied()
+                .unwrap_or(QUEUE_MODE_DEFAULT);
+            let preview = "Audio upload: STT".to_string();
+            if qmode {
+                let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
+                if cur_len >= MAX_QUEUE_SIZE {
+                    msg_debug(&format!(
+                        "[stt:single] chat_id={}, queue FULL ({}/{})",
+                        chat_id.0, cur_len, MAX_QUEUE_SIZE
+                    ));
+                    SttAdmission::QueueFull
+                } else {
+                    let id = generate_queue_id();
+                    let q = data
+                        .message_queues
+                        .entry(chat_id)
+                        .or_insert_with(std::collections::VecDeque::new);
+                    q.push_back(QueuedMessage {
+                        id: id.clone(),
+                        user_display_name: user_name,
+                        payload: QueuedPayload::SttAudio { msg, caption_text },
+                    });
+                    msg_debug(&format!(
+                        "[stt:single] chat_id={}, QUEUED id={}, pos={}",
+                        chat_id.0,
+                        id,
+                        q.len()
+                    ));
+                    SttAdmission::Queued { id, preview }
+                }
+            } else {
+                cancel_in_progress_task_locked(&data, chat_id);
+                data.loop_states.remove(&chat_id);
+                data.loop_feedback.remove(&chat_id);
+                let q = data
+                    .message_queues
+                    .entry(chat_id)
+                    .or_insert_with(std::collections::VecDeque::new);
+                let replaced = !q.is_empty();
+                q.clear();
+                let id = generate_queue_id();
+                q.push_back(QueuedMessage {
+                    id: id.clone(),
+                    user_display_name: user_name,
+                    payload: QueuedPayload::SttAudio { msg, caption_text },
+                });
+                msg_debug(&format!(
+                    "[stt:single] chat_id={}, REDIRECT id={}, replaced={}",
+                    chat_id.0, id, replaced
+                ));
+                SttAdmission::Redirect { preview, replaced }
+            }
+        } else {
+            insert_cancel_token_locked(&mut data, chat_id, cancel_token.clone());
+            msg_debug(&format!(
+                "[stt:single] chat_id={}, reserved AI slot (placeholder)",
+                chat_id.0
+            ));
+            SttAdmission::Start {
+                request_tasks,
+                cancel_token,
+                msg,
+                user_name,
+                caption_text,
+            }
+        }
+    };
+
+    match admission {
+        SttAdmission::Start {
+            request_tasks,
+            cancel_token,
+            msg,
+            user_name,
+            caption_text,
+        } => {
+            let state_for_task = state.clone();
+            let state_for_monitor = state.clone();
+            let join = spawn_tracked_request_task(request_tasks, async move {
+                CURRENT_DISPATCH_ID
+                    .scope(dispatch_id, async move {
+                        process_reserved_stt_message(
+                            bot,
+                            chat_id,
+                            msg,
+                            state_for_task,
+                            user_name,
+                            caption_text,
+                            cancel_token,
+                        )
+                        .await;
+                    })
+                    .await
+            });
+            monitor_dispatch_panic(join, state_for_monitor, chat_id, dispatch_id, "stt:single");
+        }
+        SttAdmission::Queued { id, preview } => {
+            shared_rate_limit_wait(&state, chat_id).await;
+            tg!("send_message", bot.send_message(chat_id, &format!("Queued ({id}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{id} to cancel this"))
+                .await)?;
+        }
+        SttAdmission::Redirect { preview, replaced } => {
+            shared_rate_limit_wait(&state, chat_id).await;
+            let msg = if replaced {
+                format!("🔄 Redirect target updated: \"{preview}\"")
+            } else {
+                format!("🔄 Cancelling current task, will process: \"{preview}\"")
+            };
+            tg!("send_message", bot.send_message(chat_id, &msg).await)?;
+        }
+        SttAdmission::QueueFull => {
+            shared_rate_limit_wait(&state, chat_id).await;
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    &format!(
+                        "Queue full (max {}). Use /stopall to clear.",
+                        MAX_QUEUE_SIZE
+                    )
+                )
+                .await
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_album_attachments_task(
+    bot: Bot,
+    chat_id: ChatId,
+    msgs: Vec<Message>,
+    state: SharedState,
+    user_name: String,
+    caption_str: Option<String>,
+    require_prefix: bool,
+    bot_username: String,
+    placeholder_token: Arc<CancelToken>,
+    reserved_slot: bool,
+) {
+    let timestamp = chrono::Local::now().format("%H:%M:%S");
+    println!(
+        "  [{timestamp}] ◀ [{user_name}] Album: {} attachment(s)",
+        msgs.len()
+    );
+
+    // Sequential downloads/transcriptions: handle_file_upload and STT download
+    // both rate-limit their own Telegram API calls, and sequential processing
+    // keeps pending_uploads plus transcript ordering deterministic.
+    let has_stt_audio = msgs.iter().any(|m| stt_audio_upload_info(m).is_some());
+    let progress_message_id = if has_stt_audio {
+        send_stt_progress_message(&bot, chat_id, &state, "album").await
+    } else {
+        None
+    };
+    let mut ok_count = 0usize;
+    let mut stt_texts: Vec<String> = Vec::new();
+    let mut upload_records: Vec<String> = Vec::new();
+    let mut stt_failed = false;
+    let mut first_stt_error: Option<String> = None;
+    for m in &msgs {
+        if reserved_slot && placeholder_token.cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        if stt_audio_upload_info(m).is_some() {
+            match transcribe_audio_message(
+                &bot,
+                chat_id,
+                m,
+                &state,
+                progress_message_id,
+                Some(placeholder_token.clone()),
+            )
+            .await
+            {
+                Ok(text) => {
+                    ok_count += 1;
+                    stt_texts.push(text);
+                }
+                Err(e) => {
+                    if reserved_slot && placeholder_token.cancelled.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    msg_debug(&format!(
+                        "[album_batch] chat_id={}, stt failed: {}",
+                        chat_id.0, e
+                    ));
+                    if first_stt_error.is_none() {
+                        first_stt_error = Some(e);
+                    }
+                    stt_failed = true;
+                }
+            }
+        } else {
+            match handle_file_upload(&bot, chat_id, m, &state, &user_name).await {
+                Ok(record) => {
+                    ok_count += 1;
+                    if let Some(record) = record {
+                        upload_records.push(record);
+                    }
+                }
+                Err(e) => msg_debug(&format!(
+                    "[album_batch] chat_id={}, upload failed: {}",
+                    chat_id.0, e
+                )),
+            }
+        }
+    }
+    println!(
+        "  [{timestamp}] ▶ [{user_name}] Album processing complete ({}/{})",
+        ok_count,
+        msgs.len()
+    );
+
+    // If the user issued /stop or /stopall during downloads, the placeholder
+    // token will have been marked cancelled. Release the slot and run any
+    // queued message instead of dispatching this album.
+    if reserved_slot && placeholder_token.cancelled.load(Ordering::Relaxed) {
+        msg_debug(&format!(
+            "[album_batch] chat_id={}, cancelled during downloads → aborting dispatch",
+            chat_id.0
+        ));
+        mark_stt_progress_stopped(
+            &bot,
+            chat_id,
+            &state,
+            progress_message_id,
+            "album_cancelled",
+        )
+        .await;
+        rollback_album_upload_records(&state, chat_id, &upload_records, "cancel").await;
+        cleanup_reserved_stt_slot(&bot, chat_id, &state, &placeholder_token).await;
+        return;
+    }
+
+    if stt_failed {
+        msg_debug(&format!(
+            "[album_batch] chat_id={}, aborting dispatch because at least one STT item failed",
+            chat_id.0
+        ));
+        if let Some(e) = first_stt_error.as_deref() {
+            let _ = send_stt_error(&bot, chat_id, &state, progress_message_id, e).await;
+        }
+        rollback_album_upload_records(&state, chat_id, &upload_records, "stt failure").await;
+        if reserved_slot {
+            cleanup_reserved_stt_slot(&bot, chat_id, &state, &placeholder_token).await;
+        }
+        return;
+    }
+
+    if !stt_texts.is_empty() {
+        if let Err(e) =
+            send_stt_confirmation(&bot, chat_id, &state, progress_message_id, &stt_texts).await
+        {
+            msg_debug(&format!(
+                "[album_batch] chat_id={}, stt confirmation failed: {}",
+                chat_id.0,
+                redact_err(&e)
+            ));
+            rollback_album_upload_records(&state, chat_id, &upload_records, "confirmation failure")
+                .await;
+            if reserved_slot {
+                cleanup_reserved_stt_slot(&bot, chat_id, &state, &placeholder_token).await;
+            }
+            return;
+        }
+    }
+
+    let caption_text = caption_str
+        .as_deref()
+        .and_then(|c| extract_caption_text(c, require_prefix, &bot_username));
+    let request_text = build_stt_request_text(caption_text, &stt_texts);
+    match (request_text, reserved_slot) {
+        (Some(text), true) => {
+            msg_debug(&format!(
+                "[album_batch] chat_id={}, dispatching caption (len={}) via reserved slot",
+                chat_id.0,
+                text.len()
+            ));
+            let _ = handle_text_message(&bot, chat_id, &text, &state, &user_name, true).await;
+        }
+        (Some(text), false) => {
+            msg_debug(&format!(
+                "[album_batch] chat_id={}, dispatching caption (len={}) via queue/redirect",
+                chat_id.0,
+                text.len()
+            ));
+            dispatch_album_caption(bot.clone(), chat_id, state.clone(), user_name.clone(), text)
+                .await;
+        }
+        (None, true) => {
+            msg_debug(&format!(
+                "[album_batch] chat_id={}, no caption → releasing slot",
+                chat_id.0
+            ));
+            {
+                let mut data = state.lock().await;
+                if let Some(t) = data.cancel_tokens.get(&chat_id) {
+                    if Arc::ptr_eq(t, &placeholder_token) {
+                        remove_cancel_token_locked(&mut data, chat_id);
+                    }
+                }
+            }
+            process_next_queued_message(&bot, chat_id, &state).await;
+        }
+        (None, false) => {
+            msg_debug(&format!("[album_batch] chat_id={}, no caption, slot was busy → uploads pending for next text", chat_id.0));
+        }
+    }
+}
+
 /// Extract the AI-bound text from a media caption, applying the same prefix
 /// rules used by `handle_message` for direct text messages. Returns `None`
 /// when the caption is empty or, in prefix-required group chats, doesn't
 /// address this bot.
-fn extract_caption_text(
-    caption: &str,
-    require_prefix: bool,
-    bot_username: &str,
-) -> Option<String> {
+fn extract_caption_text(caption: &str, require_prefix: bool, bot_username: &str) -> Option<String> {
     if require_prefix {
         let extracted = if !bot_username.is_empty() && caption.starts_with('@') {
             let prefix = format!("@{} ", bot_username);
             if caption.to_lowercase().starts_with(&prefix.to_lowercase()) {
                 let body = caption[prefix.len()..].trim_start();
-                body.strip_prefix(';').map(|s| s.trim_start()).unwrap_or(body)
+                body.strip_prefix(';')
+                    .map(|s| s.trim_start())
+                    .unwrap_or(body)
             } else {
                 ""
             }
@@ -4451,10 +7715,18 @@ fn extract_caption_text(
         } else {
             ""
         };
-        if extracted.is_empty() { None } else { Some(extracted.to_string()) }
+        if extracted.is_empty() {
+            None
+        } else {
+            Some(extracted.to_string())
+        }
     } else {
         let trimmed = caption.trim();
-        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
     }
 }
 
@@ -4467,41 +7739,80 @@ async fn dispatch_album_caption(
     user_name: String,
     text: String,
 ) {
-    let (ai_busy, queue_enabled, queue_result, redirect_result):
-        (bool, bool, Option<(String, String)>, Option<(String, String, bool)>) = {
+    let (ai_busy, queue_enabled, queue_result, redirect_result): (
+        bool,
+        bool,
+        Option<(String, String)>,
+        Option<(String, String, bool)>,
+    ) = {
         let mut data = state.lock().await;
         let busy = data.cancel_tokens.contains_key(&chat_id);
         let qkey = chat_id.0.to_string();
-        let qmode = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-        msg_debug(&format!("[album:dispatch] chat_id={}, busy={}, queue_mode={}", chat_id.0, busy, qmode));
+        let qmode = data
+            .settings
+            .queue
+            .get(&qkey)
+            .copied()
+            .unwrap_or(QUEUE_MODE_DEFAULT);
+        msg_debug(&format!(
+            "[album:dispatch] chat_id={}, busy={}, queue_mode={}",
+            chat_id.0, busy, qmode
+        ));
         let (qr, rr) = if busy && qmode {
             let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
             let queue_full = cur_len >= MAX_QUEUE_SIZE;
             let qr = if queue_full {
-                msg_debug(&format!("[album:dispatch] chat_id={}, queue FULL ({}/{})", chat_id.0, cur_len, MAX_QUEUE_SIZE));
+                msg_debug(&format!(
+                    "[album:dispatch] chat_id={}, queue FULL ({}/{})",
+                    chat_id.0, cur_len, MAX_QUEUE_SIZE
+                ));
                 None
             } else {
-                let uploads = data.sessions.get_mut(&chat_id)
+                let uploads = data
+                    .sessions
+                    .get_mut(&chat_id)
                     .map(|s| s.take_pending_uploads())
                     .unwrap_or_default();
                 let qid = generate_queue_id();
-                let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
+                let q = data
+                    .message_queues
+                    .entry(chat_id)
+                    .or_insert_with(std::collections::VecDeque::new);
                 q.push_back(QueuedMessage {
                     id: qid.clone(),
-                    text: text.clone(),
                     user_display_name: user_name.clone(),
-                    pending_uploads: uploads.clone(),
+                    payload: QueuedPayload::Text {
+                        text: text.clone(),
+                        pending_uploads: uploads.clone(),
+                    },
                 });
-                msg_debug(&format!("[album:dispatch] chat_id={}, QUEUED id={}, pos={}, uploads={}", chat_id.0, qid, q.len(), uploads.len()));
+                msg_debug(&format!(
+                    "[album:dispatch] chat_id={}, QUEUED id={}, pos={}, uploads={}",
+                    chat_id.0,
+                    qid,
+                    q.len(),
+                    uploads.len()
+                ));
                 Some((qid, text.clone()))
             };
             (qr, None)
         } else if busy && !qmode {
-            let uploads = data.sessions.get_mut(&chat_id)
+            let uploads = data
+                .sessions
+                .get_mut(&chat_id)
                 .map(|s| s.take_pending_uploads())
                 .unwrap_or_default();
-            let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, text.clone(), user_name.clone(), uploads);
-            msg_debug(&format!("[album:dispatch] chat_id={}, REDIRECT id={}, replaced={}", chat_id.0, qid, replaced));
+            let (qid, replaced) = enqueue_redirect_locked(
+                &mut *data,
+                chat_id,
+                text.clone(),
+                user_name.clone(),
+                uploads,
+            );
+            msg_debug(&format!(
+                "[album:dispatch] chat_id={}, REDIRECT id={}, replaced={}",
+                chat_id.0, qid, replaced
+            ));
             (None, Some((qid, text.clone(), replaced)))
         } else {
             (None, None)
@@ -4524,26 +7835,40 @@ async fn dispatch_album_caption(
                 let preview = truncate_str(&qtxt, 30);
                 let _ = tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this")).await);
             } else {
-                let _ = tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE)).await);
+                let _ = tg!(
+                    "send_message",
+                    bot.send_message(
+                        chat_id,
+                        &format!(
+                            "Queue full (max {}). Use /stopall to clear.",
+                            MAX_QUEUE_SIZE
+                        )
+                    )
+                    .await
+                );
             }
         } else {
             shared_rate_limit_wait(&state, chat_id).await;
-            let _ = tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.").await);
+            let _ = tg!(
+                "send_message",
+                bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
+                    .await
+            );
         }
     } else {
         let _ = handle_text_message(&bot, chat_id, &text, &state, &user_name, false).await;
     }
 }
 
-/// Atomically handle an album that arrived as a contiguous run of photos
+/// Atomically handle an album that arrived as a contiguous run of media items
 /// inside a single `getUpdates` batch (size ≥2, all same `media_group_id`).
 ///
 /// Differs from the per-photo path in `handle_message`: we know the exact
 /// album size up-front (it's `msgs.len()`) so no debounce/timeout buffering
-/// is needed. Each photo's `handle_file_upload` runs in order, pushing to
-/// `session.pending_uploads`. When all are saved, the caption (typically on
-/// the first photo) is dispatched once via `dispatch_album_caption`, the
-/// same helper used by the buffered fallback path.
+/// is needed. Non-audio files are saved in order and audio files are
+/// transcribed in order. The resulting caption/transcript request is
+/// dispatched once via `dispatch_album_caption`, the same helper used by
+/// the buffered fallback path.
 ///
 /// Auth replicates the relevant parts of `handle_message`: imprinting,
 /// owner/public check, `require_prefix` calculation, and the `;`/`@bot`
@@ -4560,14 +7885,18 @@ async fn handle_album_batch(
     }
     let primary = &msgs[0];
     let chat_id = primary.chat.id;
-    let raw_user_name = primary.from.as_ref()
+    let raw_user_name = primary
+        .from
+        .as_ref()
         .map(|u| u.first_name.as_str())
         .unwrap_or("unknown");
     let timestamp = chrono::Local::now().format("%H:%M:%S");
     let user_id = primary.from.as_ref().map(|u| u.id.0);
 
     let Some(uid) = user_id else {
-        for m in &msgs { log_incoming_message(m, false, "no_user_id"); }
+        for m in &msgs {
+            log_incoming_message(m, false, "no_user_id");
+        }
         return Ok(());
     };
 
@@ -4575,7 +7904,12 @@ async fn handle_album_batch(
     let require_prefix = {
         let mut data = state.lock().await;
         let chat_key = chat_id.0.to_string();
-        let direct_setting = data.settings.direct.get(&chat_key).copied().unwrap_or(DIRECT_MODE_DEFAULT);
+        let direct_setting = data
+            .settings
+            .direct
+            .get(&chat_key)
+            .copied()
+            .unwrap_or(DIRECT_MODE_DEFAULT);
         let is_direct = is_group_chat && direct_setting;
         let require_prefix = is_group_chat && !is_direct;
         match data.settings.owner_user_id {
@@ -4587,10 +7921,17 @@ async fn handle_album_batch(
             Some(owner_id) => {
                 if uid != owner_id {
                     let is_public = is_group_chat
-                        && data.settings.as_public_for_group_chat.get(&chat_key).copied().unwrap_or(PUBLIC_MODE_DEFAULT);
+                        && data
+                            .settings
+                            .as_public_for_group_chat
+                            .get(&chat_key)
+                            .copied()
+                            .unwrap_or(PUBLIC_MODE_DEFAULT);
                     if !is_public {
                         println!("  [{timestamp}] ✗ Rejected: {raw_user_name} (id:{uid})");
-                        for m in &msgs { log_incoming_message(m, false, "unauthorized"); }
+                        for m in &msgs {
+                            log_incoming_message(m, false, "unauthorized");
+                        }
                         return Ok(());
                     }
                     println!("  [{timestamp}] ○ [{raw_user_name}(id:{uid})] Public group access");
@@ -4600,13 +7941,16 @@ async fn handle_album_batch(
         require_prefix
     };
 
-    for m in &msgs { log_incoming_message(m, true, ""); }
+    for m in &msgs {
+        log_incoming_message(m, true, "");
+    }
 
     let user_name = format!("{}({uid})", raw_user_name);
 
     // First non-empty caption — Telegram clients put it on the first photo,
     // but be defensive and scan the album in arrival order.
-    let caption_str: Option<String> = msgs.iter()
+    let caption_str: Option<String> = msgs
+        .iter()
         .find_map(|m| m.caption().filter(|c| !c.is_empty()).map(|c| c.to_string()));
 
     // Prefix-mode admission: in group chats with prefix required, the album
@@ -4630,106 +7974,206 @@ async fn handle_album_batch(
             }
         };
         if !admitted {
-            msg_debug(&format!("[album_batch] chat_id={}, rejected: caption lacks ;/@", chat_id.0));
+            msg_debug(&format!(
+                "[album_batch] chat_id={}, rejected: caption lacks ;/@",
+                chat_id.0
+            ));
             return Ok(());
         }
-        msg_debug(&format!("[album_batch] chat_id={}, admitted via caption prefix", chat_id.0));
+        msg_debug(&format!(
+            "[album_batch] chat_id={}, admitted via caption prefix",
+            chat_id.0
+        ));
     }
 
     auto_restore_session(&state, chat_id, &user_name).await;
 
+    enum AlbumAdmission {
+        Start {
+            request_tasks: RequestTasks,
+            placeholder_token: Arc<CancelToken>,
+            msgs: Vec<Message>,
+            user_name: String,
+            caption_str: Option<String>,
+            bot_username: String,
+        },
+        Queued {
+            id: String,
+            preview: String,
+        },
+        Redirect {
+            preview: String,
+            replaced: bool,
+        },
+        QueueFull,
+    }
+
     // Reserve the per-chat AI slot with a placeholder cancel token *before*
-    // starting downloads. Any text message that arrives during downloads
-    // will then see `cancel_tokens.contains_key` = true and naturally
-    // queue/redirect via the existing handle_message busy-check path,
-    // preserving the user's intended order: album dispatches first with all
-    // its photos, the follow-up text waits in the queue. If the slot is
-    // already held by another in-flight AI request, we don't reserve and
-    // fall through to `dispatch_album_caption`, which queues/redirects
-    // this album normally.
-    let placeholder_token = new_cancel_token();
-    let reserved_slot = {
+    // starting downloads/transcriptions. If another AI request is already
+    // active, defer the entire album payload through the normal queue so no
+    // STT/download work runs outside the chat's cancellation/order model.
+    let dispatch_id = current_dispatch_id();
+    let placeholder_token = new_cancel_token_for_owner(dispatch_id);
+    let bot_username_owned = bot_username.to_string();
+    let admission = {
         let mut data = state.lock().await;
+        let request_tasks = data.request_tasks.clone();
         if data.cancel_tokens.contains_key(&chat_id) {
-            msg_debug(&format!("[album_batch] chat_id={}, slot busy at admission → will queue/redirect at dispatch", chat_id.0));
-            false
+            msg_debug(&format!(
+                "[album_batch] chat_id={}, slot busy at admission → deferring album",
+                chat_id.0
+            ));
+            let qkey = chat_id.0.to_string();
+            let qmode = data
+                .settings
+                .queue
+                .get(&qkey)
+                .copied()
+                .unwrap_or(QUEUE_MODE_DEFAULT);
+            let preview = format!("Album: {} attachment(s)", msgs.len());
+            if qmode {
+                let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
+                if cur_len >= MAX_QUEUE_SIZE {
+                    msg_debug(&format!(
+                        "[album_batch] chat_id={}, queue FULL ({}/{})",
+                        chat_id.0, cur_len, MAX_QUEUE_SIZE
+                    ));
+                    AlbumAdmission::QueueFull
+                } else {
+                    let id = generate_queue_id();
+                    let q = data
+                        .message_queues
+                        .entry(chat_id)
+                        .or_insert_with(std::collections::VecDeque::new);
+                    q.push_back(QueuedMessage {
+                        id: id.clone(),
+                        user_display_name: user_name,
+                        payload: QueuedPayload::AlbumAttachments {
+                            msgs,
+                            caption_str,
+                            require_prefix,
+                            bot_username: bot_username_owned,
+                        },
+                    });
+                    msg_debug(&format!(
+                        "[album_batch] chat_id={}, QUEUED id={}, pos={}",
+                        chat_id.0,
+                        id,
+                        q.len()
+                    ));
+                    AlbumAdmission::Queued { id, preview }
+                }
+            } else {
+                cancel_in_progress_task_locked(&data, chat_id);
+                data.loop_states.remove(&chat_id);
+                data.loop_feedback.remove(&chat_id);
+                let q = data
+                    .message_queues
+                    .entry(chat_id)
+                    .or_insert_with(std::collections::VecDeque::new);
+                let replaced = !q.is_empty();
+                q.clear();
+                let id = generate_queue_id();
+                q.push_back(QueuedMessage {
+                    id: id.clone(),
+                    user_display_name: user_name,
+                    payload: QueuedPayload::AlbumAttachments {
+                        msgs,
+                        caption_str,
+                        require_prefix,
+                        bot_username: bot_username_owned,
+                    },
+                });
+                msg_debug(&format!(
+                    "[album_batch] chat_id={}, REDIRECT id={}, replaced={}",
+                    chat_id.0, id, replaced
+                ));
+                AlbumAdmission::Redirect { preview, replaced }
+            }
         } else {
             insert_cancel_token_locked(&mut data, chat_id, placeholder_token.clone());
-            msg_debug(&format!("[album_batch] chat_id={}, reserved AI slot (placeholder)", chat_id.0));
-            true
+            msg_debug(&format!(
+                "[album_batch] chat_id={}, reserved AI slot (placeholder)",
+                chat_id.0
+            ));
+            AlbumAdmission::Start {
+                request_tasks,
+                placeholder_token,
+                msgs,
+                user_name,
+                caption_str,
+                bot_username: bot_username_owned,
+            }
         }
     };
 
-    println!("  [{timestamp}] ◀ [{user_name}] Album: {} photo(s)", msgs.len());
-
-    // Sequential downloads: handle_file_upload's own `shared_rate_limit_wait`
-    // calls would serialize them anyway, and sequential keeps state writeback
-    // (history append, pending_uploads push) deterministic in album order.
-    let mut ok_count = 0usize;
-    for m in &msgs {
-        match handle_file_upload(&bot, chat_id, m, &state, &user_name).await {
-            Ok(()) => ok_count += 1,
-            Err(e) => msg_debug(&format!("[album_batch] chat_id={}, upload failed: {}", chat_id.0, e)),
+    match admission {
+        AlbumAdmission::Start {
+            request_tasks,
+            placeholder_token,
+            msgs,
+            user_name,
+            caption_str,
+            bot_username,
+        } => {
+            let state_for_task = state.clone();
+            let state_for_monitor = state.clone();
+            let join = spawn_tracked_request_task(request_tasks, async move {
+                CURRENT_DISPATCH_ID
+                    .scope(dispatch_id, async move {
+                        process_album_attachments_task(
+                            bot,
+                            chat_id,
+                            msgs,
+                            state_for_task,
+                            user_name,
+                            caption_str,
+                            require_prefix,
+                            bot_username,
+                            placeholder_token,
+                            true,
+                        )
+                        .await;
+                    })
+                    .await
+            });
+            monitor_dispatch_panic(
+                join,
+                state_for_monitor,
+                chat_id,
+                dispatch_id,
+                "album:direct",
+            );
+        }
+        AlbumAdmission::Queued { id, preview } => {
+            shared_rate_limit_wait(&state, chat_id).await;
+            tg!("send_message", bot.send_message(chat_id, &format!("Queued ({id}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{id} to cancel this"))
+                .await)?;
+        }
+        AlbumAdmission::Redirect { preview, replaced } => {
+            shared_rate_limit_wait(&state, chat_id).await;
+            let msg = if replaced {
+                format!("🔄 Redirect target updated: \"{preview}\"")
+            } else {
+                format!("🔄 Cancelling current task, will process: \"{preview}\"")
+            };
+            tg!("send_message", bot.send_message(chat_id, &msg).await)?;
+        }
+        AlbumAdmission::QueueFull => {
+            shared_rate_limit_wait(&state, chat_id).await;
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    &format!(
+                        "Queue full (max {}). Use /stopall to clear.",
+                        MAX_QUEUE_SIZE
+                    )
+                )
+                .await
+            )?;
         }
     }
-    println!("  [{timestamp}] ▶ [{user_name}] Album upload complete ({}/{})", ok_count, msgs.len());
-
-    // If the user issued /stop or /stopall during downloads, the placeholder
-    // token will have been marked cancelled. Release the slot and run any
-    // queued message instead of dispatching this album.
-    if reserved_slot && placeholder_token.cancelled.load(Ordering::Relaxed) {
-        msg_debug(&format!("[album_batch] chat_id={}, cancelled during downloads → aborting dispatch", chat_id.0));
-        {
-            let mut data = state.lock().await;
-            // Only remove if the slot still holds *our* placeholder; another
-            // handler may have legitimately taken it over (e.g. via a queue
-            // pop racing with us).
-            if let Some(t) = data.cancel_tokens.get(&chat_id) {
-                if Arc::ptr_eq(t, &placeholder_token) {
-                    remove_cancel_token_locked(&mut data, chat_id);
-                }
-            }
-        }
-        process_next_queued_message(&bot, chat_id, &state).await;
-        return Ok(());
-    }
-
-    let caption_text = caption_str.as_deref()
-        .and_then(|c| extract_caption_text(c, require_prefix, bot_username));
-    match (caption_text, reserved_slot) {
-        (Some(text), true) => {
-            // Slot is ours. handle_text_message with from_queue=true bypasses
-            // its busy check and overwrites the placeholder with its own
-            // real cancel token, taking over the slot for the AI request.
-            msg_debug(&format!("[album_batch] chat_id={}, dispatching caption (len={}) via reserved slot", chat_id.0, text.len()));
-            let _ = handle_text_message(&bot, chat_id, &text, &state, &user_name, true).await;
-        }
-        (Some(text), false) => {
-            // Slot was already busy at admission. Use the standard
-            // queue/redirect path — this album becomes the next request
-            // after the in-flight one (or replaces it in OFF mode).
-            msg_debug(&format!("[album_batch] chat_id={}, dispatching caption (len={}) via queue/redirect", chat_id.0, text.len()));
-            dispatch_album_caption(bot.clone(), chat_id, state.clone(), user_name.clone(), text).await;
-        }
-        (None, true) => {
-            // No caption to dispatch — release the placeholder slot and
-            // hand off to any queued message that was waiting behind us.
-            msg_debug(&format!("[album_batch] chat_id={}, no caption → releasing slot", chat_id.0));
-            {
-                let mut data = state.lock().await;
-                if let Some(t) = data.cancel_tokens.get(&chat_id) {
-                    if Arc::ptr_eq(t, &placeholder_token) {
-                        remove_cancel_token_locked(&mut data, chat_id);
-                    }
-                }
-            }
-            process_next_queued_message(&bot, chat_id, &state).await;
-        }
-        (None, false) => {
-            msg_debug(&format!("[album_batch] chat_id={}, no caption, slot was busy → uploads pending for next text", chat_id.0));
-        }
-    }
-
     Ok(())
 }
 
@@ -4742,7 +8186,9 @@ async fn handle_message(
     bot_username: &str,
 ) -> ResponseResult<()> {
     let chat_id = msg.chat.id;
-    let raw_user_name = msg.from.as_ref()
+    let raw_user_name = msg
+        .from
+        .as_ref()
         .map(|u| u.first_name.as_str())
         .unwrap_or("unknown");
     let timestamp = chrono::Local::now().format("%H:%M:%S");
@@ -4758,13 +8204,21 @@ async fn handle_message(
     let (require_prefix, imprinted, is_owner) = {
         let mut data = state.lock().await;
         let chat_key = chat_id.0.to_string();
-        let direct_setting = data.settings.direct.get(&chat_key).copied().unwrap_or(DIRECT_MODE_DEFAULT);
+        let direct_setting = data
+            .settings
+            .direct
+            .get(&chat_key)
+            .copied()
+            .unwrap_or(DIRECT_MODE_DEFAULT);
         let is_direct = is_group_chat && direct_setting;
         msg_debug(&format!("[handle_message] chat_id={}, uid={}, is_group_chat={}, direct_setting={}, is_direct={}",
             chat_id.0, uid, is_group_chat, direct_setting, is_direct));
         // In direct mode, ; prefix requirement is waived but is_group_chat stays true
         let require_prefix = is_group_chat && !is_direct;
-        msg_debug(&format!("[handle_message] require_prefix={}", require_prefix));
+        msg_debug(&format!(
+            "[handle_message] require_prefix={}",
+            require_prefix
+        ));
         let (imprinted, is_owner) = match data.settings.owner_user_id {
             None => {
                 // Imprint: register first user as owner
@@ -4778,8 +8232,16 @@ async fn handle_message(
                 if uid != owner_id {
                     // Check if this is a public group chat
                     let is_public = is_group_chat
-                        && data.settings.as_public_for_group_chat.get(&chat_key).copied().unwrap_or(PUBLIC_MODE_DEFAULT);
-                    msg_debug(&format!("[handle_message] non-owner uid={}, owner_id={}, is_public={}", uid, owner_id, is_public));
+                        && data
+                            .settings
+                            .as_public_for_group_chat
+                            .get(&chat_key)
+                            .copied()
+                            .unwrap_or(PUBLIC_MODE_DEFAULT);
+                    msg_debug(&format!(
+                        "[handle_message] non-owner uid={}, owner_id={}, is_public={}",
+                        uid, owner_id, is_public
+                    ));
                     if !is_public {
                         // Unregistered user → reject silently (log only)
                         msg_debug(&format!("[handle_message] rejected non-owner uid={}", uid));
@@ -4796,7 +8258,10 @@ async fn handle_message(
                 }
             }
         };
-        msg_debug(&format!("[handle_message] result: require_prefix={}, imprinted={}, is_owner={}", require_prefix, imprinted, is_owner));
+        msg_debug(&format!(
+            "[handle_message] result: require_prefix={}, imprinted={}, is_owner={}",
+            require_prefix, imprinted, is_owner
+        ));
         (require_prefix, imprinted, is_owner)
     };
     if imprinted {
@@ -4808,11 +8273,71 @@ async fn handle_message(
 
     let user_name = format!("{}({uid})", raw_user_name);
 
-    let has_file = msg.document().is_some() || msg.photo().is_some() || msg.video().is_some() || msg.voice().is_some() || msg.audio().is_some() || msg.animation().is_some() || msg.video_note().is_some();
+    let has_file = msg.document().is_some()
+        || msg.photo().is_some()
+        || msg.video().is_some()
+        || msg.voice().is_some()
+        || msg.audio().is_some()
+        || msg.animation().is_some()
+        || msg.video_note().is_some();
 
     // Auto-restore session for file uploads (before text extraction)
     if has_file {
         auto_restore_session(&state, chat_id, &user_name).await;
+    }
+
+    // Audio uploads are treated as spoken user input. They are downloaded only
+    // to ~/.cokacdir/stttemp for transcription, never saved into the session
+    // workspace and never recorded as pending file uploads.
+    if has_file && stt_audio_upload_info(&msg).is_some() {
+        if require_prefix {
+            let caption = msg.caption().unwrap_or("");
+            msg_debug(&format!(
+                "[handle_message] stt upload: require_prefix=true, caption={:?}, media_group={:?}",
+                caption,
+                msg.media_group_id()
+            ));
+            if !bot_username.is_empty() && caption.starts_with('@') {
+                let caption_lower = caption.to_lowercase();
+                let prefix = format!("@{}", bot_username.to_lowercase());
+                if !caption_lower.starts_with(&prefix)
+                    || caption_lower.len() > prefix.len()
+                        && !caption_lower[prefix.len()..].starts_with(|c: char| c.is_whitespace())
+                {
+                    msg_debug("[handle_message] stt upload: rejected (@mention for another bot)");
+                    return Ok(());
+                }
+                msg_debug(&format!(
+                    "[handle_message] stt upload: accepted (@{} mention)",
+                    bot_username
+                ));
+            } else if caption.starts_with(';') {
+                msg_debug("[handle_message] stt upload: accepted (; prefix, all bots)");
+            } else {
+                msg_debug("[handle_message] stt upload: rejected (no ; or @ prefix)");
+                return Ok(());
+            }
+        } else {
+            msg_debug(&format!(
+                "[handle_message] stt upload: require_prefix=false, caption={:?}",
+                msg.caption()
+            ));
+        }
+
+        println!("  [{timestamp}] ◀ [{user_name}] Audio upload: STT");
+        let caption_text = msg
+            .caption()
+            .and_then(|caption| extract_caption_text(caption, require_prefix, bot_username));
+        start_stt_message_task(
+            bot.clone(),
+            chat_id,
+            msg,
+            state.clone(),
+            user_name,
+            caption_text,
+        )
+        .await?;
+        return Ok(());
     }
 
     // Handle file/photo/media uploads
@@ -4824,7 +8349,11 @@ async fn handle_message(
         // necessarily lack the album's caption, prefix-mode rejects them.
         if require_prefix {
             let caption = msg.caption().unwrap_or("");
-            msg_debug(&format!("[handle_message] upload: require_prefix=true, caption={:?}, media_group={:?}", caption, msg.media_group_id()));
+            msg_debug(&format!(
+                "[handle_message] upload: require_prefix=true, caption={:?}, media_group={:?}",
+                caption,
+                msg.media_group_id()
+            ));
             if !bot_username.is_empty() && caption.starts_with('@') {
                 let caption_lower = caption.to_lowercase();
                 let prefix = format!("@{}", bot_username.to_lowercase());
@@ -4835,7 +8364,10 @@ async fn handle_message(
                     msg_debug("[handle_message] upload: rejected (@mention for another bot)");
                     return Ok(());
                 }
-                msg_debug(&format!("[handle_message] upload: accepted (@{} mention)", bot_username));
+                msg_debug(&format!(
+                    "[handle_message] upload: accepted (@{} mention)",
+                    bot_username
+                ));
             } else if caption.starts_with(';') {
                 msg_debug("[handle_message] upload: accepted (; prefix, all bots)");
             } else {
@@ -4843,18 +8375,29 @@ async fn handle_message(
                 return Ok(());
             }
         } else {
-            msg_debug(&format!("[handle_message] upload: require_prefix=false, caption={:?}", msg.caption()));
+            msg_debug(&format!(
+                "[handle_message] upload: require_prefix=false, caption={:?}",
+                msg.caption()
+            ));
         }
-        let file_hint = if msg.animation().is_some() { "animation" }
-            else if msg.document().is_some() { "document" }
-            else if msg.photo().is_some() { "photo" }
-            else if msg.video().is_some() { "video" }
-            else if msg.voice().is_some() { "voice" }
-            else if msg.audio().is_some() { "audio" }
-            else { "video_note" };
+        let file_hint = if msg.animation().is_some() {
+            "animation"
+        } else if msg.document().is_some() {
+            "document"
+        } else if msg.photo().is_some() {
+            "photo"
+        } else if msg.video().is_some() {
+            "video"
+        } else if msg.voice().is_some() {
+            "voice"
+        } else if msg.audio().is_some() {
+            "audio"
+        } else {
+            "video_note"
+        };
         println!("  [{timestamp}] ◀ [{user_name}] Upload: {file_hint}");
 
-        handle_file_upload(&bot, chat_id, &msg, &state, &user_name).await?;
+        let _ = handle_file_upload(&bot, chat_id, &msg, &state, &user_name).await?;
         println!("  [{timestamp}] ▶ [{user_name}] Upload complete");
         // If caption contains text, send it to AI as a follow-up message
         if let Some(caption) = msg.caption() {
@@ -4866,7 +8409,9 @@ async fn handle_message(
                     let prefix = format!("@{} ", bot_username);
                     if caption.to_lowercase().starts_with(&prefix.to_lowercase()) {
                         let body = caption[prefix.len()..].trim_start();
-                        body.strip_prefix(';').map(|s| s.trim_start()).unwrap_or(body)
+                        body.strip_prefix(';')
+                            .map(|s| s.trim_start())
+                            .unwrap_or(body)
                     } else {
                         ""
                     }
@@ -4875,14 +8420,28 @@ async fn handle_message(
                 } else {
                     ""
                 };
-                let result = if extracted.is_empty() { None } else { Some(extracted) };
-                msg_debug(&format!("[handle_message] upload caption (prefix mode): extracted={:?}", result));
+                let result = if extracted.is_empty() {
+                    None
+                } else {
+                    Some(extracted)
+                };
+                msg_debug(&format!(
+                    "[handle_message] upload caption (prefix mode): extracted={:?}",
+                    result
+                ));
                 result
             } else {
                 // DM or direct mode: use entire caption as-is
                 let trimmed = caption.trim();
-                let result = if trimmed.is_empty() { None } else { Some(trimmed) };
-                msg_debug(&format!("[handle_message] upload caption (direct): extracted={:?}", result));
+                let result = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+                msg_debug(&format!(
+                    "[handle_message] upload caption (direct): extracted={:?}",
+                    result
+                ));
                 result
             };
             if let Some(text) = text_part {
@@ -4891,30 +8450,53 @@ async fn handle_message(
                     // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
                     // queue_result:    ON mode queue push outcome (Some(id,text) queued, None full)
                     // redirect_result: OFF mode redirect outcome (Some(id,text,was_replacement))
-                    let (ai_busy, queue_enabled, queue_result, redirect_result): (bool, bool, Option<(String, String)>, Option<(String, String, bool)>) = {
+                    let (ai_busy, queue_enabled, queue_result, redirect_result): (
+                        bool,
+                        bool,
+                        Option<(String, String)>,
+                        Option<(String, String, bool)>,
+                    ) = {
                         let mut data = state.lock().await;
                         let busy = data.cancel_tokens.contains_key(&chat_id);
                         let qkey = chat_id.0.to_string();
-                        let qmode = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-                        msg_debug(&format!("[queue:media] chat_id={}, busy={}, queue_mode={}", chat_id.0, busy, qmode));
+                        let qmode = data
+                            .settings
+                            .queue
+                            .get(&qkey)
+                            .copied()
+                            .unwrap_or(QUEUE_MODE_DEFAULT);
+                        msg_debug(&format!(
+                            "[queue:media] chat_id={}, busy={}, queue_mode={}",
+                            chat_id.0, busy, qmode
+                        ));
                         let (qr, rr) = if busy && qmode {
                             let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
                             let queue_full = cur_len >= MAX_QUEUE_SIZE;
                             let qr = if queue_full {
-                                msg_debug(&format!("[queue:media] chat_id={}, queue FULL ({}/{})", chat_id.0, cur_len, MAX_QUEUE_SIZE));
+                                msg_debug(&format!(
+                                    "[queue:media] chat_id={}, queue FULL ({}/{})",
+                                    chat_id.0, cur_len, MAX_QUEUE_SIZE
+                                ));
                                 None // queue full
                             } else {
                                 // Capture pending_uploads so they stay associated with this caption
-                                let uploads = data.sessions.get_mut(&chat_id)
+                                let uploads = data
+                                    .sessions
+                                    .get_mut(&chat_id)
                                     .map(|s| s.take_pending_uploads())
                                     .unwrap_or_default();
                                 let qid = generate_queue_id();
-                                let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
+                                let q = data
+                                    .message_queues
+                                    .entry(chat_id)
+                                    .or_insert_with(std::collections::VecDeque::new);
                                 q.push_back(QueuedMessage {
                                     id: qid.clone(),
-                                    text: text.to_string(),
                                     user_display_name: user_name.clone(),
-                                    pending_uploads: uploads.clone(),
+                                    payload: QueuedPayload::Text {
+                                        text: text.to_string(),
+                                        pending_uploads: uploads.clone(),
+                                    },
                                 });
                                 msg_debug(&format!("[queue:media] chat_id={}, QUEUED id={}, pos={}, text={:?}, uploads={}", chat_id.0, qid, q.len(), truncate_str(text, 60), uploads.len()));
                                 Some((qid, text.to_string()))
@@ -4922,11 +8504,25 @@ async fn handle_message(
                             (qr, None)
                         } else if busy && !qmode {
                             // OFF mode: caption with text is always redirect-eligible
-                            let uploads = data.sessions.get_mut(&chat_id)
+                            let uploads = data
+                                .sessions
+                                .get_mut(&chat_id)
                                 .map(|s| s.take_pending_uploads())
                                 .unwrap_or_default();
-                            let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, text.to_string(), user_name.clone(), uploads);
-                            msg_debug(&format!("[queue:media] chat_id={}, REDIRECT id={}, replaced={}, text={:?}", chat_id.0, qid, replaced, truncate_str(text, 60)));
+                            let (qid, replaced) = enqueue_redirect_locked(
+                                &mut *data,
+                                chat_id,
+                                text.to_string(),
+                                user_name.clone(),
+                                uploads,
+                            );
+                            msg_debug(&format!(
+                                "[queue:media] chat_id={}, REDIRECT id={}, replaced={}, text={:?}",
+                                chat_id.0,
+                                qid,
+                                replaced,
+                                truncate_str(text, 60)
+                            ));
                             (None, Some((qid, text.to_string(), replaced)))
                         } else {
                             (None, None)
@@ -4950,13 +8546,28 @@ async fn handle_message(
                                 tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
                                     .await)?;
                             } else {
-                                tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE))
-                                    .await)?;
+                                tg!(
+                                    "send_message",
+                                    bot.send_message(
+                                        chat_id,
+                                        &format!(
+                                            "Queue full (max {}). Use /stopall to clear.",
+                                            MAX_QUEUE_SIZE
+                                        )
+                                    )
+                                    .await
+                                )?;
                             }
                         } else {
                             shared_rate_limit_wait(&state, chat_id).await;
-                            tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                                .await)?;
+                            tg!(
+                                "send_message",
+                                bot.send_message(
+                                    chat_id,
+                                    "AI request in progress. Use /stop to cancel."
+                                )
+                                .await
+                            )?;
                         }
                     } else {
                         handle_text_message(&bot, chat_id, text, &state, &user_name, false).await?;
@@ -4969,7 +8580,10 @@ async fn handle_message(
 
     // Handle location sharing — store as pending, deliver with next text message
     if let Some(location) = msg.location() {
-        msg_debug(&format!("[handle_message] chat_id={}, location: lat={}, lon={}", chat_id.0, location.latitude, location.longitude));
+        msg_debug(&format!(
+            "[handle_message] chat_id={}, location: lat={}, lon={}",
+            chat_id.0, location.latitude, location.longitude
+        ));
         auto_restore_session(&state, chat_id, &user_name).await;
 
         let location_record = format!(
@@ -4986,12 +8600,22 @@ async fn handle_message(
             }
         };
         if stored {
-            println!("  [{timestamp}] ◀ [{user_name}] Location: {}, {} (pending)", location.latitude, location.longitude);
+            println!(
+                "  [{timestamp}] ◀ [{user_name}] Location: {}, {} (pending)",
+                location.latitude, location.longitude
+            );
             shared_rate_limit_wait(&state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "Location received.").await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "Location received.").await
+            )?;
         } else {
             shared_rate_limit_wait(&state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "No active session. Use /start <path> first.").await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "No active session. Use /start <path> first.")
+                    .await
+            )?;
         }
         return Ok(());
     }
@@ -4999,8 +8623,10 @@ async fn handle_message(
     // Handle venue sharing (place selected from Telegram's location picker) — store as pending
     if let Some(venue) = msg.venue() {
         let loc = &venue.location;
-        msg_debug(&format!("[handle_message] chat_id={}, venue: title={:?}, addr={:?}, lat={}, lon={}",
-            chat_id.0, venue.title, venue.address, loc.latitude, loc.longitude));
+        msg_debug(&format!(
+            "[handle_message] chat_id={}, venue: title={:?}, addr={:?}, lat={}, lon={}",
+            chat_id.0, venue.title, venue.address, loc.latitude, loc.longitude
+        ));
         auto_restore_session(&state, chat_id, &user_name).await;
 
         let location_record = format!(
@@ -5017,22 +8643,41 @@ async fn handle_message(
             }
         };
         if stored {
-            println!("  [{timestamp}] ◀ [{user_name}] Venue: {} ({}, {}) (pending)", venue.title, loc.latitude, loc.longitude);
+            println!(
+                "  [{timestamp}] ◀ [{user_name}] Venue: {} ({}, {}) (pending)",
+                venue.title, loc.latitude, loc.longitude
+            );
             shared_rate_limit_wait(&state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, format!("Location received: {}", venue.title)).await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, format!("Location received: {}", venue.title))
+                    .await
+            )?;
         } else {
             shared_rate_limit_wait(&state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "No active session. Use /start <path> first.").await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "No active session. Use /start <path> first.")
+                    .await
+            )?;
         }
         return Ok(());
     }
 
     let Some(raw_text) = msg.text() else {
-        msg_debug(&format!("[handle_message] chat_id={}, non-text message (no raw_text), skipping", chat_id.0));
+        msg_debug(&format!(
+            "[handle_message] chat_id={}, non-text message (no raw_text), skipping",
+            chat_id.0
+        ));
         return Ok(());
     };
 
-    msg_debug(&format!("[handle_message] chat_id={}, user={}, raw_text={:?}", chat_id.0, user_name, truncate_str(raw_text, 100)));
+    msg_debug(&format!(
+        "[handle_message] chat_id={}, user={}, raw_text={:?}",
+        chat_id.0,
+        user_name,
+        truncate_str(raw_text, 100)
+    ));
 
     // Normalize "@botname ..." → strip @botname prefix (group chat shorthand)
     // "@botname /cmd args" → "/cmd args", "@botname hello" → ";hello"
@@ -5053,7 +8698,10 @@ async fn handle_message(
                 mention_rewritten = Some(body.to_string());
             } else {
                 let prefixed = format!(";{}", body);
-                msg_debug(&format!("[mention_routing] self-mention with plain text: {:?} → {:?} (added ; prefix)", raw_text, prefixed));
+                msg_debug(&format!(
+                    "[mention_routing] self-mention with plain text: {:?} → {:?} (added ; prefix)",
+                    raw_text, prefixed
+                ));
                 mention_rewritten = Some(prefixed);
             }
             mention_rewritten.as_deref().unwrap()
@@ -5075,9 +8723,13 @@ async fn handle_message(
         }
     } else {
         if starts_with_at {
-            msg_debug(&format!("[mention_routing] starts with @ but bot_username is empty, passing through"));
+            msg_debug(&format!(
+                "[mention_routing] starts with @ but bot_username is empty, passing through"
+            ));
         } else {
-            msg_debug(&format!("[mention_routing] no @-prefix, passing through raw_text as-is"));
+            msg_debug(&format!(
+                "[mention_routing] no @-prefix, passing through raw_text as-is"
+            ));
         }
         raw_text
     };
@@ -5085,7 +8737,11 @@ async fn handle_message(
     // Strip @botname suffix from commands (e.g. "/pwd@mybot" → "/pwd")
     // If @botname doesn't match this bot, ignore the command (it's for another bot)
     let starts_with_slash = raw_text.starts_with('/');
-    msg_debug(&format!("[cmd_routing] input: raw_text={:?}, starts_with_slash={}", truncate_str(raw_text, 100), starts_with_slash));
+    msg_debug(&format!(
+        "[cmd_routing] input: raw_text={:?}, starts_with_slash={}",
+        truncate_str(raw_text, 100),
+        starts_with_slash
+    ));
     let text = if starts_with_slash {
         if let Some(space_pos) = raw_text.find(' ') {
             // "/cmd@bot args" → "/cmd args"
@@ -5101,14 +8757,23 @@ async fn handle_message(
                 let is_self = has_bot_username && mentioned.to_lowercase() == bot_username;
                 msg_debug(&format!("[cmd_routing] slash+args: cmd={:?}, mentioned={:?}, is_self={}, bot_username={:?}", cmd_part, mentioned, is_self, bot_username));
                 if !is_self {
-                    msg_debug(&format!("[cmd_routing] IGNORED: command {:?} is for @{}, not for @{}", cmd_part, mentioned, bot_username));
+                    msg_debug(&format!(
+                        "[cmd_routing] IGNORED: command {:?} is for @{}, not for @{}",
+                        cmd_part, mentioned, bot_username
+                    ));
                     return Ok(());
                 }
                 let result = format!("{}{}", &cmd_part[..at_pos], args_part);
-                msg_debug(&format!("[cmd_routing] stripped @mention from command: {:?} → {:?}", raw_text, result));
+                msg_debug(&format!(
+                    "[cmd_routing] stripped @mention from command: {:?} → {:?}",
+                    raw_text, result
+                ));
                 result
             } else {
-                msg_debug(&format!("[cmd_routing] slash+args, no @mention: {:?} → all bots", raw_text));
+                msg_debug(&format!(
+                    "[cmd_routing] slash+args, no @mention: {:?} → all bots",
+                    raw_text
+                ));
                 raw_text.to_string()
             }
         } else {
@@ -5120,19 +8785,31 @@ async fn handle_message(
                 let is_self = has_bot_username && mentioned.to_lowercase() == bot_username;
                 msg_debug(&format!("[cmd_routing] slash-only: cmd={:?}, mentioned={:?}, is_self={}, bot_username={:?}", raw_text, mentioned, is_self, bot_username));
                 if !is_self {
-                    msg_debug(&format!("[cmd_routing] IGNORED: command {:?} is for @{}, not for @{}", raw_text, mentioned, bot_username));
+                    msg_debug(&format!(
+                        "[cmd_routing] IGNORED: command {:?} is for @{}, not for @{}",
+                        raw_text, mentioned, bot_username
+                    ));
                     return Ok(());
                 }
                 let result = raw_text[..at_pos].to_string();
-                msg_debug(&format!("[cmd_routing] stripped @mention from command: {:?} → {:?}", raw_text, result));
+                msg_debug(&format!(
+                    "[cmd_routing] stripped @mention from command: {:?} → {:?}",
+                    raw_text, result
+                ));
                 result
             } else {
-                msg_debug(&format!("[cmd_routing] slash-only, no @mention: {:?} → all bots", raw_text));
+                msg_debug(&format!(
+                    "[cmd_routing] slash-only, no @mention: {:?} → all bots",
+                    raw_text
+                ));
                 raw_text.to_string()
             }
         }
     } else {
-        msg_debug(&format!("[cmd_routing] not a slash command, text={:?}", truncate_str(raw_text, 100)));
+        msg_debug(&format!(
+            "[cmd_routing] not a slash command, text={:?}",
+            truncate_str(raw_text, 100)
+        ));
         raw_text.to_string()
     };
     let preview = &text;
@@ -5145,7 +8822,13 @@ async fn handle_message(
 
     // In group chats (with prefix required), ignore plain text (only /, !, ; prefixed messages are processed)
     let has_valid_prefix = text.starts_with('/') || text.starts_with('!') || text.starts_with(';');
-    msg_debug(&format!("[prefix_filter] text={:?}, require_prefix={}, has_valid_prefix={}, direct_mode={}", truncate_str(&text, 100), require_prefix, has_valid_prefix, !require_prefix));
+    msg_debug(&format!(
+        "[prefix_filter] text={:?}, require_prefix={}, has_valid_prefix={}, direct_mode={}",
+        truncate_str(&text, 100),
+        require_prefix,
+        has_valid_prefix,
+        !require_prefix
+    ));
     if require_prefix && !has_valid_prefix {
         msg_debug(&format!("[prefix_filter] IGNORED: require_prefix=true (direct mode OFF), no valid prefix in text={:?}", truncate_str(&text, 80)));
         // A previous `;`-prefixed photo upload (addressed to all bots) may be
@@ -5161,7 +8844,11 @@ async fn handle_message(
                     if added_at.elapsed() > PENDING_UPLOAD_STALE_TTL {
                         let n = session.pending_uploads.len();
                         if n > 0 {
-                            msg_debug(&format!("[prefix_filter] expiring {} stale pending_uploads (age > {}s)", n, PENDING_UPLOAD_STALE_TTL.as_secs()));
+                            msg_debug(&format!(
+                                "[prefix_filter] expiring {} stale pending_uploads (age > {}s)",
+                                n,
+                                PENDING_UPLOAD_STALE_TTL.as_secs()
+                            ));
                             session.clear_pending_uploads();
                         }
                     }
@@ -5172,9 +8859,16 @@ async fn handle_message(
     }
 
     if is_group_chat && !is_owner && is_owner_only_command(&text) {
-        msg_debug(&format!("[handle_message] owner-only command rejected: text={:?}", truncate_str(&text, 80)));
+        msg_debug(&format!(
+            "[handle_message] owner-only command rejected: text={:?}",
+            truncate_str(&text, 80)
+        ));
         shared_rate_limit_wait(&state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Only the bot owner can use this command.").await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, "Only the bot owner can use this command.")
+                .await
+        )?;
         return Ok(());
     }
 
@@ -5199,7 +8893,11 @@ async fn handle_message(
         } else if text.starts_with(';') {
             // ; prefix → queue stripped text
             let stripped = text[1..].trim_start();
-            if stripped.is_empty() { None } else { Some(stripped) }
+            if stripped.is_empty() {
+                None
+            } else {
+                Some(stripped)
+            }
         } else if text.starts_with('!') || text.starts_with('/') {
             // Shell commands and other / commands are NOT queueable
             None
@@ -5207,43 +8905,76 @@ async fn handle_message(
             // Plain text
             Some(text.as_str())
         };
-        msg_debug(&format!("[queue:text] chat_id={}, text={:?}, queue_text={:?}", chat_id.0, truncate_str(&text, 60), queue_text.map(|s| truncate_str(s, 60))));
+        msg_debug(&format!(
+            "[queue:text] chat_id={}, text={:?}, queue_text={:?}",
+            chat_id.0,
+            truncate_str(&text, 60),
+            queue_text.map(|s| truncate_str(s, 60))
+        ));
 
         // Atomically: check busy + queue mode + push to queue (prevents race with /stopall)
         // Returns: Option<(can_queue, queue_on, queue_result, redirect_result)>
         //   queue_result:    Some((id, text)) if queued (ON mode), None if full/non-queueable
         //   redirect_result: Some((id, text, was_replacement)) if OFF mode redirect triggered
-        let busy_info: Option<(bool, bool, Option<(String, String)>, Option<(String, String, bool)>)> = {
+        let busy_info: Option<(
+            bool,
+            bool,
+            Option<(String, String)>,
+            Option<(String, String, bool)>,
+        )> = {
             let mut data = state.lock().await;
             if data.cancel_tokens.contains_key(&chat_id) {
                 let qkey = chat_id.0.to_string();
-                let queue_enabled = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
-                msg_debug(&format!("[queue:text] chat_id={}, AI busy, queue_mode={}, queueable={}", chat_id.0, queue_enabled, queue_text.is_some()));
+                let queue_enabled = data
+                    .settings
+                    .queue
+                    .get(&qkey)
+                    .copied()
+                    .unwrap_or(QUEUE_MODE_DEFAULT);
+                msg_debug(&format!(
+                    "[queue:text] chat_id={}, AI busy, queue_mode={}, queueable={}",
+                    chat_id.0,
+                    queue_enabled,
+                    queue_text.is_some()
+                ));
                 let (qr, rr) = if queue_enabled {
                     let qr = if let Some(qt) = queue_text {
                         let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
                         let queue_full = cur_len >= MAX_QUEUE_SIZE;
                         if queue_full {
-                            msg_debug(&format!("[queue:text] chat_id={}, queue FULL ({}/{})", chat_id.0, cur_len, MAX_QUEUE_SIZE));
+                            msg_debug(&format!(
+                                "[queue:text] chat_id={}, queue FULL ({}/{})",
+                                chat_id.0, cur_len, MAX_QUEUE_SIZE
+                            ));
                             None // queue full
                         } else {
                             // Capture pending_uploads so they stay associated with this message
-                            let uploads = data.sessions.get_mut(&chat_id)
+                            let uploads = data
+                                .sessions
+                                .get_mut(&chat_id)
                                 .map(|s| s.take_pending_uploads())
                                 .unwrap_or_default();
                             let qid = generate_queue_id();
-                            let q = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
+                            let q = data
+                                .message_queues
+                                .entry(chat_id)
+                                .or_insert_with(std::collections::VecDeque::new);
                             q.push_back(QueuedMessage {
                                 id: qid.clone(),
-                                text: qt.to_string(),
                                 user_display_name: user_name.clone(),
-                                pending_uploads: uploads.clone(),
+                                payload: QueuedPayload::Text {
+                                    text: qt.to_string(),
+                                    pending_uploads: uploads.clone(),
+                                },
                             });
                             msg_debug(&format!("[queue:text] chat_id={}, QUEUED id={}, pos={}, text={:?}, uploads={}", chat_id.0, qid, q.len(), truncate_str(qt, 60), uploads.len()));
                             Some((qid, qt.to_string()))
                         }
                     } else {
-                        msg_debug(&format!("[queue:text] chat_id={}, non-queueable command, rejecting", chat_id.0));
+                        msg_debug(&format!(
+                            "[queue:text] chat_id={}, non-queueable command, rejecting",
+                            chat_id.0
+                        ));
                         None // non-queueable
                     };
                     (qr, None)
@@ -5251,11 +8982,25 @@ async fn handle_message(
                     // OFF mode: redirect-eligible messages cancel the current task and become
                     // the next dispatch target (latest-wins). Slash/shell commands stay rejected.
                     let rr = if let Some(qt) = queue_text {
-                        let uploads = data.sessions.get_mut(&chat_id)
+                        let uploads = data
+                            .sessions
+                            .get_mut(&chat_id)
                             .map(|s| s.take_pending_uploads())
                             .unwrap_or_default();
-                        let (qid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, qt.to_string(), user_name.clone(), uploads);
-                        msg_debug(&format!("[queue:text] chat_id={}, REDIRECT id={}, replaced={}, text={:?}", chat_id.0, qid, replaced, truncate_str(qt, 60)));
+                        let (qid, replaced) = enqueue_redirect_locked(
+                            &mut *data,
+                            chat_id,
+                            qt.to_string(),
+                            user_name.clone(),
+                            uploads,
+                        );
+                        msg_debug(&format!(
+                            "[queue:text] chat_id={}, REDIRECT id={}, replaced={}, text={:?}",
+                            chat_id.0,
+                            qid,
+                            replaced,
+                            truncate_str(qt, 60)
+                        ));
                         Some((qid, qt.to_string(), replaced))
                     } else {
                         msg_debug(&format!("[queue:text] chat_id={}, OFF mode + non-redirectable command, rejecting", chat_id.0));
@@ -5265,7 +9010,10 @@ async fn handle_message(
                 };
                 Some((queue_enabled && queue_text.is_some(), queue_enabled, qr, rr))
             } else {
-                msg_debug(&format!("[queue:text] chat_id={}, AI not busy, proceeding normally", chat_id.0));
+                msg_debug(&format!(
+                    "[queue:text] chat_id={}, AI not busy, proceeding normally",
+                    chat_id.0
+                ));
                 None // not busy
             }
         };
@@ -5287,8 +9035,17 @@ async fn handle_message(
                     tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
                         .await)?;
                 } else {
-                    tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE))
-                        .await)?;
+                    tg!(
+                        "send_message",
+                        bot.send_message(
+                            chat_id,
+                            &format!(
+                                "Queue full (max {}). Use /stopall to clear.",
+                                MAX_QUEUE_SIZE
+                            )
+                        )
+                        .await
+                    )?;
                 }
             } else {
                 shared_rate_limit_wait(&state, chat_id).await;
@@ -5296,8 +9053,11 @@ async fn handle_message(
                     tg!("send_message", bot.send_message(chat_id, "AI request in progress. This command cannot be queued. Use /stop to cancel current, /stopall to cancel all.")
                         .await)?;
                 } else {
-                    tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                        .await)?;
+                    tg!(
+                        "send_message",
+                        bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
+                            .await
+                    )?;
                 }
             }
             return Ok(());
@@ -5312,24 +9072,30 @@ async fn handle_message(
         handle_stopall_command(&bot, chat_id, &state).await?;
     } else if is_cmd(&text, "stop") || is_stop_id_form {
         // Check if /stop has a valid queue ID argument (exactly 7 hex chars, e.g. "/stop A394FDA")
-        let stop_queue_id = text.strip_prefix("/stop")
-            .and_then(|s| {
-                // Handle /stop@botname format
-                let s = if s.starts_with('@') { s.find(' ').map(|i| &s[i..]).unwrap_or("") } else { s };
-                // Strip leading underscore to support /stop_ID format (e.g. /stop_3EBA20E)
-                let s = s.strip_prefix('_').unwrap_or(s);
-                // Strip @botname suffix (for group chat: /stop_ID@botname)
-                let s = s.split('@').next().unwrap_or(s);
-                let trimmed = s.trim();
-                // Only treat as queue ID if it matches the exact format: 7 hex characters
-                if trimmed.len() == 7 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-                    Some(trimmed.to_string())
-                } else {
-                    None
-                }
-            });
+        let stop_queue_id = text.strip_prefix("/stop").and_then(|s| {
+            // Handle /stop@botname format
+            let s = if s.starts_with('@') {
+                s.find(' ').map(|i| &s[i..]).unwrap_or("")
+            } else {
+                s
+            };
+            // Strip leading underscore to support /stop_ID format (e.g. /stop_3EBA20E)
+            let s = s.strip_prefix('_').unwrap_or(s);
+            // Strip @botname suffix (for group chat: /stop_ID@botname)
+            let s = s.split('@').next().unwrap_or(s);
+            let trimmed = s.trim();
+            // Only treat as queue ID if it matches the exact format: 7 hex characters
+            if trimmed.len() == 7 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        });
         if let Some(queue_id) = stop_queue_id {
-            msg_debug(&format!("[handle_message] routing → /stop queue_id={}", queue_id));
+            msg_debug(&format!(
+                "[handle_message] routing → /stop queue_id={}",
+                queue_id
+            ));
             println!("  [{timestamp}] ◀ [{user_name}] /stop {queue_id}");
             handle_stop_queue_item(&bot, chat_id, &state, &queue_id).await?;
         } else {
@@ -5360,45 +9126,82 @@ async fn handle_message(
         handle_session_command(&bot, chat_id, &state).await?;
     } else if is_cmd(&text, "down") {
         msg_debug(&format!("[handle_message] routing → /down"));
-        println!("  [{timestamp}] ◀ [{user_name}] /down {}", text.strip_prefix("/down").unwrap_or("").trim());
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /down {}",
+            text.strip_prefix("/down").unwrap_or("").trim()
+        );
         handle_down_command(&bot, chat_id, &text, &state).await?;
     } else if is_cmd(&text, "public") {
         msg_debug("[handle_message] routing → /public");
-        println!("  [{timestamp}] ◀ [{user_name}] /public {}", text.strip_prefix("/public").unwrap_or("").trim());
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /public {}",
+            text.strip_prefix("/public").unwrap_or("").trim()
+        );
         handle_public_command(&bot, chat_id, &text, &state, token, is_group_chat, is_owner).await?;
     } else if is_cmd(&text, "availabletools") {
         msg_debug("[handle_message] routing → /availabletools");
         println!("  [{timestamp}] ◀ [{user_name}] /availabletools");
-        { let _m = get_model(&state.lock().await.settings, chat_id);
-        if detect_provider(_m.as_deref()) != "claude" {
-            tg!("send_message", bot.send_message(chat_id, "Tool permissions are not supported in this mode.").await)?;
-        } else {
-            handle_availabletools_command(&bot, chat_id, &state).await?;
-        } }
+        {
+            let _m = get_model(&state.lock().await.settings, chat_id);
+            if detect_provider(_m.as_deref()) != "claude" {
+                tg!(
+                    "send_message",
+                    bot.send_message(chat_id, "Tool permissions are not supported in this mode.")
+                        .await
+                )?;
+            } else {
+                handle_availabletools_command(&bot, chat_id, &state).await?;
+            }
+        }
     } else if is_cmd(&text, "allowedtools") {
         msg_debug("[handle_message] routing → /allowedtools");
         println!("  [{timestamp}] ◀ [{user_name}] /allowedtools");
-        { let _m = get_model(&state.lock().await.settings, chat_id);
-        if detect_provider(_m.as_deref()) != "claude" {
-            tg!("send_message", bot.send_message(chat_id, "Tool permissions are not supported in this mode.").await)?;
-        } else {
-            handle_allowedtools_command(&bot, chat_id, &state).await?;
-        } }
+        {
+            let _m = get_model(&state.lock().await.settings, chat_id);
+            if detect_provider(_m.as_deref()) != "claude" {
+                tg!(
+                    "send_message",
+                    bot.send_message(chat_id, "Tool permissions are not supported in this mode.")
+                        .await
+                )?;
+            } else {
+                handle_allowedtools_command(&bot, chat_id, &state).await?;
+            }
+        }
     } else if is_cmd(&text, "setpollingtime") {
         msg_debug("[handle_message] routing → /setpollingtime");
-        println!("  [{timestamp}] ◀ [{user_name}] /setpollingtime {}", text.strip_prefix("/setpollingtime").unwrap_or("").trim());
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /setpollingtime {}",
+            text.strip_prefix("/setpollingtime").unwrap_or("").trim()
+        );
         handle_setpollingtime_command(&bot, chat_id, &text, &state).await?;
+    } else if is_cmd(&text, "stt_model") {
+        msg_debug("[handle_message] routing → /stt_model");
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /stt_model {}",
+            command_args(&text)
+        );
+        handle_stt_model_command(&bot, chat_id, &text, &state, token).await?;
     } else if is_cmd(&text, "model") {
         msg_debug("[handle_message] routing → /model");
-        println!("  [{timestamp}] ◀ [{user_name}] /model {}", text.strip_prefix("/model").unwrap_or("").trim());
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /model {}",
+            text.strip_prefix("/model").unwrap_or("").trim()
+        );
         handle_model_command(&bot, chat_id, &text, &state, token).await?;
     } else if is_cmd(&text, "effort") {
         msg_debug("[handle_message] routing → /effort");
-        println!("  [{timestamp}] ◀ [{user_name}] /effort {}", command_args(&text));
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /effort {}",
+            command_args(&text)
+        );
         handle_effort_command(&bot, chat_id, &text, &state, token).await?;
     } else if is_cmd(&text, "fast") {
         msg_debug("[handle_message] routing → /fast");
-        println!("  [{timestamp}] ◀ [{user_name}] /fast {}", command_args(&text));
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /fast {}",
+            command_args(&text)
+        );
         handle_fast_command(&bot, chat_id, &text, &state, token).await?;
     } else if is_cmd(&text, "greeting") {
         msg_debug("[handle_message] routing → /greeting");
@@ -5417,7 +9220,14 @@ async fn handle_message(
         if is_group_chat {
             msg_debug("[handle_message] /envvars rejected: group chat");
             shared_rate_limit_wait(&state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "/envvars is only available in a 1:1 chat with the bot.").await)?;
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    "/envvars is only available in a 1:1 chat with the bot."
+                )
+                .await
+            )?;
         } else {
             handle_envvars_command(&bot, chat_id, &state).await?;
         }
@@ -5439,16 +9249,29 @@ async fn handle_message(
         handle_direct_command(&bot, chat_id, &msg, &state, token, is_owner).await?;
     } else if is_cmd(&text, "contextlevel") {
         msg_debug("[handle_message] routing → /contextlevel");
-        println!("  [{timestamp}] ◀ [{user_name}] /contextlevel {}", text.strip_prefix("/contextlevel").unwrap_or("").trim());
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /contextlevel {}",
+            text.strip_prefix("/contextlevel").unwrap_or("").trim()
+        );
         handle_contextlevel_command(&bot, chat_id, &text, &state, token, is_group_chat).await?;
     } else if is_cmd(&text, "query") {
         let body = text.strip_prefix("/query").unwrap_or("").trim();
         if body.is_empty() {
             msg_debug("[handle_message] /query with empty body, ignoring");
             shared_rate_limit_wait(&state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "Usage: /query <message>\nExample: /query@botname hello").await)?;
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    "Usage: /query <message>\nExample: /query@botname hello"
+                )
+                .await
+            )?;
         } else {
-            msg_debug(&format!("[handle_message] routing → text_message (/query), body={:?}", truncate_str(body, 80)));
+            msg_debug(&format!(
+                "[handle_message] routing → text_message (/query), body={:?}",
+                truncate_str(body, 80)
+            ));
             println!("  [{timestamp}] ◀ [{user_name}] {body}");
             handle_text_message(&bot, chat_id, body, &state, &user_name, false).await?;
         }
@@ -5469,10 +9292,20 @@ async fn handle_message(
             // Claude (native --fork-session), Codex (ephemeral exec over the
             // full-fidelity session archive), and OpenCode (native --fork with
             // the `plan` agent). Other providers (currently Gemini) are rejected.
-            let provider = { let _m = get_model(&state.lock().await.settings, chat_id); detect_provider(_m.as_deref()).to_string() };
+            let provider = {
+                let _m = get_model(&state.lock().await.settings, chat_id);
+                detect_provider(_m.as_deref()).to_string()
+            };
             if provider != "claude" && provider != "codex" && provider != "opencode" {
                 shared_rate_limit_wait(&state, chat_id).await;
-                tg!("send_message", bot.send_message(chat_id, "/loop currently supports Claude, Codex, or OpenCode models only.").await)?;
+                tg!(
+                    "send_message",
+                    bot.send_message(
+                        chat_id,
+                        "/loop currently supports Claude, Codex, or OpenCode models only."
+                    )
+                    .await
+                )?;
             } else {
                 // Reject if a loop is already running for this chat
                 {
@@ -5480,7 +9313,14 @@ async fn handle_message(
                     if data.loop_states.contains_key(&chat_id) {
                         drop(data);
                         shared_rate_limit_wait(&state, chat_id).await;
-                        tg!("send_message", bot.send_message(chat_id, "A loop is already running. Use /stop to cancel it first.").await)?;
+                        tg!(
+                            "send_message",
+                            bot.send_message(
+                                chat_id,
+                                "A loop is already running. Use /stop to cancel it first."
+                            )
+                            .await
+                        )?;
                         return Ok(());
                     }
                 }
@@ -5499,15 +9339,26 @@ async fn handle_message(
                         (LOOP_MAX_ITERATIONS, body)
                     }
                 };
-                msg_debug(&format!("[handle_message] routing → /loop, max_iter={}, request={:?}", max_iter, truncate_str(request, 80)));
-                println!("  [{timestamp}] ◀ [{user_name}] /loop {} {}", max_iter, truncate_str(request, 60));
+                msg_debug(&format!(
+                    "[handle_message] routing → /loop, max_iter={}, request={:?}",
+                    max_iter,
+                    truncate_str(request, 80)
+                ));
+                println!(
+                    "  [{timestamp}] ◀ [{user_name}] /loop {} {}",
+                    max_iter,
+                    truncate_str(request, 60)
+                );
                 {
                     let mut data = state.lock().await;
-                    data.loop_states.insert(chat_id, LoopState {
-                        original_request: request.to_string(),
-                        max_iterations: max_iter,
-                        remaining: max_iter,
-                    });
+                    data.loop_states.insert(
+                        chat_id,
+                        LoopState {
+                            original_request: request.to_string(),
+                            max_iterations: max_iter,
+                            remaining: max_iter,
+                        },
+                    );
                 }
                 shared_rate_limit_wait(&state, chat_id).await;
                 let iter_label = if max_iter == 0 {
@@ -5537,16 +9388,30 @@ async fn handle_message(
         handle_instruction_command(&bot, chat_id, &text, &state, token).await?;
     } else if is_cmd(&text, "allowed") {
         msg_debug("[handle_message] routing → /allowed");
-        println!("  [{timestamp}] ◀ [{user_name}] /allowed {}", text.strip_prefix("/allowed").unwrap_or("").trim());
-        { let _m = get_model(&state.lock().await.settings, chat_id);
-        if detect_provider(_m.as_deref()) != "claude" {
-            tg!("send_message", bot.send_message(chat_id, "Tool permissions are not supported in this mode.").await)?;
-        } else {
-            handle_allowed_command(&bot, chat_id, &text, &state, token).await?;
-        } }
-    } else if text.starts_with('/') && is_workspace_id(text[1..].split_whitespace().next().unwrap_or("")) {
+        println!(
+            "  [{timestamp}] ◀ [{user_name}] /allowed {}",
+            text.strip_prefix("/allowed").unwrap_or("").trim()
+        );
+        {
+            let _m = get_model(&state.lock().await.settings, chat_id);
+            if detect_provider(_m.as_deref()) != "claude" {
+                tg!(
+                    "send_message",
+                    bot.send_message(chat_id, "Tool permissions are not supported in this mode.")
+                        .await
+                )?;
+            } else {
+                handle_allowed_command(&bot, chat_id, &text, &state, token).await?;
+            }
+        }
+    } else if text.starts_with('/')
+        && is_workspace_id(text[1..].split_whitespace().next().unwrap_or(""))
+    {
         let workspace_id = text[1..].split_whitespace().next().unwrap();
-        msg_debug(&format!("[handle_message] routing → workspace_resume: {}", workspace_id));
+        msg_debug(&format!(
+            "[handle_message] routing → workspace_resume: {}",
+            workspace_id
+        ));
         println!("  [{timestamp}] ◀ [{user_name}] /{workspace_id}");
         handle_workspace_resume(&bot, chat_id, workspace_id, &state, token).await?;
     } else if text.starts_with('!') {
@@ -5560,11 +9425,17 @@ async fn handle_message(
             return Ok(());
         }
         let preview = &stripped;
-        msg_debug(&format!("[handle_message] routing → text_message (;prefix), stripped={:?}", truncate_str(&stripped, 80)));
+        msg_debug(&format!(
+            "[handle_message] routing → text_message (;prefix), stripped={:?}",
+            truncate_str(&stripped, 80)
+        ));
         println!("  [{timestamp}] ◀ [{user_name}] {preview}");
         handle_text_message(&bot, chat_id, &stripped, &state, &user_name, false).await?;
     } else {
-        msg_debug(&format!("[handle_message] routing → text_message (plain), require_prefix={}", require_prefix));
+        msg_debug(&format!(
+            "[handle_message] routing → text_message (plain), require_prefix={}",
+            require_prefix
+        ));
         println!("  [{timestamp}] ◀ [{user_name}] {preview}");
         handle_text_message(&bot, chat_id, &text, &state, &user_name, false).await?;
     }
@@ -5630,6 +9501,8 @@ Ask in natural language to manage schedules.
 <b>Settings</b>
 <code>/model</code> — Show current AI model
 <code>/model &lt;name&gt;</code> — Set model (claude/codex/gemini or provider:model)
+<code>/stt_model</code> — Show current speech recognition model
+<code>/stt_model &lt;name|path:...&gt;</code> — Set transcriptor STT model
 <code>/effort</code> — Show current Claude/Codex effort
 <code>/effort &lt;level&gt;</code> — Set effort (Claude: low/medium/high/xhigh/max, Codex: minimal/low/medium/high/xhigh, or reset)
 <code>/fast</code> — Toggle Codex fast service tier
@@ -5653,9 +9526,12 @@ Bots in the same group can collaborate via <code>/instruction</code>.
 <code>/help</code> — Show this help", platform);
 
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, help)
-        .parse_mode(ParseMode::Html)
-        .await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, help)
+            .parse_mode(ParseMode::Html)
+            .await
+    )?;
 
     Ok(())
 }
@@ -5670,7 +9546,10 @@ async fn handle_start_command(
 ) -> ResponseResult<()> {
     // Extract path from "/start <path>"
     let path_str = text.strip_prefix("/start").unwrap_or("").trim();
-    msg_debug(&format!("[handle_start_command] chat_id={}, path_str={:?}", chat_id.0, path_str));
+    msg_debug(&format!(
+        "[handle_start_command] chat_id={}, path_str={:?}",
+        chat_id.0, path_str
+    ));
 
     // Determine current provider (Claude vs Codex vs Gemini)
     let original_provider_str: &str;
@@ -5679,7 +9558,10 @@ async fn handle_start_command(
         let data = state.lock().await;
         let model = get_model(&data.settings, chat_id);
         let p = detect_provider(model.as_deref());
-        msg_debug(&format!("[handle_start_command] model={:?}, provider={}", model, p));
+        msg_debug(&format!(
+            "[handle_start_command] model={:?}, provider={}",
+            model, p
+        ));
         provider_str = p;
         provider_to_session(p)
     };
@@ -5694,8 +9576,11 @@ async fn handle_start_command(
         // Create random workspace directory
         let Some(home) = dirs::home_dir() else {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "Error: cannot determine home directory.")
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "Error: cannot determine home directory.")
+                    .await
+            )?;
             return Ok(());
         };
         let workspace_dir = home.join(".cokacdir").join("workspace");
@@ -5708,41 +9593,71 @@ async fn handle_start_command(
         let new_dir = workspace_dir.join(&random_name);
         if let Err(e) = fs::create_dir_all(&new_dir) {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, format!("Error: failed to create workspace: {}", e))
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, format!("Error: failed to create workspace: {}", e))
+                    .await
+            )?;
             return Ok(());
         }
         new_dir.display().to_string()
     } else if path_str.starts_with('/')
-        || path_str.starts_with("~/") || path_str.starts_with("~\\") || path_str == "~"
-        || path_str.starts_with("./") || path_str.starts_with(".\\")
-        || path_str == "." || path_str == ".."
-        || path_str.starts_with("../") || path_str.starts_with("..\\")
-        || (path_str.len() >= 3 && path_str.as_bytes()[1] == b':' && (path_str.as_bytes()[2] == b'\\' || path_str.as_bytes()[2] == b'/'))
+        || path_str.starts_with("~/")
+        || path_str.starts_with("~\\")
+        || path_str == "~"
+        || path_str.starts_with("./")
+        || path_str.starts_with(".\\")
+        || path_str == "."
+        || path_str == ".."
+        || path_str.starts_with("../")
+        || path_str.starts_with("..\\")
+        || (path_str.len() >= 3
+            && path_str.as_bytes()[1] == b':'
+            && (path_str.as_bytes()[2] == b'\\' || path_str.as_bytes()[2] == b'/'))
     {
         is_path_intent = true;
         // Path mode: expand ~ and validate
-        let expanded = if path_str.starts_with("~/") || path_str.starts_with("~\\") || path_str == "~" {
-            if let Some(home) = dirs::home_dir() {
-                home.join(path_str.strip_prefix("~/").or_else(|| path_str.strip_prefix("~\\")).unwrap_or("")).display().to_string()
+        let expanded =
+            if path_str.starts_with("~/") || path_str.starts_with("~\\") || path_str == "~" {
+                if let Some(home) = dirs::home_dir() {
+                    home.join(
+                        path_str
+                            .strip_prefix("~/")
+                            .or_else(|| path_str.strip_prefix("~\\"))
+                            .unwrap_or(""),
+                    )
+                    .display()
+                    .to_string()
+                } else {
+                    path_str.to_string()
+                }
             } else {
                 path_str.to_string()
-            }
-        } else {
-            path_str.to_string()
-        };
+            };
         let path = Path::new(&expanded);
         if !path.exists() {
             if let Err(e) = fs::create_dir_all(&path) {
                 shared_rate_limit_wait(state, chat_id).await;
-                tg!("send_message", bot.send_message(chat_id, format!("Error: failed to create '{}': {}", expanded, e))
-                    .await)?;
+                tg!(
+                    "send_message",
+                    bot.send_message(
+                        chat_id,
+                        format!("Error: failed to create '{}': {}", expanded, e)
+                    )
+                    .await
+                )?;
                 return Ok(());
             }
         } else if !path.is_dir() {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, format!("Error: '{}' is not a directory.", expanded))
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    format!("Error: '{}' is not a directory.", expanded)
+                )
+                .await
+            )?;
             return Ok(());
         }
         path.canonicalize()
@@ -5753,54 +9668,105 @@ async fn handle_start_command(
         // Session name/ID mode: resolve Claude Code session
         // Try current provider first, then cross-provider fallback
         let fallback_providers: &[SessionProvider] = match provider {
-            SessionProvider::Claude   => &[SessionProvider::Codex, SessionProvider::Gemini, SessionProvider::OpenCode],
-            SessionProvider::Codex    => &[SessionProvider::Claude, SessionProvider::Gemini, SessionProvider::OpenCode],
-            SessionProvider::Gemini   => &[SessionProvider::Claude, SessionProvider::Codex, SessionProvider::OpenCode],
-            SessionProvider::OpenCode => &[SessionProvider::Claude, SessionProvider::Codex, SessionProvider::Gemini],
+            SessionProvider::Claude => &[
+                SessionProvider::Codex,
+                SessionProvider::Gemini,
+                SessionProvider::OpenCode,
+            ],
+            SessionProvider::Codex => &[
+                SessionProvider::Claude,
+                SessionProvider::Gemini,
+                SessionProvider::OpenCode,
+            ],
+            SessionProvider::Gemini => &[
+                SessionProvider::Claude,
+                SessionProvider::Codex,
+                SessionProvider::OpenCode,
+            ],
+            SessionProvider::OpenCode => &[
+                SessionProvider::Claude,
+                SessionProvider::Codex,
+                SessionProvider::Gemini,
+            ],
         };
 
         // Helper closure: try resolve_session + ai_sessions for a given provider
         let try_resolve = |prov: SessionProvider, prov_str: &str| -> Option<String> {
-            msg_debug(&format!("[try_resolve] provider={}, query={:?}", prov_str, path_str));
+            msg_debug(&format!(
+                "[try_resolve] provider={}, query={:?}",
+                prov_str, path_str
+            ));
             if let Some(info) = resolve_session(path_str, prov) {
                 let path = Path::new(&info.cwd);
                 let is_dir = path.is_dir();
-                msg_debug(&format!("[try_resolve] resolve_session found: cwd={:?}, is_dir={}", info.cwd, is_dir));
+                msg_debug(&format!(
+                    "[try_resolve] resolve_session found: cwd={:?}, is_dir={}",
+                    info.cwd, is_dir
+                ));
                 if is_dir {
-                    let canonical = path.canonicalize()
+                    let canonical = path
+                        .canonicalize()
                         .map(crate::utils::format::strip_unc_prefix)
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| info.cwd.clone());
                     convert_and_save_session(&info, &canonical);
-                    msg_debug(&format!("[try_resolve] resolved via resolve_session: canonical={}", canonical));
+                    msg_debug(&format!(
+                        "[try_resolve] resolved via resolve_session: canonical={}",
+                        canonical
+                    ));
                     return Some(canonical);
                 } else {
-                    msg_debug(&format!("[try_resolve] resolve_session cwd not a dir: {:?}", info.cwd));
+                    msg_debug(&format!(
+                        "[try_resolve] resolve_session cwd not a dir: {:?}",
+                        info.cwd
+                    ));
                 }
             } else {
-                msg_debug(&format!("[try_resolve] resolve_session returned None for provider={}", prov_str));
+                msg_debug(&format!(
+                    "[try_resolve] resolve_session returned None for provider={}",
+                    prov_str
+                ));
             }
             // Try ai_sessions/{id}.json
-            msg_debug(&format!("[try_resolve] trying ai_sessions/{}.json", path_str));
+            msg_debug(&format!(
+                "[try_resolve] trying ai_sessions/{}.json",
+                path_str
+            ));
             let result = ai_screen::ai_sessions_dir().and_then(|dir| {
                 let file = dir.join(format!("{}.json", path_str));
                 let content = fs::read_to_string(&file).ok()?;
                 let sd: SessionData = serde_json::from_str(&content).ok()?;
                 if !sd.provider.is_empty() && sd.provider != prov_str {
-                    msg_debug(&format!("[try_resolve] ai_sessions/{}.json provider mismatch: {} != {}", path_str, sd.provider, prov_str));
+                    msg_debug(&format!(
+                        "[try_resolve] ai_sessions/{}.json provider mismatch: {} != {}",
+                        path_str, sd.provider, prov_str
+                    ));
                     return None;
                 }
                 let p = Path::new(&sd.current_path);
                 let is_dir = p.is_dir();
-                msg_debug(&format!("[try_resolve] ai_sessions/{}.json: current_path={:?}, provider={}, is_dir={}", path_str, sd.current_path, sd.provider, is_dir));
-                if is_dir { Some(sd.current_path.clone()) } else { None }
+                msg_debug(&format!(
+                    "[try_resolve] ai_sessions/{}.json: current_path={:?}, provider={}, is_dir={}",
+                    path_str, sd.current_path, sd.provider, is_dir
+                ));
+                if is_dir {
+                    Some(sd.current_path.clone())
+                } else {
+                    None
+                }
             });
-            msg_debug(&format!("[try_resolve] ai_sessions result: {}", if result.is_some() { "found" } else { "None" }));
+            msg_debug(&format!(
+                "[try_resolve] ai_sessions result: {}",
+                if result.is_some() { "found" } else { "None" }
+            ));
             result
         };
 
         if let Some(cp) = try_resolve(provider, provider_str) {
-            msg_debug(&format!("[handle_start_command] resolved with current provider: path={}", cp));
+            msg_debug(&format!(
+                "[handle_start_command] resolved with current provider: path={}",
+                cp
+            ));
             cp
         } else {
             // Cross-provider fallback: try all other providers in order
@@ -5814,10 +9780,16 @@ async fn handle_start_command(
                     SessionProvider::OpenCode => opencode::is_opencode_available(),
                 };
                 if !available {
-                    msg_debug(&format!("[handle_start_command] cross-provider skip: {} not available", fp_str));
+                    msg_debug(&format!(
+                        "[handle_start_command] cross-provider skip: {} not available",
+                        fp_str
+                    ));
                     continue;
                 }
-                msg_debug(&format!("[handle_start_command] cross-provider attempt: {}", fp_str));
+                msg_debug(&format!(
+                    "[handle_start_command] cross-provider attempt: {}",
+                    fp_str
+                ));
                 if let Some(cp) = try_resolve(fp, fp_str) {
                     cross_result = Some((cp, fp, fp_str));
                     break;
@@ -5826,20 +9798,32 @@ async fn handle_start_command(
 
             if let Some((cp, resolved_prov, resolved_prov_str)) = cross_result {
                 // Cross-provider fallback: switch provider and model to resolved provider
-                msg_debug(&format!("[handle_start_command] cross-provider fallback: switching from {} to {}", provider_str, resolved_prov_str));
+                msg_debug(&format!(
+                    "[handle_start_command] cross-provider fallback: switching from {} to {}",
+                    provider_str, resolved_prov_str
+                ));
                 provider = resolved_prov;
                 provider_str = resolved_prov_str;
                 {
                     let mut data = state.lock().await;
-                    msg_debug(&format!("[handle_start_command] cross-provider: setting model to {:?}", resolved_prov_str));
-                    data.settings.models.insert(chat_id.0.to_string(), resolved_prov_str.to_string());
+                    msg_debug(&format!(
+                        "[handle_start_command] cross-provider: setting model to {:?}",
+                        resolved_prov_str
+                    ));
+                    data.settings
+                        .models
+                        .insert(chat_id.0.to_string(), resolved_prov_str.to_string());
                     save_bot_settings(token, &data.settings);
                     // Mirror /model provider-switch cleanup: cancel in-flight task and drop
                     // queued messages / loop state. Their captured pending_uploads point at the
                     // old workspace's files, and verify-loop feedback was authored against the
                     // old provider's session — both would be misapplied under the new provider.
                     cancel_in_progress_task_locked(&data, chat_id);
-                    let dropped_queue = data.message_queues.remove(&chat_id).map(|q| q.len()).unwrap_or(0);
+                    let dropped_queue = data
+                        .message_queues
+                        .remove(&chat_id)
+                        .map(|q| q.len())
+                        .unwrap_or(0);
                     data.loop_states.remove(&chat_id);
                     data.loop_feedback.remove(&chat_id);
                     if let Some(session) = data.sessions.get_mut(&chat_id) {
@@ -5860,17 +9844,31 @@ async fn handle_start_command(
                 let path = Path::new(path_str);
                 if path.exists() && path.is_dir() {
                     is_path_intent = true;
-                    let resolved = path.canonicalize()
+                    let resolved = path
+                        .canonicalize()
                         .map(crate::utils::format::strip_unc_prefix)
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| path_str.to_string());
-                    msg_debug(&format!("[handle_start_command] plain path resolved: {}", resolved));
+                    msg_debug(&format!(
+                        "[handle_start_command] plain path resolved: {}",
+                        resolved
+                    ));
                     resolved
                 } else {
-                    msg_debug(&format!("[handle_start_command] plain path failed: exists={}, is_dir={}", path.exists(), path.is_dir()));
+                    msg_debug(&format!(
+                        "[handle_start_command] plain path failed: exists={}, is_dir={}",
+                        path.exists(),
+                        path.is_dir()
+                    ));
                     shared_rate_limit_wait(state, chat_id).await;
-                    tg!("send_message", bot.send_message(chat_id, format!("Error: no session or directory found for '{}'.", path_str))
-                        .await)?;
+                    tg!(
+                        "send_message",
+                        bot.send_message(
+                            chat_id,
+                            format!("Error: no session or directory found for '{}'.", path_str)
+                        )
+                        .await
+                    )?;
                     return Ok(());
                 }
             }
@@ -5895,35 +9893,58 @@ async fn handle_start_command(
     if is_path_intent {
         let same_path = {
             let data = state.lock().await;
-            data.sessions.get(&chat_id)
+            data.sessions
+                .get(&chat_id)
                 .and_then(|s| s.current_path.clone())
-                .as_deref() == Some(canonical_path.as_str())
+                .as_deref()
+                == Some(canonical_path.as_str())
         };
         if same_path {
-            msg_debug(&format!("[handle_start_command] same-path no-op: {}", canonical_path));
+            msg_debug(&format!(
+                "[handle_start_command] same-path no-op: {}",
+                canonical_path
+            ));
             shared_rate_limit_wait(state, chat_id).await;
             let display = crate::utils::format::to_shell_path(&canonical_path);
-            tg!("send_message", bot.send_message(chat_id,
-                format!("Already at <code>{}</code>.", html_escape(&display)))
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    format!("Already at <code>{}</code>.", html_escape(&display))
+                )
                 .parse_mode(ParseMode::Html)
-                .await)?;
+                .await
+            )?;
             return Ok(());
         }
     }
 
     // Try to load existing session for this path
-    msg_debug(&format!("[handle_start_command] canonical_path={:?}, provider={}", canonical_path, provider_str));
+    msg_debug(&format!(
+        "[handle_start_command] canonical_path={:?}, provider={}",
+        canonical_path, provider_str
+    ));
     let existing = load_existing_session(&canonical_path, provider_str);
-    msg_debug(&format!("[handle_start_command] load_existing_session → {}", if existing.is_some() { "found" } else { "None" }));
+    msg_debug(&format!(
+        "[handle_start_command] load_existing_session → {}",
+        if existing.is_some() { "found" } else { "None" }
+    ));
 
     // If no local session, try converting the latest external session for this path
     let existing = if existing.is_some() {
         existing
     } else if let Some(info) = find_latest_session_by_cwd(&canonical_path, provider) {
-        msg_debug(&format!("[handle_start_command] fallback found: jsonl={}, session_id={}", info.jsonl_path.display(), info.session_id));
+        msg_debug(&format!(
+            "[handle_start_command] fallback found: jsonl={}, session_id={}",
+            info.jsonl_path.display(),
+            info.session_id
+        ));
         convert_and_save_session(&info, &canonical_path);
         let reloaded = load_existing_session(&canonical_path, provider_str);
-        msg_debug(&format!("[handle_start_command] after convert, reload → {}", if reloaded.is_some() { "found" } else { "None" }));
+        msg_debug(&format!(
+            "[handle_start_command] after convert, reload → {}",
+            if reloaded.is_some() { "found" } else { "None" }
+        ));
         reloaded
     } else {
         msg_debug("[handle_start_command] no external session found either");
@@ -5935,7 +9956,10 @@ async fn handle_start_command(
 
     // Notify user if provider was auto-switched via cross-provider fallback
     if provider_str != original_provider_str {
-        msg_debug(&format!("[handle_start_command] provider auto-switched: {} → {}", original_provider_str, provider_str));
+        msg_debug(&format!(
+            "[handle_start_command] provider auto-switched: {} → {}",
+            original_provider_str, provider_str
+        ));
         response_lines.push(format!("Model switched to **{}**.", provider_str));
     }
 
@@ -5950,10 +9974,20 @@ async fn handle_start_command(
         // into the just-loaded new session (corrupting the on-disk session file).
         // Idempotent with the cross-provider cleanup above (which leaves
         // current_path = None, so path_changed is always true on re-entry).
-        let old_path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
-        let old_sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+        let old_path = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone());
+        let old_sid = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.session_id.clone());
         let new_sid = existing.as_ref().and_then(|(sd, _)| {
-            if sd.session_id.is_empty() { None } else { Some(sd.session_id.clone()) }
+            if sd.session_id.is_empty() {
+                None
+            } else {
+                Some(sd.session_id.clone())
+            }
         });
         let path_changed = old_path.as_deref() != Some(canonical_path.as_str());
         let sid_changed = old_sid != new_sid;
@@ -5971,10 +10005,10 @@ async fn handle_start_command(
             pending_uploads_added_at: None,
         });
         session.session_id = None; // Clear stale session_id from previous workspace
-        // Drop uploads only when the workspace path changed — upload paths point at
-        // the old workspace's files. When only session_id changes at the same path
-        // (mode C, session-identifier swap), uploads still reference valid files in
-        // the current workspace and remain relevant to the user's next message.
+                                   // Drop uploads only when the workspace path changed — upload paths point at
+                                   // the old workspace's files. When only session_id changes at the same path
+                                   // (mode C, session-identifier swap), uploads still reference valid files in
+                                   // the current workspace and remain relevant to the user's next message.
         if path_changed {
             session.clear_pending_uploads();
         }
@@ -5985,19 +10019,35 @@ async fn handle_start_command(
                 session.current_path = Some(canonical_path.clone());
                 session.history = session_data.history.clone();
                 is_restored = true;
-                msg_debug(&format!("[handle_start_command] restored: session_id={}, path={}, history_len={}",
-                    session_data.session_id, canonical_path, session_data.history.len()));
+                msg_debug(&format!(
+                    "[handle_start_command] restored: session_id={}, path={}, history_len={}",
+                    session_data.session_id,
+                    canonical_path,
+                    session_data.history.len()
+                ));
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}] ▶ Session restored: {canonical_path}");
-                response_lines.push(format!("[{}] Session restored at `{}`.", provider_str, canonical_path));
-                if let Some(folder_name) = std::path::Path::new(&canonical_path).file_name().and_then(|n| n.to_str()) {
+                response_lines.push(format!(
+                    "[{}] Session restored at `{}`.",
+                    provider_str, canonical_path
+                ));
+                if let Some(folder_name) = std::path::Path::new(&canonical_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
                     if is_workspace_id(folder_name)
                         && dirs::home_dir()
-                            .map(|h| h.join(".cokacdir").join("workspace").join(folder_name).is_dir())
+                            .map(|h| {
+                                h.join(".cokacdir")
+                                    .join("workspace")
+                                    .join(folder_name)
+                                    .is_dir()
+                            })
                             .unwrap_or(false)
                     {
-                        response_lines.push(format!("Use /{} to resume this session.", folder_name));
+                        response_lines
+                            .push(format!("Use /{} to resume this session.", folder_name));
                     }
                 }
                 let header_len: usize = response_lines.iter().map(|l| l.len() + 1).sum();
@@ -6012,18 +10062,33 @@ async fn handle_start_command(
                 session.session_id = None;
                 session.current_path = Some(canonical_path.clone());
                 session.history.clear();
-                msg_debug(&format!("[handle_start_command] placeholder session found; starting fresh at path={}", canonical_path));
+                msg_debug(&format!(
+                    "[handle_start_command] placeholder session found; starting fresh at path={}",
+                    canonical_path
+                ));
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}] ▶ Session started: {canonical_path}");
-                response_lines.push(format!("[{}] Session started at `{}`.", provider_str, canonical_path));
-                if let Some(folder_name) = std::path::Path::new(&canonical_path).file_name().and_then(|n| n.to_str()) {
+                response_lines.push(format!(
+                    "[{}] Session started at `{}`.",
+                    provider_str, canonical_path
+                ));
+                if let Some(folder_name) = std::path::Path::new(&canonical_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                {
                     if is_workspace_id(folder_name)
                         && dirs::home_dir()
-                            .map(|h| h.join(".cokacdir").join("workspace").join(folder_name).is_dir())
+                            .map(|h| {
+                                h.join(".cokacdir")
+                                    .join("workspace")
+                                    .join(folder_name)
+                                    .is_dir()
+                            })
                             .unwrap_or(false)
                     {
-                        response_lines.push(format!("Use /{} to resume this session.", folder_name));
+                        response_lines
+                            .push(format!("Use /{} to resume this session.", folder_name));
                     }
                 }
             }
@@ -6031,16 +10096,30 @@ async fn handle_start_command(
             session.session_id = None;
             session.current_path = Some(canonical_path.clone());
             session.history.clear();
-            msg_debug(&format!("[handle_start_command] new session: path={}", canonical_path));
+            msg_debug(&format!(
+                "[handle_start_command] new session: path={}",
+                canonical_path
+            ));
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ▶ Session started: {canonical_path}");
-            response_lines.push(format!("[{}] Session started at `{}`.", provider_str, canonical_path));
+            response_lines.push(format!(
+                "[{}] Session started at `{}`.",
+                provider_str, canonical_path
+            ));
             // Show workspace ID shortcut if this is a workspace directory
-            if let Some(folder_name) = std::path::Path::new(&canonical_path).file_name().and_then(|n| n.to_str()) {
+            if let Some(folder_name) = std::path::Path::new(&canonical_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
                 if is_workspace_id(folder_name)
                     && dirs::home_dir()
-                        .map(|h| h.join(".cokacdir").join("workspace").join(folder_name).is_dir())
+                        .map(|h| {
+                            h.join(".cokacdir")
+                                .join("workspace")
+                                .join(folder_name)
+                                .is_dir()
+                        })
                         .unwrap_or(false)
                 {
                     response_lines.push(format!("Use /{} to resume this session.", folder_name));
@@ -6052,7 +10131,9 @@ async fn handle_start_command(
     // Persist chat_id → path mapping for auto-restore after restart
     {
         let mut data = state.lock().await;
-        data.settings.last_sessions.insert(chat_id.0.to_string(), canonical_path.clone());
+        data.settings
+            .last_sessions
+            .insert(chat_id.0.to_string(), canonical_path.clone());
         save_bot_settings(token, &data.settings);
     }
 
@@ -6064,19 +10145,22 @@ async fn handle_start_command(
         };
         if !uname.is_empty() {
             let dn = if dname.is_empty() { None } else { Some(dname) };
-            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                bot: uname,
-                bot_display_name: dn,
-                role: "system".to_string(),
-                from: None,
-                text: if is_restored {
-                    format!("Session restored at {}", canonical_path)
-                } else {
-                    format!("Session started at {}", canonical_path)
+            append_group_chat_log(
+                chat_id.0,
+                &GroupChatLogEntry {
+                    ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    bot: uname,
+                    bot_display_name: dn,
+                    role: "system".to_string(),
+                    from: None,
+                    text: if is_restored {
+                        format!("Session restored at {}", canonical_path)
+                    } else {
+                        format!("Session started at {}", canonical_path)
+                    },
+                    clear: false,
                 },
-                clear: false,
-            });
+            );
         }
     }
 
@@ -6133,26 +10217,41 @@ fn is_workspace_id(s: &str) -> bool {
 
 /// Check if a string is a valid UUID (8-4-4-4-12 hex format)
 fn is_uuid(s: &str) -> bool {
-    if s.len() != 36 { return false; }
+    if s.len() != 36 {
+        return false;
+    }
     let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() != 5 { return false; }
+    if parts.len() != 5 {
+        return false;
+    }
     let expected = [8, 4, 4, 4, 12];
-    parts.iter().zip(expected.iter()).all(|(p, &len)| {
-        p.len() == len && p.chars().all(|c| c.is_ascii_hexdigit())
-    })
+    parts
+        .iter()
+        .zip(expected.iter())
+        .all(|(p, &len)| p.len() == len && p.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Provider that owns the resolved session.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum SessionProvider { Claude, Codex, Gemini, OpenCode }
+enum SessionProvider {
+    Claude,
+    Codex,
+    Gemini,
+    OpenCode,
+}
 
 /// Detect provider from model prefix only (no availability fallback).
 /// Returns "claude" when model is None or has no recognized prefix.
 fn provider_from_model(model: Option<&str>) -> &'static str {
-    if codex::is_codex_model(model) { "codex" }
-    else if gemini::is_gemini_model(model) { "gemini" }
-    else if opencode::is_opencode_model(model) { "opencode" }
-    else { "claude" }
+    if codex::is_codex_model(model) {
+        "codex"
+    } else if gemini::is_gemini_model(model) {
+        "gemini"
+    } else if opencode::is_opencode_model(model) {
+        "opencode"
+    } else {
+        "claude"
+    }
 }
 
 /// Detect effective provider: from model prefix if set, otherwise from CLI availability.
@@ -6200,7 +10299,12 @@ struct ResolvedSession {
 
 /// Resolve a session by name or ID, scoped to the current provider.
 fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSession> {
-    msg_debug(&format!("[resolve_session] query={:?}, provider={:?}, is_uuid={}", query, provider, is_uuid(query)));
+    msg_debug(&format!(
+        "[resolve_session] query={:?}, provider={:?}, is_uuid={}",
+        query,
+        provider,
+        is_uuid(query)
+    ));
     let result = match provider {
         SessionProvider::Claude => {
             if is_uuid(query) {
@@ -6209,16 +10313,17 @@ fn resolve_session(query: &str, provider: SessionProvider) -> Option<ResolvedSes
                 resolve_claude_by_name(query).or_else(|| resolve_claude_by_id(query))
             }
         }
-        SessionProvider::Codex => {
-            resolve_codex_by_id(query)
-        }
+        SessionProvider::Codex => resolve_codex_by_id(query),
         SessionProvider::Gemini => resolve_gemini_by_id(query),
         SessionProvider::OpenCode => resolve_opencode_by_id(query),
     };
-    msg_debug(&format!("[resolve_session] result={}", match &result {
-        Some(r) => format!("found(cwd={:?}, session_id={})", r.cwd, r.session_id),
-        None => "None".to_string(),
-    }));
+    msg_debug(&format!(
+        "[resolve_session] result={}",
+        match &result {
+            Some(r) => format!("found(cwd={:?}, session_id={})", r.cwd, r.session_id),
+            None => "None".to_string(),
+        }
+    ));
     result
 }
 
@@ -6227,18 +10332,27 @@ fn resolve_claude_by_id(session_id: &str) -> Option<ResolvedSession> {
     msg_debug(&format!("[resolve_claude_by_id] session_id={}", session_id));
     let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
     if !projects_dir.is_dir() {
-        msg_debug(&format!("[resolve_claude_by_id] projects_dir not found: {}", projects_dir.display()));
+        msg_debug(&format!(
+            "[resolve_claude_by_id] projects_dir not found: {}",
+            projects_dir.display()
+        ));
         return None;
     }
     let filename = format!("{}.jsonl", session_id);
     for entry in fs::read_dir(&projects_dir).ok()?.flatten() {
-        if !entry.file_type().map_or(false, |t| t.is_dir()) { continue; }
+        if !entry.file_type().map_or(false, |t| t.is_dir()) {
+            continue;
+        }
         let jsonl_path = entry.path().join(&filename);
         if jsonl_path.exists() {
-            msg_debug(&format!("[resolve_claude_by_id] found: {}", jsonl_path.display()));
+            msg_debug(&format!(
+                "[resolve_claude_by_id] found: {}",
+                jsonl_path.display()
+            ));
             let cwd = extract_cwd_from_jsonl(&jsonl_path)?;
             return Some(ResolvedSession {
-                cwd, jsonl_path,
+                cwd,
+                jsonl_path,
                 session_id: session_id.to_string(),
                 provider: SessionProvider::Claude,
             });
@@ -6253,18 +10367,30 @@ fn resolve_claude_by_name(name: &str) -> Option<ResolvedSession> {
     msg_debug(&format!("[resolve_claude_by_name] name={:?}", name));
     let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
     if !projects_dir.is_dir() {
-        msg_debug(&format!("[resolve_claude_by_name] projects_dir not found: {}", projects_dir.display()));
+        msg_debug(&format!(
+            "[resolve_claude_by_name] projects_dir not found: {}",
+            projects_dir.display()
+        ));
         return None;
     }
     let name_lower = name.to_lowercase();
     for proj_entry in fs::read_dir(&projects_dir).ok()?.flatten() {
-        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) { continue; }
-        let Ok(file_entries) = fs::read_dir(proj_entry.path()) else { continue; };
+        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) {
+            continue;
+        }
+        let Ok(file_entries) = fs::read_dir(proj_entry.path()) else {
+            continue;
+        };
         for file_entry in file_entries.flatten() {
             let path = file_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
             if let Some(info) = find_session_by_title(&path, &name_lower) {
-                msg_debug(&format!("[resolve_claude_by_name] found: session_id={}, cwd={:?}", info.session_id, info.cwd));
+                msg_debug(&format!(
+                    "[resolve_claude_by_name] found: session_id={}, cwd={:?}",
+                    info.session_id, info.cwd
+                ));
                 return Some(info);
             }
         }
@@ -6295,13 +10421,17 @@ fn find_session_by_title(path: &Path, name_lower: &str) -> Option<ResolvedSessio
                 }
             }
         }
-        if matched && cwd_found.is_some() { break; }
+        if matched && cwd_found.is_some() {
+            break;
+        }
     }
     if matched {
         let cwd = cwd_found?;
         let session_id = path.file_stem()?.to_str()?.to_string();
         Some(ResolvedSession {
-            cwd, jsonl_path: path.to_path_buf(), session_id,
+            cwd,
+            jsonl_path: path.to_path_buf(),
+            session_id,
             provider: SessionProvider::Claude,
         })
     } else {
@@ -6312,11 +10442,15 @@ fn find_session_by_title(path: &Path, name_lower: &str) -> Option<ResolvedSessio
 /// Codex: recursively scan `~/.codex/sessions/` for a JSONL whose filename contains the UUID.
 fn resolve_codex_by_id(session_id: &str) -> Option<ResolvedSession> {
     let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
-    if !sessions_dir.is_dir() { return None; }
+    if !sessions_dir.is_dir() {
+        return None;
+    }
     let suffix = format!("{}.jsonl", session_id);
     fn walk(dir: &Path, suffix: &str) -> Option<std::path::PathBuf> {
         for entry in fs::read_dir(dir).ok()?.flatten() {
-            let Ok(ft) = entry.file_type() else { continue; };
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
             if ft.is_dir() {
                 if let Some(found) = walk(&entry.path(), suffix) {
                     return Some(found);
@@ -6334,7 +10468,8 @@ fn resolve_codex_by_id(session_id: &str) -> Option<ResolvedSession> {
     let jsonl_path = walk(&sessions_dir, &suffix)?;
     let cwd = extract_cwd_from_jsonl(&jsonl_path)?;
     Some(ResolvedSession {
-        cwd, jsonl_path,
+        cwd,
+        jsonl_path,
         session_id: session_id.to_string(),
         provider: SessionProvider::Codex,
     })
@@ -6351,29 +10486,54 @@ fn resolve_gemini_by_id(session_id: &str) -> Option<ResolvedSession> {
     // Use first 8 chars of UUID for quick filename filtering (char-boundary safe)
     let short_id: String = session_id.chars().take(8).collect();
     for proj_entry in fs::read_dir(&tmp_dir).ok()?.flatten() {
-        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) { continue; }
+        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) {
+            continue;
+        }
         let chats_dir = proj_entry.path().join("chats");
-        if !chats_dir.is_dir() { continue; }
-        let Ok(chat_entries) = fs::read_dir(&chats_dir) else { continue; };
+        if !chats_dir.is_dir() {
+            continue;
+        }
+        let Ok(chat_entries) = fs::read_dir(&chats_dir) else {
+            continue;
+        };
         for chat_entry in chat_entries.flatten() {
             let path = chat_entry.path();
-            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else { continue; };
-            if !fname.starts_with("session-") || !fname.ends_with(".json") { continue; }
+            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !fname.starts_with("session-") || !fname.ends_with(".json") {
+                continue;
+            }
             // Quick filter: filename contains first 8 chars of UUID
-            if !fname.contains(short_id.as_str()) { continue; }
+            if !fname.contains(short_id.as_str()) {
+                continue;
+            }
             // Parse JSON to verify full sessionId
-            let Ok(content) = fs::read_to_string(&path) else { continue; };
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else { continue; };
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
             let sid = val.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
-            if sid != session_id { continue; }
+            if sid != session_id {
+                continue;
+            }
             // Read .project_root from parent directory to get cwd
             let project_root_file = proj_entry.path().join(".project_root");
-            let cwd = fs::read_to_string(&project_root_file).ok()
+            let cwd = fs::read_to_string(&project_root_file)
+                .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())?;
-            msg_debug(&format!("[resolve_gemini_by_id] found: cwd={:?}, file={}", cwd, path.display()));
+            msg_debug(&format!(
+                "[resolve_gemini_by_id] found: cwd={:?}, file={}",
+                cwd,
+                path.display()
+            ));
             return Some(ResolvedSession {
-                cwd, jsonl_path: path, session_id: session_id.to_string(),
+                cwd,
+                jsonl_path: path,
+                session_id: session_id.to_string(),
                 provider: SessionProvider::Gemini,
             });
         }
@@ -6384,22 +10544,38 @@ fn resolve_gemini_by_id(session_id: &str) -> Option<ResolvedSession> {
 
 /// OpenCode: query `~/.local/share/opencode/opencode.db` for a matching session ID.
 fn resolve_opencode_by_id(session_id: &str) -> Option<ResolvedSession> {
-    msg_debug(&format!("[resolve_opencode_by_id] session_id={}", session_id));
-    let db_path = dirs::home_dir()?.join(".local").join("share").join("opencode").join("opencode.db");
+    msg_debug(&format!(
+        "[resolve_opencode_by_id] session_id={}",
+        session_id
+    ));
+    let db_path = dirs::home_dir()?
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
     if !db_path.is_file() {
         msg_debug("[resolve_opencode_by_id] db not found");
         return None;
     }
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ).ok()?;
-    let mut stmt = conn.prepare("SELECT id, directory FROM session WHERE id = ?1 LIMIT 1").ok()?;
-    let result = stmt.query_row(rusqlite::params![session_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    }).ok()?;
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT id, directory FROM session WHERE id = ?1 LIMIT 1")
+        .ok()?;
+    let result = stmt
+        .query_row(rusqlite::params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .ok()?;
     let directory = result.1;
-    if directory.is_empty() { return None; }
-    msg_debug(&format!("[resolve_opencode_by_id] found: directory={:?}", directory));
+    if directory.is_empty() {
+        return None;
+    }
+    msg_debug(&format!(
+        "[resolve_opencode_by_id] found: directory={:?}",
+        directory
+    ));
     Some(ResolvedSession {
         cwd: directory,
         jsonl_path: db_path,
@@ -6412,8 +10588,12 @@ fn resolve_opencode_by_id(session_id: &str) -> Option<ResolvedSession> {
 /// Re-converts if the source JSONL is newer than the existing JSON, or if the
 /// existing JSON is a cleared/incomplete placeholder.
 fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
-    msg_debug(&format!("[convert_session] start: jsonl={}, session_id={}, canonical_path={:?}",
-        info.jsonl_path.display(), info.session_id, canonical_path));
+    msg_debug(&format!(
+        "[convert_session] start: jsonl={}, session_id={}, canonical_path={:?}",
+        info.jsonl_path.display(),
+        info.session_id,
+        canonical_path
+    ));
     let Some(sessions_dir) = ai_screen::ai_sessions_dir() else {
         msg_debug("[convert_session] ai_sessions_dir() returned None");
         return;
@@ -6422,12 +10602,26 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
     let provider_str = session_provider_str(info.provider);
     msg_debug(&format!("[convert_session] target={}", target.display()));
     if target.exists() {
-        if !converted_session_file_is_complete(&target, &info.session_id, canonical_path, provider_str) {
-            msg_debug("[convert_session] target exists but is incomplete or mismatched; reconverting");
+        if !converted_session_file_is_complete(
+            &target,
+            &info.session_id,
+            canonical_path,
+            provider_str,
+        ) {
+            msg_debug(
+                "[convert_session] target exists but is incomplete or mismatched; reconverting",
+            );
         } else {
-            let source_mtime = info.jsonl_path.metadata().ok().and_then(|m| m.modified().ok());
+            let source_mtime = info
+                .jsonl_path
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok());
             let target_mtime = target.metadata().ok().and_then(|m| m.modified().ok());
-            msg_debug(&format!("[convert_session] target exists, source_mtime={:?}, target_mtime={:?}", source_mtime, target_mtime));
+            msg_debug(&format!(
+                "[convert_session] target exists, source_mtime={:?}, target_mtime={:?}",
+                source_mtime, target_mtime
+            ));
             if let (Some(src), Some(tgt)) = (source_mtime, target_mtime) {
                 if src <= tgt {
                     msg_debug("[convert_session] skipped: target is up-to-date");
@@ -6442,20 +10636,31 @@ fn convert_and_save_session(info: &ResolvedSession, canonical_path: &str) {
 
     let parser = match info.provider {
         SessionProvider::Claude => parse_claude_jsonl,
-        SessionProvider::Codex  => parse_codex_jsonl,
+        SessionProvider::Codex => parse_codex_jsonl,
         SessionProvider::Gemini => parse_gemini_json,
         SessionProvider::OpenCode => parse_opencode_session,
     };
-    msg_debug(&format!("[convert_session] parsing with provider={:?}", info.provider));
+    msg_debug(&format!(
+        "[convert_session] parsing with provider={:?}",
+        info.provider
+    ));
     let Some(session_data) = parser(&info.jsonl_path, &info.session_id, canonical_path) else {
         msg_debug("[convert_session] parser returned None");
         return;
     };
-    msg_debug(&format!("[convert_session] parsed: history_len={}, provider={}", session_data.history.len(), session_data.provider));
+    msg_debug(&format!(
+        "[convert_session] parsed: history_len={}, provider={}",
+        session_data.history.len(),
+        session_data.provider
+    ));
     let _ = fs::create_dir_all(&sessions_dir);
     if let Ok(json) = serde_json::to_string_pretty(&session_data) {
         let write_result = fs::write(&target, &json);
-        msg_debug(&format!("[convert_session] write result={:?}, bytes={}", write_result, json.len()));
+        msg_debug(&format!(
+            "[convert_session] write result={:?}, bytes={}",
+            write_result,
+            json.len()
+        ));
     } else {
         msg_debug("[convert_session] serde_json::to_string_pretty failed");
     }
@@ -6594,39 +10799,67 @@ mod session_conversion_tests {
 }
 
 /// Find the most recently modified external session whose cwd matches the given path.
-fn find_latest_session_by_cwd(canonical_path: &str, provider: SessionProvider) -> Option<ResolvedSession> {
-    msg_debug(&format!("[find_latest_by_cwd] canonical_path={:?}, provider={:?}", canonical_path, provider));
+fn find_latest_session_by_cwd(
+    canonical_path: &str,
+    provider: SessionProvider,
+) -> Option<ResolvedSession> {
+    msg_debug(&format!(
+        "[find_latest_by_cwd] canonical_path={:?}, provider={:?}",
+        canonical_path, provider
+    ));
     let result = match provider {
         SessionProvider::Claude => find_latest_claude_by_cwd(canonical_path),
-        SessionProvider::Codex  => find_latest_codex_by_cwd(canonical_path),
+        SessionProvider::Codex => find_latest_codex_by_cwd(canonical_path),
         SessionProvider::Gemini => find_latest_gemini_by_cwd(canonical_path),
         SessionProvider::OpenCode => find_latest_opencode_by_cwd(canonical_path),
     };
-    msg_debug(&format!("[find_latest_by_cwd] result={}", if result.is_some() { "found" } else { "None" }));
+    msg_debug(&format!(
+        "[find_latest_by_cwd] result={}",
+        if result.is_some() { "found" } else { "None" }
+    ));
     result
 }
 
 /// Claude: scan all `~/.claude/projects/*/*.jsonl` for the latest session matching cwd.
 fn find_latest_claude_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
     let projects_dir = dirs::home_dir()?.join(".claude").join("projects");
-    msg_debug(&format!("[find_claude_by_cwd] projects_dir={}, is_dir={}", projects_dir.display(), projects_dir.is_dir()));
-    if !projects_dir.is_dir() { return None; }
+    msg_debug(&format!(
+        "[find_claude_by_cwd] projects_dir={}, is_dir={}",
+        projects_dir.display(),
+        projects_dir.is_dir()
+    ));
+    if !projects_dir.is_dir() {
+        return None;
+    }
     let mut best_path: Option<std::path::PathBuf> = None;
     let mut best_time = std::time::UNIX_EPOCH;
     let mut scan_count = 0u32;
     let mut cwd_mismatch_sample: Option<String> = None;
     for proj_entry in fs::read_dir(&projects_dir).ok()?.flatten() {
-        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) { continue; }
-        let Ok(file_entries) = fs::read_dir(proj_entry.path()) else { continue; };
+        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) {
+            continue;
+        }
+        let Ok(file_entries) = fs::read_dir(proj_entry.path()) else {
+            continue;
+        };
         for file_entry in file_entries.flatten() {
             let path = file_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
             scan_count += 1;
             if let Some(cwd) = extract_cwd_from_jsonl(&path) {
-                msg_debug(&format!("[find_claude_by_cwd] file={}, extracted_cwd={:?}, want={:?}, match={}",
-                    path.display(), cwd, canonical_path, cwd == canonical_path));
+                msg_debug(&format!(
+                    "[find_claude_by_cwd] file={}, extracted_cwd={:?}, want={:?}, match={}",
+                    path.display(),
+                    cwd,
+                    canonical_path,
+                    cwd == canonical_path
+                ));
                 if cwd == canonical_path {
-                    let mtime = path.metadata().ok()
+                    let mtime = path
+                        .metadata()
+                        .ok()
                         .and_then(|m| m.modified().ok())
                         .unwrap_or(std::time::UNIX_EPOCH);
                     if mtime > best_time {
@@ -6637,20 +10870,32 @@ fn find_latest_claude_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
                     cwd_mismatch_sample = Some(cwd);
                 }
             } else {
-                msg_debug(&format!("[find_claude_by_cwd] file={}, extract_cwd returned None", path.display()));
+                msg_debug(&format!(
+                    "[find_claude_by_cwd] file={}, extract_cwd returned None",
+                    path.display()
+                ));
             }
         }
     }
-    msg_debug(&format!("[find_claude_by_cwd] scanned {} jsonl files, best={:?}", scan_count, best_path.as_ref().map(|p| p.display().to_string())));
+    msg_debug(&format!(
+        "[find_claude_by_cwd] scanned {} jsonl files, best={:?}",
+        scan_count,
+        best_path.as_ref().map(|p| p.display().to_string())
+    ));
     if best_path.is_none() {
         if let Some(sample) = cwd_mismatch_sample {
-            msg_debug(&format!("[find_claude_by_cwd] cwd mismatch example: extracted={:?} vs wanted={:?}", sample, canonical_path));
+            msg_debug(&format!(
+                "[find_claude_by_cwd] cwd mismatch example: extracted={:?} vs wanted={:?}",
+                sample, canonical_path
+            ));
         }
     }
     let jsonl_path = best_path?;
     let session_id = jsonl_path.file_stem()?.to_str()?.to_string();
     Some(ResolvedSession {
-        cwd: canonical_path.to_string(), jsonl_path, session_id,
+        cwd: canonical_path.to_string(),
+        jsonl_path,
+        session_id,
         provider: SessionProvider::Claude,
     })
 }
@@ -6658,40 +10903,63 @@ fn find_latest_claude_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
 /// Codex: scan `~/.codex/sessions/**/*.jsonl` for the latest session matching cwd.
 fn find_latest_codex_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
     let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
-    if !sessions_dir.is_dir() { return None; }
+    if !sessions_dir.is_dir() {
+        return None;
+    }
     let mut best_path: Option<std::path::PathBuf> = None;
     let mut best_time = std::time::UNIX_EPOCH;
-    collect_best_codex_jsonl(&sessions_dir, canonical_path, &mut best_path, &mut best_time);
+    collect_best_codex_jsonl(
+        &sessions_dir,
+        canonical_path,
+        &mut best_path,
+        &mut best_time,
+    );
     let jsonl_path = best_path?;
     // Extract UUID from filename tail (last 36 chars of stem)
     let session_id = {
         let stem = jsonl_path.file_stem()?.to_str()?;
-        if stem.len() < 36 { return None; }
+        if stem.len() < 36 {
+            return None;
+        }
         let candidate = &stem[stem.len() - 36..];
-        if !is_uuid(candidate) { return None; }
+        if !is_uuid(candidate) {
+            return None;
+        }
         candidate.to_string()
     };
     Some(ResolvedSession {
-        cwd: canonical_path.to_string(), jsonl_path, session_id,
+        cwd: canonical_path.to_string(),
+        jsonl_path,
+        session_id,
         provider: SessionProvider::Codex,
     })
 }
 
 fn collect_best_codex_jsonl(
-    dir: &Path, canonical_path: &str,
-    best_path: &mut Option<std::path::PathBuf>, best_time: &mut std::time::SystemTime,
+    dir: &Path,
+    canonical_path: &str,
+    best_path: &mut Option<std::path::PathBuf>,
+    best_time: &mut std::time::SystemTime,
 ) {
-    let Ok(entries) = fs::read_dir(dir) else { return; };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue; };
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
         if ft.is_dir() {
             collect_best_codex_jsonl(&entry.path(), canonical_path, best_path, best_time);
         } else if ft.is_file() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") { continue; }
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
             if let Some(cwd) = extract_cwd_from_jsonl(&path) {
                 if cwd == canonical_path {
-                    let mtime = path.metadata().ok()
+                    let mtime = path
+                        .metadata()
+                        .ok()
                         .and_then(|m| m.modified().ok())
                         .unwrap_or(std::time::UNIX_EPOCH);
                     if mtime > *best_time {
@@ -6706,24 +10974,45 @@ fn collect_best_codex_jsonl(
 
 /// Gemini: scan `~/.gemini/tmp/*/.project_root` for cwd match, find latest chat file.
 fn find_latest_gemini_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
-    msg_debug(&format!("[find_latest_gemini_by_cwd] canonical_path={:?}", canonical_path));
+    msg_debug(&format!(
+        "[find_latest_gemini_by_cwd] canonical_path={:?}",
+        canonical_path
+    ));
     let tmp_dir = dirs::home_dir()?.join(".gemini").join("tmp");
-    if !tmp_dir.is_dir() { return None; }
+    if !tmp_dir.is_dir() {
+        return None;
+    }
     let mut best_path: Option<std::path::PathBuf> = None;
     let mut best_time = std::time::UNIX_EPOCH;
     for proj_entry in fs::read_dir(&tmp_dir).ok()?.flatten() {
-        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) { continue; }
+        if !proj_entry.file_type().map_or(false, |t| t.is_dir()) {
+            continue;
+        }
         let pr_file = proj_entry.path().join(".project_root");
-        let Ok(pr_content) = fs::read_to_string(&pr_file) else { continue; };
-        if pr_content.trim() != canonical_path { continue; }
+        let Ok(pr_content) = fs::read_to_string(&pr_file) else {
+            continue;
+        };
+        if pr_content.trim() != canonical_path {
+            continue;
+        }
         let chats_dir = proj_entry.path().join("chats");
-        if !chats_dir.is_dir() { continue; }
-        let Ok(chat_entries) = fs::read_dir(&chats_dir) else { continue; };
+        if !chats_dir.is_dir() {
+            continue;
+        }
+        let Ok(chat_entries) = fs::read_dir(&chats_dir) else {
+            continue;
+        };
         for chat_entry in chat_entries.flatten() {
             let path = chat_entry.path();
-            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else { continue; };
-            if !fname.starts_with("session-") || !fname.ends_with(".json") { continue; }
-            let mtime = path.metadata().ok()
+            let Some(fname) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !fname.starts_with("session-") || !fname.ends_with(".json") {
+                continue;
+            }
+            let mtime = path
+                .metadata()
+                .ok()
                 .and_then(|m| m.modified().ok())
                 .unwrap_or(std::time::UNIX_EPOCH);
             if mtime > best_time {
@@ -6736,28 +11025,46 @@ fn find_latest_gemini_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
     let content = fs::read_to_string(&jsonl_path).ok()?;
     let val: serde_json::Value = serde_json::from_str(&content).ok()?;
     let session_id = val.get("sessionId").and_then(|v| v.as_str())?.to_string();
-    msg_debug(&format!("[find_latest_gemini_by_cwd] found: session_id={}, file={}", session_id, jsonl_path.display()));
+    msg_debug(&format!(
+        "[find_latest_gemini_by_cwd] found: session_id={}, file={}",
+        session_id,
+        jsonl_path.display()
+    ));
     Some(ResolvedSession {
-        cwd: canonical_path.to_string(), jsonl_path, session_id,
+        cwd: canonical_path.to_string(),
+        jsonl_path,
+        session_id,
         provider: SessionProvider::Gemini,
     })
 }
 
 /// OpenCode: query SQLite DB for latest session matching cwd.
 fn find_latest_opencode_by_cwd(canonical_path: &str) -> Option<ResolvedSession> {
-    msg_debug(&format!("[find_latest_opencode_by_cwd] canonical_path={:?}", canonical_path));
-    let db_path = dirs::home_dir()?.join(".local").join("share").join("opencode").join("opencode.db");
-    if !db_path.is_file() { return None; }
-    let conn = rusqlite::Connection::open_with_flags(
-        &db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ).ok()?;
-    let mut stmt = conn.prepare(
-        "SELECT id FROM session WHERE directory = ?1 ORDER BY time_updated DESC LIMIT 1"
-    ).ok()?;
-    let session_id: String = stmt.query_row(rusqlite::params![canonical_path], |row| {
-        row.get(0)
-    }).ok()?;
-    msg_debug(&format!("[find_latest_opencode_by_cwd] found: session_id={}", session_id));
+    msg_debug(&format!(
+        "[find_latest_opencode_by_cwd] canonical_path={:?}",
+        canonical_path
+    ));
+    let db_path = dirs::home_dir()?
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("opencode.db");
+    if !db_path.is_file() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM session WHERE directory = ?1 ORDER BY time_updated DESC LIMIT 1")
+        .ok()?;
+    let session_id: String = stmt
+        .query_row(rusqlite::params![canonical_path], |row| row.get(0))
+        .ok()?;
+    msg_debug(&format!(
+        "[find_latest_opencode_by_cwd] found: session_id={}",
+        session_id
+    ));
     Some(ResolvedSession {
         cwd: canonical_path.to_string(),
         jsonl_path: db_path,
@@ -6774,19 +11081,34 @@ fn parse_claude_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<
     let mut history: Vec<HistoryItem> = Vec::new();
 
     for line in reader.lines().flatten() {
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
         // Skip sidechain (alternative conversation branches)
-        if val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) { continue; }
+        if val.get("isSidechain").and_then(|v| v.as_bool()) == Some(true) {
+            continue;
+        }
 
-        let Some(msg_type) = val.get("type").and_then(|v| v.as_str()) else { continue };
+        let Some(msg_type) = val.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
 
         match msg_type {
             "user" => {
-                let Some(message) = val.get("message") else { continue };
-                let Some(content) = message.get("content") else { continue };
+                let Some(message) = val.get("message") else {
+                    continue;
+                };
+                let Some(content) = message.get("content") else {
+                    continue;
+                };
                 if let Some(text) = content.as_str() {
                     // Skip commands and system injections
-                    if text.is_empty() || text.contains("<command-name>") || text.contains("<local-command") { continue; }
+                    if text.is_empty()
+                        || text.contains("<command-name>")
+                        || text.contains("<local-command")
+                    {
+                        continue;
+                    }
                     history.push(HistoryItem {
                         item_type: HistoryType::User,
                         content: truncate_utf8(text, 300),
@@ -6818,9 +11140,15 @@ fn parse_claude_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<
                 }
             }
             "assistant" => {
-                let Some(message) = val.get("message") else { continue };
-                let Some(content) = message.get("content") else { continue };
-                let Some(arr) = content.as_array() else { continue };
+                let Some(message) = val.get("message") else {
+                    continue;
+                };
+                let Some(content) = message.get("content") else {
+                    continue;
+                };
+                let Some(arr) = content.as_array() else {
+                    continue;
+                };
                 for item in arr {
                     let it = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     match it {
@@ -6848,7 +11176,9 @@ fn parse_claude_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<
         }
     }
 
-    if history.is_empty() { return None; }
+    if history.is_empty() {
+        return None;
+    }
 
     Some(SessionData {
         session_id: session_id.to_string(),
@@ -6867,16 +11197,25 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
     let mut history: Vec<HistoryItem> = Vec::new();
 
     for line in reader.lines().flatten() {
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-        let Some(line_type) = val.get("type").and_then(|v| v.as_str()) else { continue };
-        let Some(payload) = val.get("payload") else { continue };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(line_type) = val.get("type").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(payload) = val.get("payload") else {
+            continue;
+        };
 
         match line_type {
             "event_msg" => {
                 let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 match msg_type {
                     "user_message" => {
-                        let text = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                        let text = payload
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         if !text.is_empty() {
                             history.push(HistoryItem {
                                 item_type: HistoryType::User,
@@ -6885,7 +11224,10 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
                         }
                     }
                     "agent_message" => {
-                        let text = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                        let text = payload
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         if !text.is_empty() {
                             history.push(HistoryItem {
                                 item_type: HistoryType::Assistant,
@@ -6902,7 +11244,10 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
                     // response_item → message is intentionally ignored:
                     // agent text is already captured via event_msg → agent_message (always emitted in pairs)
                     "function_call" => {
-                        let name = payload.get("name").and_then(|v| v.as_str()).unwrap_or("Tool");
+                        let name = payload
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("Tool");
                         history.push(HistoryItem {
                             item_type: HistoryType::ToolUse,
                             content: format!("[{}]", name),
@@ -6910,12 +11255,15 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
                     }
                     "function_call_output" => {
                         // output can be a plain string or structured {content_items: [...]}
-                        let output = if let Some(s) = payload.get("output").and_then(|v| v.as_str()) {
+                        let output = if let Some(s) = payload.get("output").and_then(|v| v.as_str())
+                        {
                             s.to_string()
                         } else if let Some(obj) = payload.get("output") {
                             // Structured: try content_items[].text, then content field
-                            if let Some(items) = obj.get("content_items").and_then(|v| v.as_array()) {
-                                items.iter()
+                            if let Some(items) = obj.get("content_items").and_then(|v| v.as_array())
+                            {
+                                items
+                                    .iter()
                                     .filter_map(|c| c.get("text").and_then(|v| v.as_str()))
                                     .collect::<Vec<_>>()
                                     .join("\n")
@@ -6941,7 +11289,9 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
         }
     }
 
-    if history.is_empty() { return None; }
+    if history.is_empty() {
+        return None;
+    }
 
     Some(SessionData {
         session_id: session_id.to_string(),
@@ -6954,7 +11304,11 @@ fn parse_codex_jsonl(jsonl_path: &Path, session_id: &str, cwd: &str) -> Option<S
 
 /// Parse a Gemini CLI chat JSON file into cokacdir SessionData.
 fn parse_gemini_json(json_path: &Path, session_id: &str, cwd: &str) -> Option<SessionData> {
-    msg_debug(&format!("[parse_gemini_json] file={}, session_id={}", json_path.display(), session_id));
+    msg_debug(&format!(
+        "[parse_gemini_json] file={}, session_id={}",
+        json_path.display(),
+        session_id
+    ));
     let content = fs::read_to_string(json_path).ok()?;
     let val: serde_json::Value = serde_json::from_str(&content).ok()?;
     let messages = val.get("messages")?.as_array()?;
@@ -6992,8 +11346,13 @@ fn parse_gemini_json(json_path: &Path, session_id: &str, cwd: &str) -> Option<Se
             _ => {}
         }
     }
-    if history.is_empty() { return None; }
-    msg_debug(&format!("[parse_gemini_json] parsed: history_len={}", history.len()));
+    if history.is_empty() {
+        return None;
+    }
+    msg_debug(&format!(
+        "[parse_gemini_json] parsed: history_len={}",
+        history.len()
+    ));
     Some(SessionData {
         session_id: session_id.to_string(),
         history,
@@ -7005,25 +11364,35 @@ fn parse_gemini_json(json_path: &Path, session_id: &str, cwd: &str) -> Option<Se
 
 /// Parse an OpenCode session from SQLite DB into cokacdir SessionData.
 fn parse_opencode_session(db_path: &Path, session_id: &str, cwd: &str) -> Option<SessionData> {
-    msg_debug(&format!("[parse_opencode_session] db={}, session_id={}", db_path.display(), session_id));
-    if !db_path.is_file() { return None; }
-    let conn = rusqlite::Connection::open_with_flags(
-        db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ).ok()?;
-    let mut stmt = conn.prepare(
-        "SELECT json_extract(m.data, '$.role'), json_extract(p.data, '$.type'), \
+    msg_debug(&format!(
+        "[parse_opencode_session] db={}, session_id={}",
+        db_path.display(),
+        session_id
+    ));
+    if !db_path.is_file() {
+        return None;
+    }
+    let conn =
+        rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(m.data, '$.role'), json_extract(p.data, '$.type'), \
          json_extract(p.data, '$.text'), json_extract(p.data, '$.tool') \
          FROM message m JOIN part p ON p.message_id = m.id \
-         WHERE m.session_id = ?1 ORDER BY p.time_created ASC"
-    ).ok()?;
-    let rows = stmt.query_map(rusqlite::params![session_id], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<String>>(2)?,
-            row.get::<_, Option<String>>(3)?,
-        ))
-    }).ok()?;
+         WHERE m.session_id = ?1 ORDER BY p.time_created ASC",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .ok()?;
     let mut history: Vec<HistoryItem> = Vec::new();
     for row in rows.flatten() {
         let role = row.0.as_deref().unwrap_or("");
@@ -7032,7 +11401,9 @@ fn parse_opencode_session(db_path: &Path, session_id: &str, cwd: &str) -> Option
         let tool = row.3.as_deref().unwrap_or("Tool");
         match ptype {
             "text" => {
-                if text.is_empty() { continue; }
+                if text.is_empty() {
+                    continue;
+                }
                 if role == "user" {
                     history.push(HistoryItem {
                         item_type: HistoryType::User,
@@ -7055,8 +11426,13 @@ fn parse_opencode_session(db_path: &Path, session_id: &str, cwd: &str) -> Option
             _ => {}
         }
     }
-    if history.is_empty() { return None; }
-    msg_debug(&format!("[parse_opencode_session] parsed: history_len={}", history.len()));
+    if history.is_empty() {
+        return None;
+    }
+    msg_debug(&format!(
+        "[parse_opencode_session] parsed: history_len={}",
+        history.len()
+    ));
     Some(SessionData {
         session_id: session_id.to_string(),
         history,
@@ -7068,9 +11444,13 @@ fn parse_opencode_session(db_path: &Path, session_id: &str, cwd: &str) -> Option
 
 /// Truncate a string at a valid UTF-8 boundary.
 fn truncate_utf8(s: &str, max: usize) -> String {
-    if s.len() <= max { return s.to_string(); }
+    if s.len() <= max {
+        return s.to_string();
+    }
     let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
     format!("{}…", &s[..end])
 }
 
@@ -7080,15 +11460,24 @@ fn extract_cwd_from_jsonl(path: &Path) -> Option<String> {
     let file = fs::File::open(path).ok()?;
     let reader = BufReader::new(file);
     for line in reader.lines().flatten() {
-        if !line.contains("\"cwd\"") { continue; }
+        if !line.contains("\"cwd\"") {
+            continue;
+        }
         if let Some(cwd) = extract_json_string_field(&line, "cwd") {
             if !cwd.is_empty() {
-                msg_debug(&format!("[extract_cwd] file={}, cwd={:?}", path.display(), cwd));
+                msg_debug(&format!(
+                    "[extract_cwd] file={}, cwd={:?}",
+                    path.display(),
+                    cwd
+                ));
                 return Some(cwd);
             }
         }
     }
-    msg_debug(&format!("[extract_cwd] file={}, no cwd found", path.display()));
+    msg_debug(&format!(
+        "[extract_cwd] file={}, no cwd found",
+        path.display()
+    ));
     None
 }
 
@@ -7113,13 +11502,18 @@ fn extract_json_string_field(json: &str, field: &str) -> Option<String> {
         }
         end += 1;
     }
-    if end >= bytes.len() { return None; }
+    if end >= bytes.len() {
+        return None;
+    }
     // Unescape JSON string (e.g. "\\\\" → "\\", "\\\"" → "\"")
     let raw = &rest[..end];
     let quoted = format!("\"{}\"", raw);
     let unescaped = serde_json::from_str::<String>(&quoted).unwrap_or_else(|_| raw.to_string());
     if field == "cwd" {
-        msg_debug(&format!("[extract_field] field={}, raw={:?}, unescaped={:?}", field, raw, unescaped));
+        msg_debug(&format!(
+            "[extract_field] field={}, raw={:?}, unescaped={:?}",
+            field, raw, unescaped
+        ));
     }
     Some(unescaped)
 }
@@ -7132,23 +11526,36 @@ async fn handle_workspace_resume(
     state: &SharedState,
     token: &str,
 ) -> ResponseResult<()> {
-    msg_debug(&format!("[workspace_resume] chat_id={}, workspace_id={}", chat_id.0, workspace_id));
+    msg_debug(&format!(
+        "[workspace_resume] chat_id={}, workspace_id={}",
+        chat_id.0, workspace_id
+    ));
     let Some(home) = dirs::home_dir() else {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Error: cannot determine home directory.")
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, "Error: cannot determine home directory.")
+                .await
+        )?;
         return Ok(());
     };
 
     let workspace_path = home.join(".cokacdir").join("workspace").join(workspace_id);
     if !workspace_path.exists() || !workspace_path.is_dir() {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, format!("Error: no workspace found for '{}'.", workspace_id))
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                format!("Error: no workspace found for '{}'.", workspace_id)
+            )
+            .await
+        )?;
         return Ok(());
     }
 
-    let canonical_path = workspace_path.canonicalize()
+    let canonical_path = workspace_path
+        .canonicalize()
         .map(crate::utils::format::strip_unc_prefix)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| workspace_path.display().to_string());
@@ -7158,19 +11565,32 @@ async fn handle_workspace_resume(
         let ws_model = get_model(&data.settings, chat_id);
         detect_provider(ws_model.as_deref())
     };
-    msg_debug(&format!("[workspace_resume] canonical_path={:?}, provider={}", canonical_path, ws_provider));
+    msg_debug(&format!(
+        "[workspace_resume] canonical_path={:?}, provider={}",
+        canonical_path, ws_provider
+    ));
     let existing = load_existing_session(&canonical_path, ws_provider);
-    msg_debug(&format!("[workspace_resume] load_existing_session → {}", if existing.is_some() { "found" } else { "None" }));
+    msg_debug(&format!(
+        "[workspace_resume] load_existing_session → {}",
+        if existing.is_some() { "found" } else { "None" }
+    ));
 
     let existing = if existing.is_some() {
         existing
     } else {
         let provider = provider_to_session(ws_provider);
         if let Some(info) = find_latest_session_by_cwd(&canonical_path, provider) {
-            msg_debug(&format!("[workspace_resume] fallback found: jsonl={}, session_id={}", info.jsonl_path.display(), info.session_id));
+            msg_debug(&format!(
+                "[workspace_resume] fallback found: jsonl={}, session_id={}",
+                info.jsonl_path.display(),
+                info.session_id
+            ));
             convert_and_save_session(&info, &canonical_path);
             let reloaded = load_existing_session(&canonical_path, ws_provider);
-            msg_debug(&format!("[workspace_resume] after convert, reload → {}", if reloaded.is_some() { "found" } else { "None" }));
+            msg_debug(&format!(
+                "[workspace_resume] after convert, reload → {}",
+                if reloaded.is_some() { "found" } else { "None" }
+            ));
             reloaded
         } else {
             msg_debug("[workspace_resume] no external session found either");
@@ -7187,10 +11607,20 @@ async fn handle_workspace_resume(
         // messages, and loop state authored against the old session — they would be
         // misapplied here, and an in-flight task's writeback would otherwise overwrite
         // the just-loaded session_id/history with the old task's data.
-        let old_path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
-        let old_sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+        let old_path = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone());
+        let old_sid = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.session_id.clone());
         let new_sid = existing.as_ref().and_then(|(sd, _)| {
-            if sd.session_id.is_empty() { None } else { Some(sd.session_id.clone()) }
+            if sd.session_id.is_empty() {
+                None
+            } else {
+                Some(sd.session_id.clone())
+            }
         });
         let path_changed = old_path.as_deref() != Some(canonical_path.as_str());
         let sid_changed = old_sid != new_sid;
@@ -7208,9 +11638,9 @@ async fn handle_workspace_resume(
             pending_uploads_added_at: None,
         });
         session.session_id = None; // Clear stale session_id from previous workspace
-        // Drop uploads only when the workspace path changed — upload paths point at
-        // the old workspace's files. Re-resuming the same workspace (same path) keeps
-        // uploads since they reference valid files the user just sent.
+                                   // Drop uploads only when the workspace path changed — upload paths point at
+                                   // the old workspace's files. Re-resuming the same workspace (same path) keeps
+                                   // uploads since they reference valid files the user just sent.
         if path_changed {
             session.clear_pending_uploads();
         }
@@ -7222,8 +11652,13 @@ async fn handle_workspace_resume(
                 session.history = session_data.history.clone();
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] ▶ Workspace session restored: {workspace_id} → {canonical_path}");
-                response_lines.push(format!("[{}] Session restored at `{}`.", ws_provider, canonical_path));
+                println!(
+                    "  [{ts}] ▶ Workspace session restored: {workspace_id} → {canonical_path}"
+                );
+                response_lines.push(format!(
+                    "[{}] Session restored at `{}`.",
+                    ws_provider, canonical_path
+                ));
 
                 let header_len: usize = response_lines.iter().map(|l| l.len() + 1).sum();
                 let remaining = TELEGRAM_MSG_LIMIT.saturating_sub(header_len + 2);
@@ -7240,7 +11675,10 @@ async fn handle_workspace_resume(
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}] ▶ Workspace session started: {workspace_id} → {canonical_path}");
-                response_lines.push(format!("[{}] Session started at `{}`.", ws_provider, canonical_path));
+                response_lines.push(format!(
+                    "[{}] Session started at `{}`.",
+                    ws_provider, canonical_path
+                ));
             }
         } else {
             // Workspace exists but no session — start a new session there
@@ -7250,14 +11688,19 @@ async fn handle_workspace_resume(
 
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ▶ Workspace session started: {workspace_id} → {canonical_path}");
-            response_lines.push(format!("[{}] Session started at `{}`.", ws_provider, canonical_path));
+            response_lines.push(format!(
+                "[{}] Session started at `{}`.",
+                ws_provider, canonical_path
+            ));
         }
     }
 
     // Persist chat_id → path mapping for auto-restore after restart
     {
         let mut data = state.lock().await;
-        data.settings.last_sessions.insert(chat_id.0.to_string(), canonical_path);
+        data.settings
+            .last_sessions
+            .insert(chat_id.0.to_string(), canonical_path);
         save_bot_settings(token, &data.settings);
     }
 
@@ -7277,10 +11720,23 @@ async fn handle_clear_command(
     msg_debug(&format!("[handle_clear] chat_id={}", chat_id.0));
     let (current_path, model_for_provider, orphan_stop_msg, bot_username, bot_display_name) = {
         let mut data = state.lock().await;
-        let path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
-        let old_sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
-        let old_hist_len = data.sessions.get(&chat_id).map(|s| s.history.len()).unwrap_or(0);
-        msg_debug(&format!("[handle_clear] clearing: path={:?}, session_id={:?}, history_len={}", path, old_sid, old_hist_len));
+        let path = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone());
+        let old_sid = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.session_id.clone());
+        let old_hist_len = data
+            .sessions
+            .get(&chat_id)
+            .map(|s| s.history.len())
+            .unwrap_or(0);
+        msg_debug(&format!(
+            "[handle_clear] clearing: path={:?}, session_id={:?}, history_len={}",
+            path, old_sid, old_hist_len
+        ));
         // Cancel any in-flight AI task. Without this, its completion handler would write
         // back the response into the just-cleared session, partially resurrecting what the
         // user explicitly cleared. The polling guard's sid comparison (captured_sid vs
@@ -7288,9 +11744,16 @@ async fn handle_clear_command(
         // mid-completion. Drop queued messages and loop state for the same reason — they
         // were authored against the pre-clear context.
         cancel_in_progress_task_locked(&data, chat_id);
-        let dropped_queue = data.message_queues.remove(&chat_id).map(|q| q.len()).unwrap_or(0);
+        let dropped_queue = data
+            .message_queues
+            .remove(&chat_id)
+            .map(|q| q.len())
+            .unwrap_or(0);
         if dropped_queue > 0 {
-            msg_debug(&format!("[handle_clear] dropped {} queued message(s)", dropped_queue));
+            msg_debug(&format!(
+                "[handle_clear] dropped {} queued message(s)",
+                dropped_queue
+            ));
         }
         // Bump clear_epoch so any in-flight task's polling guard detects the clear
         // even when session_id is None on both spawn and post-completion (brand-new
@@ -7328,9 +11791,11 @@ async fn handle_clear_command(
                     let file_path = entry.path();
                     if file_path.extension().map(|e| e == "json").unwrap_or(false) {
                         if let Ok(content) = fs::read_to_string(&file_path) {
-                            if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
+                            if let Ok(session_data) = serde_json::from_str::<SessionData>(&content)
+                            {
                                 if session_data.current_path == *path
-                                    && (session_data.provider.is_empty() || session_data.provider == provider)
+                                    && (session_data.provider.is_empty()
+                                        || session_data.provider == provider)
                                 {
                                     let cleared = serde_json::json!({"current_path": *path, "provider": provider});
                                     if let Ok(json) = serde_json::to_string_pretty(&cleared) {
@@ -7353,16 +11818,23 @@ async fn handle_clear_command(
     // Append clear marker to group chat log so other bots skip this bot's old entries
     if chat_id.0 < 0 {
         if !bot_username.is_empty() {
-            let dn = if bot_display_name.is_empty() { None } else { Some(bot_display_name.clone()) };
-            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
-                bot: bot_username,
-                bot_display_name: dn,
-                role: "system".to_string(),
-                from: None,
-                text: "Session cleared.".to_string(),
-                clear: true,
-            });
+            let dn = if bot_display_name.is_empty() {
+                None
+            } else {
+                Some(bot_display_name.clone())
+            };
+            append_group_chat_log(
+                chat_id.0,
+                &GroupChatLogEntry {
+                    ts: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    bot: bot_username,
+                    bot_display_name: dn,
+                    role: "system".to_string(),
+                    from: None,
+                    text: "Session cleared.".to_string(),
+                    clear: true,
+                },
+            );
         }
     }
 
@@ -7372,23 +11844,27 @@ async fn handle_clear_command(
     };
 
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, msg)
-        .await)?;
+    tg!("send_message", bot.send_message(chat_id, msg).await)?;
 
     Ok(())
 }
 
 /// Handle /pwd command - show current session path
-async fn handle_pwd_command(
-    bot: &Bot,
-    chat_id: ChatId,
-    state: &SharedState,
-) -> ResponseResult<()> {
+async fn handle_pwd_command(bot: &Bot, chat_id: ChatId, state: &SharedState) -> ResponseResult<()> {
     let current_path = {
         let data = state.lock().await;
-        let path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
-        let sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
-        msg_debug(&format!("[handle_pwd] chat_id={}, path={:?}, session_id={:?}", chat_id.0, path, sid));
+        let path = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone());
+        let sid = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.session_id.clone());
+        msg_debug(&format!(
+            "[handle_pwd] chat_id={}, path={:?}, session_id={:?}",
+            chat_id.0, path, sid
+        ));
         path
     };
 
@@ -7396,14 +11872,29 @@ async fn handle_pwd_command(
     match current_path {
         Some(path) => {
             let mut msg = format!("<code>{}</code>", path);
-            if let Some(folder_name) = std::path::Path::new(&path).file_name().and_then(|n| n.to_str()) {
+            if let Some(folder_name) = std::path::Path::new(&path)
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
                 if is_workspace_id(folder_name) {
-                    msg.push_str(&format!("\nUse /{} to switch back to this session.", folder_name));
+                    msg.push_str(&format!(
+                        "\nUse /{} to switch back to this session.",
+                        folder_name
+                    ));
                 }
             }
-            tg!("send_message", bot.send_message(chat_id, msg).parse_mode(ParseMode::Html).await)?
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, msg)
+                    .parse_mode(ParseMode::Html)
+                    .await
+            )?
         }
-        None => tg!("send_message", bot.send_message(chat_id, "No active session. Use /start <path> first.").await)?,
+        None => tg!(
+            "send_message",
+            bot.send_message(chat_id, "No active session. Use /start <path> first.")
+                .await
+        )?,
     };
 
     Ok(())
@@ -7417,8 +11908,14 @@ async fn handle_session_command(
 ) -> ResponseResult<()> {
     let (session_id, current_path, model_for_provider) = {
         let data = state.lock().await;
-        let sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
-        let path = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
+        let sid = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.session_id.clone());
+        let path = data
+            .sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone());
         let mdl = get_model(&data.settings, chat_id);
         (sid, path, mdl)
     };
@@ -7433,16 +11930,27 @@ async fn handle_session_command(
                 "opencode" => format!("opencode -s {}", id),
                 _ => format!("claude --resume {}", id),
             };
-            let provider = match session_prov { "codex" => "Codex", "gemini" => "Gemini", "opencode" => "OpenCode", _ => "Claude" };
+            let provider = match session_prov {
+                "codex" => "Codex",
+                "gemini" => "Gemini",
+                "opencode" => "OpenCode",
+                _ => "Claude",
+            };
             let msg = format!(
                 "Current {} session ID:\n<code>{}</code>\n\nTo resume this session from your terminal:\n<code>cd \"{}\"; {}</code>",
                 provider, id, path, resume_cmd
             );
-            tg!("send_message", bot.send_message(chat_id, msg).parse_mode(ParseMode::Html).await)?
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, msg)
+                    .parse_mode(ParseMode::Html)
+                    .await
+            )?
         }
-        _ => {
-            tg!("send_message", bot.send_message(chat_id, "No active session.").await)?
-        }
+        _ => tg!(
+            "send_message",
+            bot.send_message(chat_id, "No active session.").await
+        )?,
     };
 
     Ok(())
@@ -7485,15 +11993,20 @@ fn enqueue_redirect_locked(
     data.loop_feedback.remove(&chat_id);
 
     // Step 3: latest-wins push. If a previous redirect is still pending, drop it.
-    let queue = data.message_queues.entry(chat_id).or_insert_with(std::collections::VecDeque::new);
+    let queue = data
+        .message_queues
+        .entry(chat_id)
+        .or_insert_with(std::collections::VecDeque::new);
     let was_replacement = !queue.is_empty();
     queue.clear();
     let qid = generate_queue_id();
     queue.push_back(QueuedMessage {
         id: qid.clone(),
-        text,
         user_display_name,
-        pending_uploads,
+        payload: QueuedPayload::Text {
+            text,
+            pending_uploads,
+        },
     });
 
     (qid, was_replacement)
@@ -7509,7 +12022,11 @@ async fn handle_stop_command(
         let data = state.lock().await;
         data.cancel_tokens.get(&chat_id).cloned()
     };
-    msg_debug(&format!("[handle_stop] chat_id={}, has_token={}", chat_id.0, token.is_some()));
+    msg_debug(&format!(
+        "[handle_stop] chat_id={}, has_token={}",
+        chat_id.0,
+        token.is_some()
+    ));
 
     match token {
         Some(token) => {
@@ -7537,7 +12054,10 @@ async fn handle_stop_command(
 
             // Send feedback to user (after cancellation to avoid delay)
             shared_rate_limit_wait(state, chat_id).await;
-            let stop_msg = tg!("send_message", bot.send_message(chat_id, "Stopping...").await)?;
+            let stop_msg = tg!(
+                "send_message",
+                bot.send_message(chat_id, "Stopping...").await
+            )?;
 
             // Store the stop message ID only if the task is still running.
             // If cancel_token was already removed (task finished during "Stopping..." send),
@@ -7549,15 +12069,21 @@ async fn handle_stop_command(
                 } else {
                     drop(data);
                     shared_rate_limit_wait(state, chat_id).await;
-                    let _ = tg!("delete_message", bot.delete_message(chat_id, stop_msg.id).await);
+                    let _ = tg!(
+                        "delete_message",
+                        bot.delete_message(chat_id, stop_msg.id).await
+                    );
                     return Ok(());
                 }
             }
         }
         None => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "No active request to stop.")
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "No active request to stop.")
+                    .await
+            )?;
         }
     }
 
@@ -7575,7 +12101,10 @@ async fn handle_stop_command(
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
                         if v.get("chat_id").and_then(|c| c.as_str()) == Some(&chat_id_str) {
                             let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("?");
-                            msg_debug(&format!("[handle_stop] clearing pending bot message: {}", id));
+                            msg_debug(&format!(
+                                "[handle_stop] clearing pending bot message: {}",
+                                id
+                            ));
                             let _ = std::fs::remove_file(&path);
                         }
                     }
@@ -7599,25 +12128,43 @@ async fn handle_stop_queue_item(
         if let Some(q) = data.message_queues.get_mut(&chat_id) {
             if let Some(pos) = q.iter().position(|m| m.id.eq_ignore_ascii_case(queue_id)) {
                 let removed_msg = q.remove(pos);
-                msg_debug(&format!("[queue:stop_item] chat_id={}, removed id={}, text={:?}, remaining={}", chat_id.0, queue_id, removed_msg.as_ref().map(|m| truncate_str(&m.text, 60)), q.len()));
+                msg_debug(&format!(
+                    "[queue:stop_item] chat_id={}, removed id={}, text={:?}, remaining={}",
+                    chat_id.0,
+                    queue_id,
+                    removed_msg
+                        .as_ref()
+                        .map(|m| truncate_str(&m.preview_text(), 60)),
+                    q.len()
+                ));
                 // Clean up empty queue
                 if q.is_empty() {
                     data.message_queues.remove(&chat_id);
                 }
                 removed_msg.map(|m| m.id)
             } else {
-                msg_debug(&format!("[queue:stop_item] chat_id={}, id={} not found in queue", chat_id.0, queue_id));
+                msg_debug(&format!(
+                    "[queue:stop_item] chat_id={}, id={} not found in queue",
+                    chat_id.0, queue_id
+                ));
                 None
             }
         } else {
-            msg_debug(&format!("[queue:stop_item] chat_id={}, no queue exists", chat_id.0));
+            msg_debug(&format!(
+                "[queue:stop_item] chat_id={}, no queue exists",
+                chat_id.0
+            ));
             None
         }
     };
 
     if let Some(id) = removed {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, &format!("Removed queued message ({id}).")).await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, &format!("Removed queued message ({id})."))
+                .await
+        )?;
     }
     Ok(())
 }
@@ -7646,17 +12193,33 @@ async fn handle_stopall_command(
         };
         (qlen, ct, was_cancelled)
     };
-    msg_debug(&format!("[queue:stopall] chat_id={}, has_token={}, queue_cleared={}, already_cancelled={}", chat_id.0, token.is_some(), queue_len, already_cancelled));
+    msg_debug(&format!(
+        "[queue:stopall] chat_id={}, has_token={}, queue_cleared={}, already_cancelled={}",
+        chat_id.0,
+        token.is_some(),
+        queue_len,
+        already_cancelled
+    ));
 
     match token {
         Some(token) => {
             // Ignore duplicate stop if already cancelled
             if already_cancelled {
-                msg_debug(&format!("[queue:stopall] chat_id={}, duplicate cancel ignored, queue_cleared={}", chat_id.0, queue_len));
+                msg_debug(&format!(
+                    "[queue:stopall] chat_id={}, duplicate cancel ignored, queue_cleared={}",
+                    chat_id.0, queue_len
+                ));
                 // Still report queue clearance if there were queued messages
                 if queue_len > 0 {
                     shared_rate_limit_wait(state, chat_id).await;
-                    tg!("send_message", bot.send_message(chat_id, &format!("{} queued message(s) cleared.", queue_len)).await)?;
+                    tg!(
+                        "send_message",
+                        bot.send_message(
+                            chat_id,
+                            &format!("{} queued message(s) cleared.", queue_len)
+                        )
+                        .await
+                    )?;
                 }
                 return Ok(());
             }
@@ -7667,7 +12230,10 @@ async fn handle_stopall_command(
             token.cancel_now();
 
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ■ Cancel signal sent (stopall, {} queued cleared)", queue_len);
+            println!(
+                "  [{ts}] ■ Cancel signal sent (stopall, {} queued cleared)",
+                queue_len
+            );
 
             // Send feedback
             let msg_text = if queue_len > 0 {
@@ -7686,14 +12252,20 @@ async fn handle_stopall_command(
                 } else {
                     drop(data);
                     shared_rate_limit_wait(state, chat_id).await;
-                    let _ = tg!("delete_message", bot.delete_message(chat_id, stop_msg.id).await);
+                    let _ = tg!(
+                        "delete_message",
+                        bot.delete_message(chat_id, stop_msg.id).await
+                    );
                     return Ok(());
                 }
             }
         }
         None => {
             let msg_text = if queue_len > 0 {
-                format!("No active request. {} queued message(s) cleared.", queue_len)
+                format!(
+                    "No active request. {} queued message(s) cleared.",
+                    queue_len
+                )
             } else {
                 "No active request to stop.".to_string()
             };
@@ -7715,7 +12287,10 @@ async fn handle_stopall_command(
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
                         if v.get("chat_id").and_then(|c| c.as_str()) == Some(&chat_id_str) {
                             let id = v.get("id").and_then(|i| i.as_str()).unwrap_or("?");
-                            msg_debug(&format!("[handle_stopall] clearing pending bot message: {}", id));
+                            msg_debug(&format!(
+                                "[handle_stopall] clearing pending bot message: {}",
+                                id
+                            ));
                             let _ = std::fs::remove_file(&path);
                         }
                     }
@@ -7735,12 +12310,21 @@ async fn handle_down_command(
     state: &SharedState,
 ) -> ResponseResult<()> {
     let raw_file_path = text.strip_prefix("/down").unwrap_or("").trim();
-    msg_debug(&format!("[handle_down] chat_id={}, file_path={:?}", chat_id.0, raw_file_path));
+    msg_debug(&format!(
+        "[handle_down] chat_id={}, file_path={:?}",
+        chat_id.0, raw_file_path
+    ));
 
     if raw_file_path.is_empty() {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Usage: /down <filepath>\nExample: /down /home/kst/file.txt")
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                "Usage: /down <filepath>\nExample: /down /home/kst/file.txt"
+            )
+            .await
+        )?;
         return Ok(());
     }
 
@@ -7753,14 +12337,25 @@ async fn handle_down_command(
     } else {
         let current_path = {
             let data = state.lock().await;
-            data.sessions.get(&chat_id).and_then(|s| s.current_path.clone())
+            data.sessions
+                .get(&chat_id)
+                .and_then(|s| s.current_path.clone())
         };
         match current_path {
-            Some(base) => Path::new(base.trim_end_matches(['/', '\\'])).join(file_path).display().to_string(),
+            Some(base) => Path::new(base.trim_end_matches(['/', '\\']))
+                .join(file_path)
+                .display()
+                .to_string(),
             None => {
                 shared_rate_limit_wait(state, chat_id).await;
-                tg!("send_message", bot.send_message(chat_id, "No active session. Use absolute path or /start <path> first.")
-                    .await)?;
+                tg!(
+                    "send_message",
+                    bot.send_message(
+                        chat_id,
+                        "No active session. Use absolute path or /start <path> first."
+                    )
+                    .await
+                )?;
                 return Ok(());
             }
         }
@@ -7769,18 +12364,29 @@ async fn handle_down_command(
     let path = Path::new(&resolved_path);
     if !path.exists() {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, &format!("File not found: {}", resolved_path)).await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, &format!("File not found: {}", resolved_path))
+                .await
+        )?;
         return Ok(());
     }
     if !path.is_file() {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, &format!("Not a file: {}", resolved_path)).await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, &format!("Not a file: {}", resolved_path))
+                .await
+        )?;
         return Ok(());
     }
 
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_document", bot.send_document(chat_id, teloxide::types::InputFile::file(path))
-        .await)?;
+    tg!(
+        "send_document",
+        bot.send_document(chat_id, teloxide::types::InputFile::file(path))
+            .await
+    )?;
 
     Ok(())
 }
@@ -7792,31 +12398,49 @@ async fn handle_file_upload(
     msg: &Message,
     state: &SharedState,
     user_display_name: &str,
-) -> ResponseResult<()> {
-    let upload_type = if msg.animation().is_some() { "animation" }
-        else if msg.document().is_some() { "document" }
-        else if msg.photo().is_some() { "photo" }
-        else if msg.video().is_some() { "video" }
-        else if msg.voice().is_some() { "voice" }
-        else if msg.audio().is_some() { "audio" }
-        else if msg.video_note().is_some() { "video_note" }
-        else { "unknown" };
-    msg_debug(&format!("[handle_upload] chat_id={}, type={}", chat_id.0, upload_type));
+) -> ResponseResult<Option<String>> {
+    let upload_type = if msg.animation().is_some() {
+        "animation"
+    } else if msg.document().is_some() {
+        "document"
+    } else if msg.photo().is_some() {
+        "photo"
+    } else if msg.video().is_some() {
+        "video"
+    } else if msg.voice().is_some() {
+        "voice"
+    } else if msg.audio().is_some() {
+        "audio"
+    } else if msg.video_note().is_some() {
+        "video_note"
+    } else {
+        "unknown"
+    };
+    msg_debug(&format!(
+        "[handle_upload] chat_id={}, type={}",
+        chat_id.0, upload_type
+    ));
     // Get current session path
     let current_path = {
         let data = state.lock().await;
-        data.sessions.get(&chat_id).and_then(|s| s.current_path.clone())
+        data.sessions
+            .get(&chat_id)
+            .and_then(|s| s.current_path.clone())
     };
 
     let save_dir = if let Some(path) = current_path {
         path
     } else {
         // Auto-create a workspace session
-        let Some((_, path)) = auto_create_workspace_session(bot, state, chat_id, bot.token()).await else {
+        let Some((_, path)) = auto_create_workspace_session(bot, state, chat_id, bot.token()).await
+        else {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "Failed to create workspace.")
-                .await)?;
-            return Ok(());
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "Failed to create workspace.")
+                    .await
+            )?;
+            return Ok(None);
         };
         path
     };
@@ -7824,10 +12448,16 @@ async fn handle_file_upload(
     // Get file_id, file_name, and file_size
     // animation must precede document: Telegram sets both fields for GIFs
     let (file_id, file_name, file_size_hint) = if let Some(anim) = msg.animation() {
-        let name = anim.file_name.clone().unwrap_or_else(|| format!("animation_{}.mp4", anim.file.unique_id));
+        let name = anim
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("animation_{}.mp4", anim.file.unique_id));
         (anim.file.id.clone(), name, anim.file.size)
     } else if let Some(doc) = msg.document() {
-        let name = doc.file_name.clone().unwrap_or_else(|| "uploaded_file".to_string());
+        let name = doc
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "uploaded_file".to_string());
         (doc.file.id.clone(), name, doc.file.size)
     } else if let Some(photos) = msg.photo() {
         // Get the largest photo
@@ -7835,34 +12465,52 @@ async fn handle_file_upload(
             let name = format!("photo_{}.jpg", photo.file.unique_id);
             (photo.file.id.clone(), name, photo.file.size)
         } else {
-            return Ok(());
+            return Ok(None);
         }
     } else if let Some(video) = msg.video() {
-        let name = video.file_name.clone().unwrap_or_else(|| format!("video_{}.mp4", video.file.unique_id));
+        let name = video
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("video_{}.mp4", video.file.unique_id));
         (video.file.id.clone(), name, video.file.size)
     } else if let Some(voice) = msg.voice() {
         let name = format!("voice_{}.ogg", voice.file.unique_id);
         (voice.file.id.clone(), name, voice.file.size)
     } else if let Some(audio) = msg.audio() {
-        let name = audio.file_name.clone().unwrap_or_else(|| format!("audio_{}.mp3", audio.file.unique_id));
+        let name = audio
+            .file_name
+            .clone()
+            .unwrap_or_else(|| format!("audio_{}.mp3", audio.file.unique_id));
         (audio.file.id.clone(), name, audio.file.size)
     } else if let Some(vn) = msg.video_note() {
         let name = format!("videonote_{}.mp4", vn.file.unique_id);
         (vn.file.id.clone(), name, vn.file.size)
     } else {
-        return Ok(());
+        return Ok(None);
     };
-    msg_debug(&format!("[handle_upload] chat_id={}, file_name={}, file_size={}", chat_id.0, file_name, file_size_hint));
+    msg_debug(&format!(
+        "[handle_upload] chat_id={}, file_name={}, file_size={}",
+        chat_id.0, file_name, file_size_hint
+    ));
 
     // Check file size (Telegram Bot API limit: 20MB for getFile)
     const MAX_DOWNLOAD_SIZE: u32 = 20 * 1024 * 1024;
     if file_size_hint > MAX_DOWNLOAD_SIZE {
         let size_mb = file_size_hint as f64 / (1024.0 * 1024.0);
-        msg_debug(&format!("[handle_upload] chat_id={}, file rejected: size {:.1}MB exceeds 20MB limit", chat_id.0, size_mb));
+        msg_debug(&format!(
+            "[handle_upload] chat_id={}, file rejected: size {:.1}MB exceeds 20MB limit",
+            chat_id.0, size_mb
+        ));
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, &format!("File too large ({:.1}MB). Maximum size is 20MB.", size_mb))
-            .await)?;
-        return Ok(());
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                &format!("File too large ({:.1}MB). Maximum size is 20MB.", size_mb)
+            )
+            .await
+        )?;
+        return Ok(None);
     }
 
     // Download file from Telegram via HTTP
@@ -7874,7 +12522,10 @@ async fn handle_file_upload(
     };
     let token = bot.token().to_string();
     let url = format!("{}/file/bot{}/{}", base, token, file.path);
-    msg_debug(&format!("[handle_upload] download url: api_base={}, file_path={}", base, file.path));
+    msg_debug(&format!(
+        "[handle_upload] download url: api_base={}, file_path={}",
+        base, file.path
+    ));
     // Strip the bot token from any error string before showing it to the chat.
     // reqwest's Display impl can include the request URL on some error kinds
     // (redirect, parse, …), and the URL embeds `bot<TOKEN>` in plaintext.
@@ -7887,14 +12538,22 @@ async fn handle_file_upload(
             Ok(bytes) => bytes,
             Err(e) => {
                 shared_rate_limit_wait(state, chat_id).await;
-                tg!("send_message", bot.send_message(chat_id, &format!("Download failed: {}", scrub(e))).await)?;
-                return Ok(());
+                tg!(
+                    "send_message",
+                    bot.send_message(chat_id, &format!("Download failed: {}", scrub(e)))
+                        .await
+                )?;
+                return Ok(None);
             }
         },
         Err(e) => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, &format!("Download failed: {}", scrub(e))).await)?;
-            return Ok(());
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, &format!("Download failed: {}", scrub(e)))
+                    .await
+            )?;
+            return Ok(None);
         }
     };
 
@@ -7905,40 +12564,70 @@ async fn handle_file_upload(
     let mut dest = Path::new(&save_dir).join(safe_name);
     // Avoid overwriting existing files (atomic create_new to eliminate TOCTOU race)
     let file_size = buf.len();
-    let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or("uploaded_file").to_string();
-    let ext = dest.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
+    let stem = dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("uploaded_file")
+        .to_string();
+    let ext = dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e))
+        .unwrap_or_default();
     let mut counter = 0u32;
     let write_result = loop {
         use std::io::Write;
-        match fs::OpenOptions::new().write(true).create_new(true).open(&dest) {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+        {
             Ok(mut f) => break f.write_all(&buf),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 counter += 1;
                 dest = Path::new(&save_dir).join(format!("{}({}){}", stem, counter, ext));
-                msg_debug(&format!("[handle_upload] chat_id={}, file exists, renamed to: {}", chat_id.0, dest.display()));
+                msg_debug(&format!(
+                    "[handle_upload] chat_id={}, file exists, renamed to: {}",
+                    chat_id.0,
+                    dest.display()
+                ));
             }
             Err(e) => break Err(e),
         }
     };
     match write_result {
         Ok(_) => {
-            msg_debug(&format!("[handle_upload] chat_id={}, saved: {} ({} bytes)", chat_id.0, dest.display(), file_size));
+            msg_debug(&format!(
+                "[handle_upload] chat_id={}, saved: {} ({} bytes)",
+                chat_id.0,
+                dest.display(),
+                file_size
+            ));
             let msg_text = format!("Saved: {}\n({} bytes)", dest.display(), file_size);
             shared_rate_limit_wait(state, chat_id).await;
             tg!("send_message", bot.send_message(chat_id, &msg_text).await)?;
         }
         Err(e) => {
-            msg_debug(&format!("[handle_upload] chat_id={}, save failed: {}", chat_id.0, e));
+            msg_debug(&format!(
+                "[handle_upload] chat_id={}, save failed: {}",
+                chat_id.0, e
+            ));
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, &format!("Failed to save file: {}", e)).await)?;
-            return Ok(());
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, &format!("Failed to save file: {}", e))
+                    .await
+            )?;
+            return Ok(None);
         }
     }
 
     // Record upload in session history and pending queue for Claude
     let upload_record = format!(
         "[File uploaded] {} → {} ({} bytes)",
-        file_name, dest.display(), file_size
+        file_name,
+        dest.display(),
+        file_size
     );
     {
         let mut data = state.lock().await;
@@ -7955,20 +12644,27 @@ async fn handle_file_upload(
         // Write file upload to group chat shared log
         if chat_id.0 < 0 {
             let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-            let dn = if data.bot_display_name.is_empty() { None } else { Some(data.bot_display_name.clone()) };
-            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                ts: now_ts,
-                bot: data.bot_username.clone(),
-                bot_display_name: dn,
-                role: "user".to_string(),
-                from: Some(user_display_name.to_string()),
-                text: upload_record,
-                clear: false,
-            });
+            let dn = if data.bot_display_name.is_empty() {
+                None
+            } else {
+                Some(data.bot_display_name.clone())
+            };
+            append_group_chat_log(
+                chat_id.0,
+                &GroupChatLogEntry {
+                    ts: now_ts,
+                    bot: data.bot_username.clone(),
+                    bot_display_name: dn,
+                    role: "user".to_string(),
+                    from: Some(user_display_name.to_string()),
+                    text: upload_record.clone(),
+                    clear: false,
+                },
+            );
         }
     }
 
-    Ok(())
+    Ok(Some(upload_record))
 }
 
 /// Shell command output message type
@@ -7987,12 +12683,22 @@ async fn handle_shell_command(
     user_display_name: &str,
 ) -> ResponseResult<()> {
     let cmd_str = text.strip_prefix('!').unwrap_or("").trim();
-    msg_debug(&format!("[handle_shell] chat_id={}, cmd={:?}", chat_id.0, truncate_str(cmd_str, 100)));
+    msg_debug(&format!(
+        "[handle_shell] chat_id={}, cmd={:?}",
+        chat_id.0,
+        truncate_str(cmd_str, 100)
+    ));
 
     if cmd_str.is_empty() {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Usage: !<command>\nExample: !mkdir /home/kst/testcode")
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                "Usage: !<command>\nExample: !mkdir /home/kst/testcode"
+            )
+            .await
+        )?;
         return Ok(());
     }
 
@@ -8001,11 +12707,17 @@ async fn handle_shell_command(
     {
         let mut data = state.lock().await;
         if data.cancel_tokens.contains_key(&chat_id) {
-            msg_debug(&format!("[handle_shell] chat_id={}, cancel_token exists (busy), rejecting", chat_id.0));
+            msg_debug(&format!(
+                "[handle_shell] chat_id={}, cancel_token exists (busy), rejecting",
+                chat_id.0
+            ));
             drop(data);
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
+                    .await
+            )?;
             return Ok(());
         }
         insert_cancel_token_locked(&mut data, chat_id, cancel_token.clone());
@@ -8021,12 +12733,19 @@ async fn handle_shell_command(
     // Get current_path for working directory (default to home directory)
     let working_dir = {
         let data = state.lock().await;
-        data.sessions.get(&chat_id)
+        data.sessions
+            .get(&chat_id)
             .and_then(|s| s.current_path.clone())
             .unwrap_or_else(|| {
                 dirs::home_dir()
                     .map(|h| h.display().to_string())
-                    .unwrap_or_else(|| if cfg!(windows) { "C:\\".to_string() } else { "/".to_string() })
+                    .unwrap_or_else(|| {
+                        if cfg!(windows) {
+                            "C:\\".to_string()
+                        } else {
+                            "/".to_string()
+                        }
+                    })
             })
     };
 
@@ -8075,8 +12794,14 @@ async fn handle_shell_command(
         // lock is acquired and the placeholder is sent), so cleanup is just
         // state + queue processing; no child process to SIGKILL.
         if cancel_token.cancelled.load(Ordering::Relaxed) {
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=query_cancelled_during_lock", chat_id.0));
-            { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=query_cancelled_during_lock",
+                chat_id.0
+            ));
+            {
+                let mut data = state_owned.lock().await;
+                remove_cancel_token_locked(&mut data, chat_id);
+            }
             drop(group_lock);
             process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
             return;
@@ -8087,13 +12812,29 @@ async fn handle_shell_command(
         // Shell child is spawned only after the placeholder succeeds, so a
         // network error here means no child to clean up.
         shared_rate_limit_wait(&state_owned, chat_id).await;
-        let placeholder = match tg!("send_message", bot_owned.send_message(chat_id, format!("Processing <code>{}</code>", html_escape(&cmd_display_owned)))
-            .parse_mode(ParseMode::Html).await)
-        {
+        let placeholder = match tg!(
+            "send_message",
+            bot_owned
+                .send_message(
+                    chat_id,
+                    format!(
+                        "Processing <code>{}</code>",
+                        html_escape(&cmd_display_owned)
+                    )
+                )
+                .parse_mode(ParseMode::Html)
+                .await
+        ) {
             Ok(m) => m,
             Err(e) => {
-                msg_debug(&format!("[queue:trigger] chat_id={}, source=query_placeholder_error: {}", chat_id.0, e));
-                { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+                msg_debug(&format!(
+                    "[queue:trigger] chat_id={}, source=query_placeholder_error: {}",
+                    chat_id.0, e
+                ));
+                {
+                    let mut data = state_owned.lock().await;
+                    remove_cancel_token_locked(&mut data, chat_id);
+                }
                 process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
                 return;
             }
@@ -8117,7 +12858,10 @@ async fn handle_shell_command(
                 c
             };
             #[cfg(windows)]
-            let ps_command = format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {}; exit $LASTEXITCODE", cmd_owned);
+            let ps_command = format!(
+                "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {}; exit $LASTEXITCODE",
+                cmd_owned
+            );
             #[cfg(windows)]
             let mut cmd = {
                 let mut c = std::process::Command::new("powershell");
@@ -8146,14 +12890,20 @@ async fn handle_shell_command(
             // holder panicked) instead of silently dropping the PID — without
             // it stored, /stop cannot signal this child.
             {
-                let mut guard = cancel_token_clone.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = cancel_token_clone
+                    .child_pid
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 *guard = Some(child.id());
             }
             // /stop landing between `cancel_token_clone.cancelled = true` and
             // PID storage above would leave the child alive. Re-check after
             // storing so the cancel observer in this thread kills the child
             // even if /stop fired in that narrow window.
-            if cancel_token_clone.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            if cancel_token_clone
+                .cancelled
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
                 claude::kill_child_tree(&mut child);
                 let _ = child.wait();
                 return;
@@ -8177,7 +12927,10 @@ async fn handle_shell_command(
             if let Some(stdout) = child.stdout.take() {
                 use std::io::BufRead;
                 for line in std::io::BufReader::new(stdout).lines().flatten() {
-                    if cancel_token_clone.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    if cancel_token_clone
+                        .cancelled
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         claude::kill_child_tree(&mut child);
                         let _ = child.wait();
                         return;
@@ -8188,7 +12941,10 @@ async fn handle_shell_command(
 
             let stderr_output = stderr_thread.join().unwrap_or_default();
             if !stderr_output.is_empty() {
-                let _ = tx.send(ShellOutput::Line(format!("[stderr]\n{}", stderr_output.trim_end())));
+                let _ = tx.send(ShellOutput::Line(format!(
+                    "[stderr]\n{}",
+                    stderr_output.trim_end()
+                )));
             }
 
             let status = child.wait();
@@ -8197,10 +12953,18 @@ async fn handle_shell_command(
         });
 
         const SPINNER: &[&str] = &[
-            "🕐 P",           "🕑 Pr",          "🕒 Pro",
-            "🕓 Proc",        "🕔 Proce",       "🕕 Proces",
-            "🕖 Process",     "🕗 Processi",    "🕘 Processin",
-            "🕙 Processing",  "🕚 Processing.", "🕛 Processing..",
+            "🕐 P",
+            "🕑 Pr",
+            "🕒 Pro",
+            "🕓 Proc",
+            "🕔 Proce",
+            "🕕 Proces",
+            "🕖 Process",
+            "🕗 Processi",
+            "🕘 Processin",
+            "🕙 Processing",
+            "🕚 Processing.",
+            "🕛 Processing..",
         ];
         let mut full_output = String::new();
         let mut last_edit_text = String::new();
@@ -8219,14 +12983,18 @@ async fn handle_shell_command(
         while !done || !queue_done {
             // Check cancel
             if cancel_token.cancelled.load(Ordering::Relaxed) {
-                if !done { cancelled = true; }
+                if !done {
+                    cancelled = true;
+                }
                 break;
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(polling_time_ms)).await;
 
             if cancel_token.cancelled.load(Ordering::Relaxed) {
-                if !done { cancelled = true; }
+                if !done {
+                    cancelled = true;
+                }
                 break;
             }
 
@@ -8263,16 +13031,32 @@ async fn handle_shell_command(
                     let indicator = SPINNER[spin_idx % SPINNER.len()];
                     spin_idx += 1;
 
-                    let display_text = format!("Processing <code>{}</code>\n\n{}", html_escape(&cmd_display_owned), indicator);
+                    let display_text = format!(
+                        "Processing <code>{}</code>\n\n{}",
+                        html_escape(&cmd_display_owned),
+                        indicator
+                    );
 
                     if display_text != last_edit_text {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("edit_message", &state_owned, chat_id, bot_owned.edit_message_text(chat_id, placeholder_msg_id, &display_text)
-                            .parse_mode(ParseMode::Html).await);
+                        let _ = tg!(
+                            "edit_message",
+                            &state_owned,
+                            chat_id,
+                            bot_owned
+                                .edit_message_text(chat_id, placeholder_msg_id, &display_text)
+                                .parse_mode(ParseMode::Html)
+                                .await
+                        );
                         last_edit_text = display_text;
                     } else {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("send_chat_action", bot_owned.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await);
+                        let _ = tg!(
+                            "send_chat_action",
+                            bot_owned
+                                .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                                .await
+                        );
                     }
                 }
             }
@@ -8284,7 +13068,12 @@ async fn handle_shell_command(
                 if let Some(err) = &spawn_error {
                     // Spawn error - just show error message
                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, err).await);
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(chat_id, placeholder_msg_id, err)
+                            .await
+                    );
                 } else {
                     // Only show exit code when non-zero
                     let exit_suffix = if exit_code != 0 {
@@ -8299,25 +13088,51 @@ async fn handle_shell_command(
 
                         if content_bytes <= 4000 {
                             // Short output: update placeholder with completion + result in one call
-                            let combined = format!("Done <code>{}</code>{}\n\n<pre>$ {}\n\n{}</pre>",
-                                html_escape(&cmd_display_owned), exit_suffix,
-                                html_escape(&cmd_display_owned), html_escape(full_output.trim()));
+                            let combined = format!(
+                                "Done <code>{}</code>{}\n\n<pre>$ {}\n\n{}</pre>",
+                                html_escape(&cmd_display_owned),
+                                exit_suffix,
+                                html_escape(&cmd_display_owned),
+                                html_escape(full_output.trim())
+                            );
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            if let Err(_) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &combined)
-                                .parse_mode(ParseMode::Html)
-                                .await)
-                            {
-                                let fallback = format!("Done {}{}\n\n$ {}\n\n{}",
-                                    cmd_display_owned, exit_suffix, cmd_display_owned, full_output.trim());
+                            if let Err(_) = tg!(
+                                "edit_message",
+                                bot_owned
+                                    .edit_message_text(chat_id, placeholder_msg_id, &combined)
+                                    .parse_mode(ParseMode::Html)
+                                    .await
+                            ) {
+                                let fallback = format!(
+                                    "Done {}{}\n\n$ {}\n\n{}",
+                                    cmd_display_owned,
+                                    exit_suffix,
+                                    cmd_display_owned,
+                                    full_output.trim()
+                                );
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &fallback).await);
+                                let _ = tg!(
+                                    "edit_message",
+                                    bot_owned
+                                        .edit_message_text(chat_id, placeholder_msg_id, &fallback)
+                                        .await
+                                );
                             }
                         } else {
                             // Long output: update placeholder + send as .txt file
-                            let final_msg = format!("Done <code>{}</code>{}", html_escape(&cmd_display_owned), exit_suffix);
+                            let final_msg = format!(
+                                "Done <code>{}</code>{}",
+                                html_escape(&cmd_display_owned),
+                                exit_suffix
+                            );
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &final_msg)
-                                .parse_mode(ParseMode::Html).await);
+                            let _ = tg!(
+                                "edit_message",
+                                bot_owned
+                                    .edit_message_text(chat_id, placeholder_msg_id, &final_msg)
+                                    .parse_mode(ParseMode::Html)
+                                    .await
+                            );
 
                             let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
                             if let Some(home) = dirs::home_dir() {
@@ -8325,23 +13140,40 @@ async fn handle_shell_command(
                                 let _ = std::fs::create_dir_all(&tmp_dir);
                                 let tmp_path = tmp_dir
                                     .join(format!("cokacdir_shell_{}_{}.txt", chat_id.0, timestamp))
-                                    .display().to_string();
+                                    .display()
+                                    .to_string();
                                 if std::fs::write(&tmp_path, &file_content).is_ok() {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("send_document", bot_owned.send_document(
-                                        chat_id,
-                                        teloxide::types::InputFile::file(std::path::Path::new(&tmp_path)),
-                                    ).await);
+                                    let _ = tg!(
+                                        "send_document",
+                                        bot_owned
+                                            .send_document(
+                                                chat_id,
+                                                teloxide::types::InputFile::file(
+                                                    std::path::Path::new(&tmp_path)
+                                                ),
+                                            )
+                                            .await
+                                    );
                                     let _ = std::fs::remove_file(&tmp_path);
                                 }
                             }
                         }
                     } else {
                         // No output
-                        let final_msg = format!("Done <code>{}</code>{}", html_escape(&cmd_display_owned), exit_suffix);
+                        let final_msg = format!(
+                            "Done <code>{}</code>{}",
+                            html_escape(&cmd_display_owned),
+                            exit_suffix
+                        );
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &final_msg)
-                            .parse_mode(ParseMode::Html).await);
+                        let _ = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(chat_id, placeholder_msg_id, &final_msg)
+                                .parse_mode(ParseMode::Html)
+                                .await
+                        );
                     }
                 }
 
@@ -8351,30 +13183,40 @@ async fn handle_shell_command(
                 // Write shell command to group chat shared log
                 if chat_id.0 < 0 {
                     let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                    let dn = if shell_bot_display_name.is_empty() { None } else { Some(shell_bot_display_name.clone()) };
-                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                        ts: now_ts.clone(),
-                        bot: shell_bot_username.clone(),
-                        bot_display_name: dn.clone(),
-                        role: "user".to_string(),
-                        from: Some(shell_user_display_name.clone()),
-                        text: format!("!{}", cmd_display_owned),
-                        clear: false,
-                    });
+                    let dn = if shell_bot_display_name.is_empty() {
+                        None
+                    } else {
+                        Some(shell_bot_display_name.clone())
+                    };
+                    append_group_chat_log(
+                        chat_id.0,
+                        &GroupChatLogEntry {
+                            ts: now_ts.clone(),
+                            bot: shell_bot_username.clone(),
+                            bot_display_name: dn.clone(),
+                            role: "user".to_string(),
+                            from: Some(shell_user_display_name.clone()),
+                            text: format!("!{}", cmd_display_owned),
+                            clear: false,
+                        },
+                    );
                     let output_summary = if full_output.trim().is_empty() {
                         format!("(exit code: {})", exit_code)
                     } else {
                         format!("exit code: {}\n{}", exit_code, full_output.trim())
                     };
-                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                        ts: now_ts,
-                        bot: shell_bot_username.clone(),
-                        bot_display_name: dn,
-                        role: "assistant".to_string(),
-                        from: None,
-                        text: output_summary,
-                        clear: false,
-                    });
+                    append_group_chat_log(
+                        chat_id.0,
+                        &GroupChatLogEntry {
+                            ts: now_ts,
+                            bot: shell_bot_username.clone(),
+                            bot_display_name: dn,
+                            role: "assistant".to_string(),
+                            from: None,
+                            text: output_summary,
+                            clear: false,
+                        },
+                    );
                 }
 
                 // Send end hook message if configured
@@ -8385,7 +13227,10 @@ async fn handle_shell_command(
                     };
                     if let Some(hook_msg) = end_hook_msg {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("send_message", bot_owned.send_message(chat_id, &hook_msg).await);
+                        let _ = tg!(
+                            "send_message",
+                            bot_owned.send_message(chat_id, &hook_msg).await
+                        );
                     }
                 }
             }
@@ -8404,7 +13249,12 @@ async fn handle_shell_command(
             cancel_token.cancel_now();
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
-            let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, "[Stopped]").await);
+            let _ = tg!(
+                "edit_message",
+                bot_owned
+                    .edit_message_text(chat_id, placeholder_msg_id, "[Stopped]")
+                    .await
+            );
 
             let stop_msg_id = {
                 let data = state_owned.lock().await;
@@ -8412,7 +13262,10 @@ async fn handle_shell_command(
             };
             if let Some(msg_id) = stop_msg_id {
                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+                let _ = tg!(
+                    "delete_message",
+                    bot_owned.delete_message(chat_id, msg_id).await
+                );
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -8421,26 +13274,36 @@ async fn handle_shell_command(
             // Write stopped shell command to group chat shared log
             if chat_id.0 < 0 {
                 let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                let dn = if shell_bot_display_name.is_empty() { None } else { Some(shell_bot_display_name.clone()) };
-                append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                    ts: now_ts.clone(),
-                    bot: shell_bot_username.clone(),
-                    bot_display_name: dn.clone(),
-                    role: "user".to_string(),
-                    from: Some(shell_user_display_name.clone()),
-                    text: format!("!{} [Stopped]", cmd_display_owned),
-                    clear: false,
-                });
-                if !full_output.trim().is_empty() {
-                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                        ts: now_ts,
+                let dn = if shell_bot_display_name.is_empty() {
+                    None
+                } else {
+                    Some(shell_bot_display_name.clone())
+                };
+                append_group_chat_log(
+                    chat_id.0,
+                    &GroupChatLogEntry {
+                        ts: now_ts.clone(),
                         bot: shell_bot_username.clone(),
-                        bot_display_name: dn,
-                        role: "assistant".to_string(),
-                        from: None,
-                        text: format!("[Stopped] exit code: -1\n{}", full_output.trim()),
+                        bot_display_name: dn.clone(),
+                        role: "user".to_string(),
+                        from: Some(shell_user_display_name.clone()),
+                        text: format!("!{} [Stopped]", cmd_display_owned),
                         clear: false,
-                    });
+                    },
+                );
+                if !full_output.trim().is_empty() {
+                    append_group_chat_log(
+                        chat_id.0,
+                        &GroupChatLogEntry {
+                            ts: now_ts,
+                            bot: shell_bot_username.clone(),
+                            bot_display_name: dn,
+                            role: "assistant".to_string(),
+                            from: None,
+                            text: format!("[Stopped] exit code: -1\n{}", full_output.trim()),
+                            clear: false,
+                        },
+                    );
                 }
             }
 
@@ -8448,7 +13311,10 @@ async fn handle_shell_command(
             remove_cancel_token_locked(&mut data, chat_id);
             data.stop_message_ids.remove(&chat_id);
             drop(data);
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=query_poll_cancelled", chat_id.0));
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=query_poll_cancelled",
+                chat_id.0
+            ));
             drop(_group_lock); // release group chat lock before processing queue
             process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
             return;
@@ -8460,7 +13326,10 @@ async fn handle_shell_command(
             if let Some(msg_id) = data.stop_message_ids.remove(&chat_id) {
                 drop(data);
                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+                let _ = tg!(
+                    "delete_message",
+                    bot_owned.delete_message(chat_id, msg_id).await
+                );
             }
         }
 
@@ -8469,7 +13338,10 @@ async fn handle_shell_command(
             let mut data = state_owned.lock().await;
             remove_cancel_token_locked(&mut data, chat_id);
         }
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=query_poll_completed", chat_id.0));
+        msg_debug(&format!(
+            "[queue:trigger] chat_id={}, source=query_poll_completed",
+            chat_id.0
+        ));
         drop(_group_lock); // release group chat lock before processing queue
         process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
     });
@@ -8512,12 +13384,25 @@ async fn handle_availabletools_command(
     for &(name, desc, destructive) in ALL_TOOLS {
         let badge = risk_badge(destructive);
         if badge.is_empty() {
-            msg.push_str(&format!("<code>{}</code> — {}\n", html_escape(name), html_escape(desc)));
+            msg.push_str(&format!(
+                "<code>{}</code> — {}\n",
+                html_escape(name),
+                html_escape(desc)
+            ));
         } else {
-            msg.push_str(&format!("<code>{}</code> {} — {}\n", html_escape(name), badge, html_escape(desc)));
+            msg.push_str(&format!(
+                "<code>{}</code> {} — {}\n",
+                html_escape(name),
+                badge,
+                html_escape(desc)
+            ));
         }
     }
-    msg.push_str(&format!("\n{} = destructive\nTotal: {}", risk_badge(true), ALL_TOOLS.len()));
+    msg.push_str(&format!(
+        "\n{} = destructive\nTotal: {}",
+        risk_badge(true),
+        ALL_TOOLS.len()
+    ));
 
     send_long_message(bot, chat_id, &msg, Some(ParseMode::Html), state).await?;
 
@@ -8540,17 +13425,33 @@ async fn handle_allowedtools_command(
         let (desc, destructive) = tool_info(tool);
         let badge = risk_badge(destructive);
         if badge.is_empty() {
-            msg.push_str(&format!("<code>{}</code> — {}\n", html_escape(tool), html_escape(desc)));
+            msg.push_str(&format!(
+                "<code>{}</code> — {}\n",
+                html_escape(tool),
+                html_escape(desc)
+            ));
         } else {
-            msg.push_str(&format!("<code>{}</code> {} — {}\n", html_escape(tool), badge, html_escape(desc)));
+            msg.push_str(&format!(
+                "<code>{}</code> {} — {}\n",
+                html_escape(tool),
+                badge,
+                html_escape(desc)
+            ));
         }
     }
-    msg.push_str(&format!("\n{} = destructive\nTotal: {}", risk_badge(true), tools.len()));
+    msg.push_str(&format!(
+        "\n{} = destructive\nTotal: {}",
+        risk_badge(true),
+        tools.len()
+    ));
 
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, &msg)
-        .parse_mode(ParseMode::Html)
-        .await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, &msg)
+            .parse_mode(ParseMode::Html)
+            .await
+    )?;
 
     Ok(())
 }
@@ -8570,8 +13471,17 @@ async fn handle_setpollingtime_command(
             data.polling_time_ms
         };
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, format!("Current polling time: {}ms\nUsage: /setpollingtime <ms>\nMinimum: 2500ms", current))
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                format!(
+                    "Current polling time: {}ms\nUsage: /setpollingtime <ms>\nMinimum: 2500ms",
+                    current
+                )
+            )
+            .await
+        )?;
         return Ok(());
     }
 
@@ -8579,16 +13489,25 @@ async fn handle_setpollingtime_command(
         Ok(v) => v,
         Err(_) => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "Invalid number. Usage: /setpollingtime <ms>\nExample: /setpollingtime 3000")
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    "Invalid number. Usage: /setpollingtime <ms>\nExample: /setpollingtime 3000"
+                )
+                .await
+            )?;
             return Ok(());
         }
     };
 
     if value < 2500 {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Minimum polling time is 2500ms.")
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, "Minimum polling time is 2500ms.")
+                .await
+        )?;
         return Ok(());
     }
 
@@ -8605,8 +13524,11 @@ async fn handle_setpollingtime_command(
     }
 
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, format!("✅ Polling time set to {}ms", value))
-        .await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, format!("✅ Polling time set to {}ms", value))
+            .await
+    )?;
 
     Ok(())
 }
@@ -8618,8 +13540,11 @@ async fn handle_greeting_command(
     state: &SharedState,
 ) -> ResponseResult<()> {
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, "Startup greeting is disabled.")
-        .await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, "Startup greeting is disabled.")
+            .await
+    )?;
     Ok(())
 }
 
@@ -8635,7 +13560,10 @@ async fn handle_debug_command(
         data.settings.debug
     };
     let next = !prev;
-    msg_debug(&format!("[handle_debug] chat_id={}, {} → {}", chat_id.0, prev, next));
+    msg_debug(&format!(
+        "[handle_debug] chat_id={}, {} → {}",
+        chat_id.0, prev, next
+    ));
     {
         let mut data = state.lock().await;
         data.settings.debug = next;
@@ -8649,8 +13577,11 @@ async fn handle_debug_command(
         ""
     };
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, format!("🔍 Debug logging: {status}{note}"))
-        .await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, format!("🔍 Debug logging: {status}{note}"))
+            .await
+    )?;
     Ok(())
 }
 
@@ -8663,33 +13594,62 @@ async fn handle_direct_command(
     token: &str,
     is_owner: bool,
 ) -> ResponseResult<()> {
-    msg_debug(&format!("[handle_direct] chat_id={}, is_owner={}", chat_id.0, is_owner));
+    msg_debug(&format!(
+        "[handle_direct] chat_id={}, is_owner={}",
+        chat_id.0, is_owner
+    ));
     let is_actually_group = matches!(msg.chat.kind, teloxide::types::ChatKind::Public(_));
-    msg_debug(&format!("[handle_direct] is_actually_group={}", is_actually_group));
+    msg_debug(&format!(
+        "[handle_direct] is_actually_group={}",
+        is_actually_group
+    ));
     if !is_actually_group {
         msg_debug("[handle_direct] rejected: not a group chat");
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "This command is only available in group chats.").await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, "This command is only available in group chats.")
+                .await
+        )?;
         return Ok(());
     }
     if !is_owner {
         msg_debug("[handle_direct] rejected: not owner");
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Only the bot owner can change direct mode.").await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, "Only the bot owner can change direct mode.")
+                .await
+        )?;
         return Ok(());
     }
     let next = {
         let mut data = state.lock().await;
         let key = chat_id.0.to_string();
-        let prev = data.settings.direct.get(&key).copied().unwrap_or(DIRECT_MODE_DEFAULT);
+        let prev = data
+            .settings
+            .direct
+            .get(&key)
+            .copied()
+            .unwrap_or(DIRECT_MODE_DEFAULT);
         let next = !prev;
-        msg_debug(&format!("[handle_direct] chat_id={}, {} → {}", chat_id.0, prev, next));
+        msg_debug(&format!(
+            "[handle_direct] chat_id={}, {} → {}",
+            chat_id.0, prev, next
+        ));
         data.settings.direct.insert(key, next);
         save_bot_settings(token, &data.settings);
-        msg_debug(&format!("[handle_direct] saved to bot_settings, next={}", next));
+        msg_debug(&format!(
+            "[handle_direct] saved to bot_settings, next={}",
+            next
+        ));
         next
     };
-    let status = if next { "Direct mode: ON (no ; prefix needed)" } else { "Direct mode: OFF (; prefix required)" };
+    let status = if next {
+        "Direct mode: ON (no ; prefix needed)"
+    } else {
+        "Direct mode: OFF (; prefix required)"
+    };
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, status).await)?;
     Ok(())
@@ -8706,7 +13666,11 @@ async fn handle_contextlevel_command(
 ) -> ResponseResult<()> {
     if !is_group_chat {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "This command is only available in group chats.").await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, "This command is only available in group chats.")
+                .await
+        )?;
         return Ok(());
     }
 
@@ -8719,12 +13683,20 @@ async fn handle_contextlevel_command(
             data.settings.context.get(&key).copied().unwrap_or(12)
         };
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, format!(
-            "Group chat log context: <b>{}</b> entries\n\n\
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                format!(
+                    "Group chat log context: <b>{}</b> entries\n\n\
              <code>/contextlevel &lt;N&gt;</code> — Set count (0 to disable)\n\
              Default: 12",
-            current
-        )).parse_mode(teloxide::types::ParseMode::Html).await)?;
+                    current
+                )
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await
+        )?;
         return Ok(());
     }
 
@@ -8750,7 +13722,12 @@ async fn handle_contextlevel_command(
         format!("Group chat log context: <b>{}</b> entries", n)
     };
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, msg).parse_mode(teloxide::types::ParseMode::Html).await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, msg)
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .await
+    )?;
     Ok(())
 }
 
@@ -8764,15 +13741,26 @@ async fn handle_instruction_command(
 ) -> ResponseResult<()> {
     let body = text.strip_prefix("/instruction").unwrap_or("").trim();
     let key = chat_id.0.to_string();
-    msg_debug(&format!("[handle_instruction] chat_id={}, body_len={}, body_empty={}", chat_id.0, body.len(), body.is_empty()));
+    msg_debug(&format!(
+        "[handle_instruction] chat_id={}, body_len={}, body_empty={}",
+        chat_id.0,
+        body.len(),
+        body.is_empty()
+    ));
     if body.is_empty() {
         // Show current instruction
         let data = state.lock().await;
         let current = data.settings.instructions.get(&key);
-        msg_debug(&format!("[handle_instruction] view mode: has_instruction={}", current.is_some()));
+        msg_debug(&format!(
+            "[handle_instruction] view mode: has_instruction={}",
+            current.is_some()
+        ));
         let msg = match current {
             Some(instr) => {
-                msg_debug(&format!("[handle_instruction] current instruction len={}", instr.len()));
+                msg_debug(&format!(
+                    "[handle_instruction] current instruction len={}",
+                    instr.len()
+                ));
                 format!("Current instruction:\n{}", instr)
             }
             None => "No instruction set.\nUsage: /instruction <text>".to_string(),
@@ -8783,8 +13771,12 @@ async fn handle_instruction_command(
     } else {
         // Set instruction
         let instr = body.to_string();
-        msg_debug(&format!("[handle_instruction] set mode: chat_id={}, instruction_len={}, text={:?}",
-            chat_id.0, instr.len(), truncate_str(&instr, 100)));
+        msg_debug(&format!(
+            "[handle_instruction] set mode: chat_id={}, instruction_len={}, text={:?}",
+            chat_id.0,
+            instr.len(),
+            truncate_str(&instr, 100)
+        ));
         {
             let mut data = state.lock().await;
             data.settings.instructions.insert(key, instr.clone());
@@ -8792,7 +13784,11 @@ async fn handle_instruction_command(
             msg_debug("[handle_instruction] saved to bot_settings");
         }
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, format!("Instruction set:\n{}", instr)).await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, format!("Instruction set:\n{}", instr))
+                .await
+        )?;
     }
     Ok(())
 }
@@ -8809,13 +13805,19 @@ async fn handle_instruction_clear_command(
     {
         let mut data = state.lock().await;
         let had_instruction = data.settings.instructions.contains_key(&key);
-        msg_debug(&format!("[handle_instruction_clear] had_instruction={}", had_instruction));
+        msg_debug(&format!(
+            "[handle_instruction_clear] had_instruction={}",
+            had_instruction
+        ));
         data.settings.instructions.remove(&key);
         save_bot_settings(token, &data.settings);
         msg_debug("[handle_instruction_clear] saved to bot_settings");
     }
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, "Instruction cleared.").await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, "Instruction cleared.").await
+    )?;
     Ok(())
 }
 
@@ -8848,7 +13850,11 @@ async fn handle_setendhook_command(
             save_bot_settings(token, &data.settings);
         }
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, format!("End hook set:\n{}", hook)).await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, format!("End hook set:\n{}", hook))
+                .await
+        )?;
     }
     Ok(())
 }
@@ -8867,7 +13873,10 @@ async fn handle_setendhook_clear_command(
         save_bot_settings(token, &data.settings);
     }
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, "End hook cleared.").await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, "End hook cleared.").await
+    )?;
     Ok(())
 }
 
@@ -8881,13 +13890,22 @@ async fn handle_silent_command(
     let next = {
         let mut data = state.lock().await;
         let key = chat_id.0.to_string();
-        let prev = data.settings.silent.get(&key).copied().unwrap_or(SILENT_MODE_DEFAULT);
+        let prev = data
+            .settings
+            .silent
+            .get(&key)
+            .copied()
+            .unwrap_or(SILENT_MODE_DEFAULT);
         let next = !prev;
         data.settings.silent.insert(key, next);
         save_bot_settings(token, &data.settings);
         next
     };
-    let status = if next { "🔇 Silent mode: ON" } else { "🔊 Silent mode: OFF" };
+    let status = if next {
+        "🔇 Silent mode: ON"
+    } else {
+        "🔊 Silent mode: OFF"
+    };
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, status).await)?;
     Ok(())
@@ -8909,7 +13927,11 @@ async fn handle_usechrome_command(
         save_bot_settings(token, &data.settings);
         next
     };
-    let status = if next { "🌐 Chrome mode: ON (--chrome)" } else { "🌐 Chrome mode: OFF" };
+    let status = if next {
+        "🌐 Chrome mode: ON (--chrome)"
+    } else {
+        "🌐 Chrome mode: OFF"
+    };
     shared_rate_limit_wait(state, chat_id).await;
     tg!("send_message", bot.send_message(chat_id, status).await)?;
     Ok(())
@@ -8927,7 +13949,12 @@ async fn handle_queue_command(
     let (next, queue_len) = {
         let mut data = state.lock().await;
         let key = chat_id.0.to_string();
-        let prev = data.settings.queue.get(&key).copied().unwrap_or(QUEUE_MODE_DEFAULT);
+        let prev = data
+            .settings
+            .queue
+            .get(&key)
+            .copied()
+            .unwrap_or(QUEUE_MODE_DEFAULT);
         let next = !prev;
         data.settings.queue.insert(key, next);
         save_bot_settings(token, &data.settings);
@@ -8935,7 +13962,10 @@ async fn handle_queue_command(
         let queue_len = if !next {
             let q = data.message_queues.remove(&chat_id);
             let cleared = q.as_ref().map(|q| q.len()).unwrap_or(0);
-            msg_debug(&format!("[queue:toggle] chat_id={}, OFF, cleared {} queued messages", chat_id.0, cleared));
+            msg_debug(&format!(
+                "[queue:toggle] chat_id={}, OFF, cleared {} queued messages",
+                chat_id.0, cleared
+            ));
             cleared
         } else {
             msg_debug(&format!("[queue:toggle] chat_id={}, ON", chat_id.0));
@@ -8944,9 +13974,13 @@ async fn handle_queue_command(
         (next, queue_len)
     };
     let status = if next {
-        "📋 Queue mode: ON\nMessages sent while AI is busy will be queued and processed in order.".to_string()
+        "📋 Queue mode: ON\nMessages sent while AI is busy will be queued and processed in order."
+            .to_string()
     } else if queue_len > 0 {
-        format!("📋 Queue mode: OFF\n{} queued message(s) cleared.", queue_len)
+        format!(
+            "📋 Queue mode: OFF\n{} queued message(s) cleared.",
+            queue_len
+        )
     } else {
         "📋 Queue mode: OFF".to_string()
     };
@@ -8967,7 +14001,10 @@ async fn handle_allowed_command(
     token: &str,
 ) -> ResponseResult<()> {
     let arg = text.strip_prefix("/allowed").unwrap_or("").trim();
-    msg_debug(&format!("[handle_allowed] chat_id={}, arg={:?}", chat_id.0, arg));
+    msg_debug(&format!(
+        "[handle_allowed] chat_id={}, arg={:?}",
+        chat_id.0, arg
+    ));
 
     if arg.is_empty() {
         shared_rate_limit_wait(state, chat_id).await;
@@ -9000,8 +14037,14 @@ async fn handle_allowed_command(
 
     if operations.is_empty() {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Use +toolname to add or -toolname to remove.\nExample: /allowed +Bash -Edit")
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                "Use +toolname to add or -toolname to remove.\nExample: /allowed +Bash -Edit"
+            )
+            .await
+        )?;
         return Ok(());
     }
 
@@ -9010,8 +14053,13 @@ async fn handle_allowed_command(
         let chat_key = chat_id.0.to_string();
         // Ensure this chat has its own tool list (initialize from defaults if missing)
         if !data.settings.allowed_tools.contains_key(&chat_key) {
-            let defaults: Vec<String> = DEFAULT_ALLOWED_TOOLS.iter().map(|s| s.to_string()).collect();
-            data.settings.allowed_tools.insert(chat_key.clone(), defaults);
+            let defaults: Vec<String> = DEFAULT_ALLOWED_TOOLS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            data.settings
+                .allowed_tools
+                .insert(chat_key.clone(), defaults);
         }
         let tools = data.settings.allowed_tools.get_mut(&chat_key).unwrap();
         let mut results: Vec<String> = Vec::new();
@@ -9020,7 +14068,10 @@ async fn handle_allowed_command(
             match op {
                 '+' => {
                     if tools.iter().any(|t| t == tool_name) {
-                        results.push(format!("<code>{}</code> already in list", html_escape(tool_name)));
+                        results.push(format!(
+                            "<code>{}</code> already in list",
+                            html_escape(tool_name)
+                        ));
                     } else {
                         tools.push(tool_name.clone());
                         changed = true;
@@ -9034,7 +14085,10 @@ async fn handle_allowed_command(
                         changed = true;
                         results.push(format!("<code>{}</code> disabled", html_escape(tool_name)));
                     } else {
-                        results.push(format!("<code>{}</code> not in list", html_escape(tool_name)));
+                        results.push(format!(
+                            "<code>{}</code> not in list",
+                            html_escape(tool_name)
+                        ));
                     }
                 }
                 _ => unreachable!(),
@@ -9047,9 +14101,12 @@ async fn handle_allowed_command(
     };
 
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, &response_msg)
-        .parse_mode(ParseMode::Html)
-        .await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, &response_msg)
+            .parse_mode(ParseMode::Html)
+            .await
+    )?;
 
     Ok(())
 }
@@ -9066,19 +14123,32 @@ async fn handle_public_command(
 ) -> ResponseResult<()> {
     if !is_group_chat {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "This command is only available in group chats.")
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, "This command is only available in group chats.")
+                .await
+        )?;
         return Ok(());
     }
 
     if !is_owner {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, "Only the bot owner can change public access settings.")
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                "Only the bot owner can change public access settings."
+            )
+            .await
+        )?;
         return Ok(());
     }
 
-    let arg = text.strip_prefix("/public").unwrap_or("").trim().to_lowercase();
+    let arg = text
+        .strip_prefix("/public")
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
     let chat_key = chat_id.0.to_string();
 
     let response_msg = match arg.as_str() {
@@ -9111,9 +14181,12 @@ async fn handle_public_command(
     };
 
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, &response_msg)
-        .parse_mode(ParseMode::Html)
-        .await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, &response_msg)
+            .parse_mode(ParseMode::Html)
+            .await
+    )?;
 
     Ok(())
 }
@@ -9149,7 +14222,7 @@ fn resolve_model_name(name: &str) -> Result<String, &'static str> {
             Err("opencode")
         }
     } else {
-        Err("")  // invalid format
+        Err("") // invalid format
     }
 }
 
@@ -9166,7 +14239,10 @@ async fn handle_effort_command(
     token: &str,
 ) -> ResponseResult<()> {
     let arg = command_args(text).to_lowercase();
-    msg_debug(&format!("[handle_effort_command] chat_id={}, arg={:?}", chat_id.0, arg));
+    msg_debug(&format!(
+        "[handle_effort_command] chat_id={}, arg={:?}",
+        chat_id.0, arg
+    ));
     let current_model = {
         let data = state.lock().await;
         get_model(&data.settings, chat_id)
@@ -9185,14 +14261,22 @@ async fn handle_effort_command(
         };
         let mut msg = if provider == "claude" || provider == "codex" {
             match &current {
-                Some(v) => format!("Current {} effort: <b>{}</b>\n", provider_label, html_escape(v)),
+                Some(v) => format!(
+                    "Current {} effort: <b>{}</b>\n",
+                    provider_label,
+                    html_escape(v)
+                ),
                 None => format!("Current {} effort: <b>default</b>\n", provider_label),
             }
         } else {
             format!("Effort is supported only for Claude and Codex.\nCurrent model provider: <b>{}</b>\n", html_escape(provider_label))
         };
         if provider == "claude" || provider == "codex" {
-            msg.push_str(&format!("\nAccepted for {}: <code>{}</code>\n", provider_label, valid_effort_values(provider)));
+            msg.push_str(&format!(
+                "\nAccepted for {}: <code>{}</code>\n",
+                provider_label,
+                valid_effort_values(provider)
+            ));
         }
         msg.push_str("\n<b>Usage:</b>\n");
         msg.push_str("<code>/effort low</code>, <code>/effort medium</code>, <code>/effort high</code>, <code>/effort xhigh</code>\n");
@@ -9200,18 +14284,28 @@ async fn handle_effort_command(
         msg.push_str("<code>/effort minimal</code> — Codex only\n");
         msg.push_str("<code>/effort reset</code> — clear current provider override\n");
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(chat_id, msg)
-            .parse_mode(ParseMode::Html)
-            .await)?;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, msg)
+                .parse_mode(ParseMode::Html)
+                .await
+        )?;
         return Ok(());
     }
 
     if provider != "claude" && provider != "codex" {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(
-            chat_id,
-            format!("/effort is supported only for Claude and Codex. Current provider: {}.", provider_label),
-        ).await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                format!(
+                    "/effort is supported only for Claude and Codex. Current provider: {}.",
+                    provider_label
+                ),
+            )
+            .await
+        )?;
         return Ok(());
     }
 
@@ -9228,7 +14322,10 @@ async fn handle_effort_command(
             r
         };
         let msg = if removed {
-            format!("{} effort cleared — provider default will be used.", provider_label)
+            format!(
+                "{} effort cleared — provider default will be used.",
+                provider_label
+            )
         } else {
             format!("{} effort was not set.", provider_label)
         };
@@ -9239,10 +14336,19 @@ async fn handle_effort_command(
 
     if !is_valid_effort_for_provider(provider, &arg) {
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(
-            chat_id,
-            format!("Invalid {} effort value: '{}'. Accepted: {}, reset.", provider_label, arg, valid_effort_values(provider)),
-        ).await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                format!(
+                    "Invalid {} effort value: '{}'. Accepted: {}, reset.",
+                    provider_label,
+                    arg,
+                    valid_effort_values(provider)
+                ),
+            )
+            .await
+        )?;
         return Ok(());
     }
 
@@ -9250,8 +14356,12 @@ async fn handle_effort_command(
         let mut data = state.lock().await;
         let key = chat_id.0.to_string();
         match provider {
-            "claude" => { data.settings.claude_effort.insert(key, arg.clone()); }
-            "codex" => { data.settings.effort.insert(key, arg.clone()); }
+            "claude" => {
+                data.settings.claude_effort.insert(key, arg.clone());
+            }
+            "codex" => {
+                data.settings.effort.insert(key, arg.clone());
+            }
             _ => {}
         }
         save_bot_settings(token, &data.settings);
@@ -9259,9 +14369,12 @@ async fn handle_effort_command(
     let arg_escaped = html_escape(&arg);
     let msg = format!("{} effort set to <b>{}</b>.", provider_label, arg_escaped);
     shared_rate_limit_wait(state, chat_id).await;
-    tg!("send_message", bot.send_message(chat_id, msg)
-        .parse_mode(ParseMode::Html)
-        .await)?;
+    tg!(
+        "send_message",
+        bot.send_message(chat_id, msg)
+            .parse_mode(ParseMode::Html)
+            .await
+    )?;
     Ok(())
 }
 
@@ -9274,7 +14387,10 @@ async fn handle_fast_command(
     token: &str,
 ) -> ResponseResult<()> {
     let arg = command_args(text).to_lowercase();
-    msg_debug(&format!("[handle_fast_command] chat_id={}, arg={:?}", chat_id.0, arg));
+    msg_debug(&format!(
+        "[handle_fast_command] chat_id={}, arg={:?}",
+        chat_id.0, arg
+    ));
     let current_model = {
         let data = state.lock().await;
         get_model(&data.settings, chat_id)
@@ -9288,10 +14404,17 @@ async fn handle_fast_command(
             _ => provider,
         };
         shared_rate_limit_wait(state, chat_id).await;
-        tg!("send_message", bot.send_message(
-            chat_id,
-            format!("/fast is supported only for Codex. Current provider: {}.", provider_label),
-        ).await)?;
+        tg!(
+            "send_message",
+            bot.send_message(
+                chat_id,
+                format!(
+                    "/fast is supported only for Codex. Current provider: {}.",
+                    provider_label
+                ),
+            )
+            .await
+        )?;
         return Ok(());
     }
 
@@ -9313,13 +14436,16 @@ async fn handle_fast_command(
     let requested = match arg.as_str() {
         "" => None,
         "on" | "enable" | "enabled" | "true" | "1" => Some(true),
-        "off" | "disable" | "disabled" | "false" | "0" | "reset" | "clear" | "default" => Some(false),
+        "off" | "disable" | "disabled" | "false" | "0" | "reset" | "clear" | "default" => {
+            Some(false)
+        }
         _ => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(
-                chat_id,
-                "Usage: /fast, /fast on, /fast off, /fast status",
-            ).await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "Usage: /fast, /fast on, /fast off, /fast status",)
+                    .await
+            )?;
             return Ok(());
         }
     };
@@ -9348,6 +14474,99 @@ async fn handle_fast_command(
     Ok(())
 }
 
+/// Handle /stt_model command - set or view transcriptor model for this chat.
+async fn handle_stt_model_command(
+    bot: &Bot,
+    chat_id: ChatId,
+    text: &str,
+    state: &SharedState,
+    token: &str,
+) -> ResponseResult<()> {
+    let arg = command_args(text);
+    msg_debug(&format!(
+        "[handle_stt_model_command] chat_id={}, arg={:?}",
+        chat_id.0, arg
+    ));
+    let key = chat_id.0.to_string();
+
+    if arg.is_empty() {
+        let current = {
+            let data = state.lock().await;
+            get_stt_model(&data.settings, chat_id)
+        };
+        let msg = format!(
+            "Current STT model: <b>{}</b>\n\n\
+             <b>Usage:</b>\n\
+             <code>/stt_model tiny</code>\n\
+             <code>/stt_model base</code>\n\
+             <code>/stt_model small</code>\n\
+             <code>/stt_model medium</code>\n\
+             <code>/stt_model large-v3</code>\n\
+             <code>/stt_model large-v3-turbo</code>\n\
+             <code>/stt_model path:/absolute/model.bin</code>\n\
+             <code>/stt_model reset</code> — use transcriptor env/config/default",
+            html_escape(&stt_model_setting_display(current.as_deref()))
+        );
+        shared_rate_limit_wait(state, chat_id).await;
+        tg!(
+            "send_message",
+            bot.send_message(chat_id, msg)
+                .parse_mode(ParseMode::Html)
+                .await
+        )?;
+        return Ok(());
+    }
+
+    let normalized = match normalize_stt_model_setting(arg) {
+        Ok(value) => value,
+        Err(e) => {
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!("send_message", bot.send_message(chat_id, e).await)?;
+            return Ok(());
+        }
+    };
+
+    match normalized {
+        Some(value) => {
+            {
+                let mut data = state.lock().await;
+                data.settings.stt_models.insert(key, value.clone());
+                save_bot_settings(token, &data.settings);
+            }
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "STT model set to <b>{}</b>.",
+                        html_escape(&stt_model_setting_display(Some(&value)))
+                    ),
+                )
+                .parse_mode(ParseMode::Html)
+                .await
+            )?;
+        }
+        None => {
+            let removed = {
+                let mut data = state.lock().await;
+                let removed = data.settings.stt_models.remove(&key).is_some();
+                save_bot_settings(token, &data.settings);
+                removed
+            };
+            let msg = if removed {
+                "STT model reset. Transcriptor env/config/default will be used."
+            } else {
+                "STT model was not set. Transcriptor env/config/default is already used."
+            };
+            shared_rate_limit_wait(state, chat_id).await;
+            tg!("send_message", bot.send_message(chat_id, msg).await)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Handle /model command
 async fn handle_model_command(
     bot: &Bot,
@@ -9357,7 +14576,10 @@ async fn handle_model_command(
     token: &str,
 ) -> ResponseResult<()> {
     let arg = text.strip_prefix("/model").unwrap_or("").trim();
-    msg_debug(&format!("[handle_model_command] chat_id={}, arg={:?}", chat_id.0, arg));
+    msg_debug(&format!(
+        "[handle_model_command] chat_id={}, arg={:?}",
+        chat_id.0, arg
+    ));
 
     if arg.is_empty() {
         // Show current model + available providers
@@ -9373,7 +14595,15 @@ async fn handle_model_command(
         let mut msg = match &current {
             Some(m) => format!("Current model: <b>{}</b>\n", m),
             None => {
-                let default_provider = if has_claude { "claude" } else if has_codex { "codex" } else if has_gemini { "gemini" } else { "opencode" };
+                let default_provider = if has_claude {
+                    "claude"
+                } else if has_codex {
+                    "codex"
+                } else if has_gemini {
+                    "gemini"
+                } else {
+                    "opencode"
+                };
                 format!("Current model: <b>default</b> ({})\n", default_provider)
             }
         };
@@ -9388,11 +14618,17 @@ async fn handle_model_command(
         if has_codex {
             msg.push_str("\n<b>Codex:</b>\n");
             msg.push_str("<code>/model codex</code> — default\n");
-            msg.push_str("<code>/model codex:gpt-5.5</code> — Latest frontier agentic coding model\n");
+            msg.push_str(
+                "<code>/model codex:gpt-5.5</code> — Latest frontier agentic coding model\n",
+            );
             msg.push_str("<code>/model codex:gpt-5.4</code> — Frontier agentic coding model\n");
             msg.push_str("<code>/model codex:gpt-5.3-codex</code> — Frontier Codex-optimized agentic coding model\n");
-            msg.push_str("<code>/model codex:gpt-5.3-codex-spark</code> — Ultra-fast coding model\n");
-            msg.push_str("<code>/model codex:gpt-5.2-codex</code> — Frontier agentic coding model\n");
+            msg.push_str(
+                "<code>/model codex:gpt-5.3-codex-spark</code> — Ultra-fast coding model\n",
+            );
+            msg.push_str(
+                "<code>/model codex:gpt-5.2-codex</code> — Frontier agentic coding model\n",
+            );
             msg.push_str("<code>/model codex:gpt-5.2</code> — Optimized for professional work and long-running agents\n");
             msg.push_str("<code>/model codex:gpt-5.1-codex-max</code> — Codex-optimized model for deep and fast reasoning\n");
             msg.push_str("<code>/model codex:gpt-5.1-codex-mini</code> — Optimized for codex. Cheaper, faster, but less capable\n");
@@ -9405,7 +14641,9 @@ async fn handle_model_command(
             msg.push_str("<code>/model gemini:gemini-3-flash-preview</code> — Gemini 3 Flash\n");
             msg.push_str("<code>/model gemini:gemini-2.5-pro</code> — Gemini 2.5 Pro\n");
             msg.push_str("<code>/model gemini:gemini-2.5-flash</code> — Gemini 2.5 Flash\n");
-            msg.push_str("<code>/model gemini:gemini-2.5-flash-lite</code> — Gemini 2.5 Flash Lite\n");
+            msg.push_str(
+                "<code>/model gemini:gemini-2.5-flash-lite</code> — Gemini 2.5 Flash Lite\n",
+            );
         }
         if has_opencode {
             msg.push_str("\n<b>OpenCode:</b>\n");
@@ -9417,24 +14655,33 @@ async fn handle_model_command(
 
         if msg.len() <= TELEGRAM_MSG_LIMIT {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, msg)
-                .parse_mode(ParseMode::Html)
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, msg)
+                    .parse_mode(ParseMode::Html)
+                    .await
+            )?;
         } else {
             // Build plain text version for file attachment
             let plain = msg
-                .replace("<b>", "").replace("</b>", "")
-                .replace("<code>", "").replace("</code>", "");
+                .replace("<b>", "")
+                .replace("</b>", "")
+                .replace("<code>", "")
+                .replace("</code>", "");
             let tmp_path = std::env::temp_dir().join(format!("models_{}.txt", chat_id.0));
             if let Err(e) = std::fs::write(&tmp_path, &plain) {
-                msg_debug(&format!("[handle_model_command] failed to write tmp file: {}", e));
+                msg_debug(&format!(
+                    "[handle_model_command] failed to write tmp file: {}",
+                    e
+                ));
                 return Ok(());
             }
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_document", bot.send_document(
-                chat_id,
-                teloxide::types::InputFile::file(&tmp_path),
-            ).await)?;
+            tg!(
+                "send_document",
+                bot.send_document(chat_id, teloxide::types::InputFile::file(&tmp_path),)
+                    .await
+            )?;
             let _ = std::fs::remove_file(&tmp_path);
         }
         return Ok(());
@@ -9470,7 +14717,11 @@ async fn handle_model_command(
                     // captured pending_uploads point at the old workspace's files. Restoring them
                     // into the new (auto-created) workspace would prepend stale upload references
                     // to the next prompt, contradicting the "uploads have been reset" notice.
-                    let dropped_queue = data.message_queues.remove(&chat_id).map(|q| q.len()).unwrap_or(0);
+                    let dropped_queue = data
+                        .message_queues
+                        .remove(&chat_id)
+                        .map(|q| q.len())
+                        .unwrap_or(0);
                     // Cancel any verification loop. Its feedback was authored against the old
                     // provider's session and would be misapplied under the new provider.
                     data.loop_states.remove(&chat_id);
@@ -9495,7 +14746,9 @@ async fn handle_model_command(
                 } else {
                     (false, None, 0)
                 };
-                data.settings.models.insert(chat_id.0.to_string(), model_id.clone());
+                data.settings
+                    .models
+                    .insert(chat_id.0.to_string(), model_id.clone());
                 save_bot_settings(token, &data.settings);
                 (provider_changed, had_state, old_path, queue_cleared)
             };
@@ -9526,25 +14779,36 @@ async fn handle_model_command(
             } else {
                 format!("Model set to <b>{}</b>.", model_id_escaped)
             };
-            tg!("send_message", bot.send_message(chat_id, msg)
-                .parse_mode(ParseMode::Html)
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, msg)
+                    .parse_mode(ParseMode::Html)
+                    .await
+            )?;
         }
         Err(provider) if !provider.is_empty() => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, format!("{provider} provider is not installed."))
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, format!("{provider} provider is not installed."))
+                    .await
+            )?;
         }
         Err(_) => {
             shared_rate_limit_wait(state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id,
-                "Invalid format. Use:\n\
+            tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    "Invalid format. Use:\n\
                  <code>/model claude</code> or <code>/model claude:&lt;model&gt;</code>\n\
                  <code>/model codex</code> or <code>/model codex:&lt;model&gt;</code>\n\
                  <code>/model gemini</code> or <code>/model gemini:&lt;model&gt;</code>\n\
-                 <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>")
+                 <code>/model opencode</code> or <code>/model opencode:&lt;model&gt;</code>"
+                )
                 .parse_mode(ParseMode::Html)
-                .await)?;
+                .await
+            )?;
         }
     }
 
@@ -9603,6 +14867,105 @@ async fn run_inline_text_dispatch(
     }
 }
 
+async fn run_inline_stt_dispatch(
+    bot: Bot,
+    chat_id: ChatId,
+    state: SharedState,
+    msg: Message,
+    user_display_name: String,
+    caption_text: Option<String>,
+    cancel_token: Arc<CancelToken>,
+    dispatch_id: u64,
+    context: &'static str,
+) {
+    let state_for_task = state.clone();
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let join = spawn_tracked_request_task(request_tasks, async move {
+        CURRENT_DISPATCH_ID
+            .scope(dispatch_id, async move {
+                process_reserved_stt_message(
+                    bot,
+                    chat_id,
+                    msg,
+                    state_for_task,
+                    user_display_name,
+                    caption_text,
+                    cancel_token,
+                )
+                .await;
+            })
+            .await
+    });
+
+    if let Err(join_err) = join.await {
+        let panic_str = redact_known_tokens(&join_err.to_string());
+        msg_debug(&format!(
+            "[{}] chat_id={}, inline STT dispatch PANICKED: {}",
+            context, chat_id.0, panic_str
+        ));
+        eprintln!(
+            "  ⚠ Chat {} {} STT dispatch panicked: {} — recovering",
+            chat_id.0, context, panic_str
+        );
+        reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, context).await;
+    }
+}
+
+async fn run_inline_album_dispatch(
+    bot: Bot,
+    chat_id: ChatId,
+    state: SharedState,
+    msgs: Vec<Message>,
+    user_display_name: String,
+    caption_str: Option<String>,
+    require_prefix: bool,
+    bot_username: String,
+    placeholder_token: Arc<CancelToken>,
+    dispatch_id: u64,
+    context: &'static str,
+) {
+    let state_for_task = state.clone();
+    let request_tasks = {
+        let data = state.lock().await;
+        data.request_tasks.clone()
+    };
+    let join = spawn_tracked_request_task(request_tasks, async move {
+        CURRENT_DISPATCH_ID
+            .scope(dispatch_id, async move {
+                process_album_attachments_task(
+                    bot,
+                    chat_id,
+                    msgs,
+                    state_for_task,
+                    user_display_name,
+                    caption_str,
+                    require_prefix,
+                    bot_username,
+                    placeholder_token,
+                    true,
+                )
+                .await;
+            })
+            .await
+    });
+
+    if let Err(join_err) = join.await {
+        let panic_str = redact_known_tokens(&join_err.to_string());
+        msg_debug(&format!(
+            "[{}] chat_id={}, inline album dispatch PANICKED: {}",
+            context, chat_id.0, panic_str
+        ));
+        eprintln!(
+            "  ⚠ Chat {} {} album dispatch panicked: {} — recovering",
+            chat_id.0, context, panic_str
+        );
+        reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, context).await;
+    }
+}
+
 /// Dispatch pending loop feedback (stored in loop_feedback HashMap).
 /// Called after loop verification determines the task is incomplete.
 /// Uses the same boxed-future pattern as process_next_queued_message
@@ -9621,13 +14984,24 @@ fn dispatch_loop_feedback<'a>(
             // during the gap before handle_text_message creates its own token.
             // Same pattern as process_next_queued_message (line 6628).
             if fb.is_some() {
-                insert_cancel_token_locked(&mut data, chat_id, new_cancel_token_for_owner(dispatch_id));
-                msg_debug(&format!("[loop:dispatch] chat_id={}, placeholder cancel_token inserted", chat_id.0));
+                insert_cancel_token_locked(
+                    &mut data,
+                    chat_id,
+                    new_cancel_token_for_owner(dispatch_id),
+                );
+                msg_debug(&format!(
+                    "[loop:dispatch] chat_id={}, placeholder cancel_token inserted",
+                    chat_id.0
+                ));
             }
             fb
         };
         if let Some((text, user_display_name)) = feedback {
-            msg_debug(&format!("[loop:dispatch] chat_id={}, feedback_len={}", chat_id.0, text.len()));
+            msg_debug(&format!(
+                "[loop:dispatch] chat_id={}, feedback_len={}",
+                chat_id.0,
+                text.len()
+            ));
             // from_queue=true: handle_text_message will overwrite the placeholder
             // cancel_token instead of treating it as "another task active".
             run_inline_text_dispatch(
@@ -9639,9 +15013,13 @@ fn dispatch_loop_feedback<'a>(
                 true,
                 dispatch_id,
                 "loop:dispatch",
-            ).await;
+            )
+            .await;
         } else {
-            msg_debug(&format!("[loop:dispatch] chat_id={}, no feedback found (may have been cleared by /stop)", chat_id.0));
+            msg_debug(&format!(
+                "[loop:dispatch] chat_id={}, no feedback found (may have been cleared by /stop)",
+                chat_id.0
+            ));
             // Fall through to normal queue processing
             process_next_queued_message(bot, chat_id, state).await;
         }
@@ -9659,66 +15037,173 @@ fn process_next_queued_message<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
     Box::pin(async move {
         let dispatch_id = next_dispatch_id();
-        msg_debug(&format!("[queue:next] chat_id={}, checking for next queued message", chat_id.0));
+        msg_debug(&format!(
+            "[queue:next] chat_id={}, checking for next queued message",
+            chat_id.0
+        ));
         let next_msg = {
             let mut data = state.lock().await;
             // Skip if another task is already processing this chat
             if data.cancel_tokens.contains_key(&chat_id) {
-                msg_debug(&format!("[queue:next] chat_id={}, cancel_token exists (another task active), skipping", chat_id.0));
+                msg_debug(&format!(
+                    "[queue:next] chat_id={}, cancel_token exists (another task active), skipping",
+                    chat_id.0
+                ));
                 return;
             }
             // NOTE: We do NOT skip when queue mode is OFF. In OFF mode, the queue is used
             // as a single-slot buffer for redirect targets (latest-wins). If something is
             // pending here, it was placed by enqueue_redirect_locked and must be dispatched.
             let qkey = chat_id.0.to_string();
-            let queue_enabled = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
+            let queue_enabled = data
+                .settings
+                .queue
+                .get(&qkey)
+                .copied()
+                .unwrap_or(QUEUE_MODE_DEFAULT);
             let queue_len_before = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
-            msg_debug(&format!("[queue:next] chat_id={}, queue_mode={}, queue_len={}", chat_id.0, queue_enabled, queue_len_before));
-            let msg = data.message_queues.get_mut(&chat_id).and_then(|q| q.pop_front());
+            msg_debug(&format!(
+                "[queue:next] chat_id={}, queue_mode={}, queue_len={}",
+                chat_id.0, queue_enabled, queue_len_before
+            ));
+            let msg = data
+                .message_queues
+                .get_mut(&chat_id)
+                .and_then(|q| q.pop_front());
             // Restore pending_uploads captured at queue time so handle_text_message picks them up
             if let Some(ref m) = msg {
-                msg_debug(&format!("[queue:next] chat_id={}, popped message: text={:?}, user={:?}, uploads={}, queue_before={}", chat_id.0, truncate_str(&m.text, 60), m.user_display_name, m.pending_uploads.len(), queue_len_before));
-                if !m.pending_uploads.is_empty() {
-                    if let Some(session) = data.sessions.get_mut(&chat_id) {
-                        session.extend_pending_uploads(m.pending_uploads.iter().cloned());
-                        msg_debug(&format!("[queue:next] chat_id={}, restored {} pending_uploads to session", chat_id.0, m.pending_uploads.len()));
-                    } else {
-                        msg_debug(&format!("[queue:next] chat_id={}, WARNING: no session to restore uploads to", chat_id.0));
+                let preview = m.preview_text();
+                let uploads_len = m.pending_uploads_len();
+                msg_debug(&format!("[queue:next] chat_id={}, popped message: text={:?}, user={:?}, uploads={}, queue_before={}", chat_id.0, truncate_str(&preview, 60), m.user_display_name, uploads_len, queue_len_before));
+                if let QueuedPayload::Text {
+                    pending_uploads, ..
+                } = &m.payload
+                {
+                    if !pending_uploads.is_empty() {
+                        if let Some(session) = data.sessions.get_mut(&chat_id) {
+                            session.extend_pending_uploads(pending_uploads.iter().cloned());
+                            msg_debug(&format!(
+                                "[queue:next] chat_id={}, restored {} pending_uploads to session",
+                                chat_id.0,
+                                pending_uploads.len()
+                            ));
+                        } else {
+                            msg_debug(&format!("[queue:next] chat_id={}, WARNING: no session to restore uploads to", chat_id.0));
+                        }
                     }
                 }
                 // Insert placeholder cancel_token so new messages see "busy" during Dequeued notification.
                 // Without this, messages arriving between pop and handle_text_message's cancel_token insert
                 // would see "not busy" and bypass the queue (FIFO violation).
-                // handle_text_message will overwrite this with its own real cancel_token.
-                insert_cancel_token_locked(&mut data, chat_id, new_cancel_token_for_owner(dispatch_id));
-                msg_debug(&format!("[queue:next] chat_id={}, placeholder cancel_token inserted", chat_id.0));
+                // Text dispatch overwrites this with its own real cancel_token;
+                // STT/album dispatch uses this same token while transcribing.
+                insert_cancel_token_locked(
+                    &mut data,
+                    chat_id,
+                    new_cancel_token_for_owner(dispatch_id),
+                );
+                msg_debug(&format!(
+                    "[queue:next] chat_id={}, placeholder cancel_token inserted",
+                    chat_id.0
+                ));
             } else {
-                msg_debug(&format!("[queue:next] chat_id={}, queue empty (len was {})", chat_id.0, queue_len_before));
+                msg_debug(&format!(
+                    "[queue:next] chat_id={}, queue empty (len was {})",
+                    chat_id.0, queue_len_before
+                ));
             }
             // Clean up empty queue entry to prevent memory leak
-            if data.message_queues.get(&chat_id).map_or(false, |q| q.is_empty()) {
+            if data
+                .message_queues
+                .get(&chat_id)
+                .map_or(false, |q| q.is_empty())
+            {
                 data.message_queues.remove(&chat_id);
-                msg_debug(&format!("[queue:next] chat_id={}, removed empty queue entry", chat_id.0));
+                msg_debug(&format!(
+                    "[queue:next] chat_id={}, removed empty queue entry",
+                    chat_id.0
+                ));
             }
             msg
         };
 
         if let Some(queued) = next_msg {
-            msg_debug(&format!("[queue:next] chat_id={}, dispatching id={}, text={:?}", chat_id.0, queued.id, truncate_str(&queued.text, 60)));
+            let preview = queued.preview_text();
+            let placeholder_token = {
+                let data = state.lock().await;
+                data.cancel_tokens.get(&chat_id).cloned()
+            };
+            let Some(placeholder_token) = placeholder_token else {
+                msg_debug(&format!("[queue:next] chat_id={}, missing placeholder token for id={}, dropping queued item", chat_id.0, queued.id));
+                return;
+            };
+            msg_debug(&format!(
+                "[queue:next] chat_id={}, dispatching id={}, text={:?}",
+                chat_id.0,
+                queued.id,
+                truncate_str(&preview, 60)
+            ));
             shared_rate_limit_wait(state, chat_id).await;
-            let _ = tg!("send_message", bot.send_message(chat_id, &format!("Dequeued ({})", queued.id)).await);
+            let _ = tg!(
+                "send_message",
+                bot.send_message(chat_id, &format!("Dequeued ({})", queued.id))
+                    .await
+            );
 
-            run_inline_text_dispatch(
-                bot.clone(),
-                chat_id,
-                state.clone(),
-                queued.text,
-                queued.user_display_name,
-                true,
-                dispatch_id,
-                "queue:next",
-            ).await;
-            msg_debug(&format!("[queue:next] chat_id={}, id={}, inline dispatch returned", chat_id.0, queued.id));
+            match queued.payload {
+                QueuedPayload::Text { text, .. } => {
+                    run_inline_text_dispatch(
+                        bot.clone(),
+                        chat_id,
+                        state.clone(),
+                        text,
+                        queued.user_display_name,
+                        true,
+                        dispatch_id,
+                        "queue:next",
+                    )
+                    .await;
+                }
+                QueuedPayload::SttAudio { msg, caption_text } => {
+                    run_inline_stt_dispatch(
+                        bot.clone(),
+                        chat_id,
+                        state.clone(),
+                        msg,
+                        queued.user_display_name,
+                        caption_text,
+                        placeholder_token,
+                        dispatch_id,
+                        "queue:next",
+                    )
+                    .await;
+                }
+                QueuedPayload::AlbumAttachments {
+                    msgs,
+                    caption_str,
+                    require_prefix,
+                    bot_username,
+                } => {
+                    run_inline_album_dispatch(
+                        bot.clone(),
+                        chat_id,
+                        state.clone(),
+                        msgs,
+                        queued.user_display_name,
+                        caption_str,
+                        require_prefix,
+                        bot_username,
+                        placeholder_token,
+                        dispatch_id,
+                        "queue:next",
+                    )
+                    .await;
+                }
+            }
+            msg_debug(&format!(
+                "[queue:next] chat_id={}, id={}, inline dispatch returned",
+                chat_id.0, queued.id
+            ));
         }
     })
 }
@@ -9732,9 +15217,18 @@ async fn handle_text_message(
     user_display_name: &str,
     from_queue: bool,
 ) -> ResponseResult<()> {
-    msg_debug(&format!("[handle_text_message] START chat_id={}, user_text={:?}, from_queue={}",
-        chat_id.0, truncate_str(user_text, 100), from_queue));
-    ai_trace(&format!("[START] chat_id={}, user_text={:?}, from_queue={}", chat_id.0, truncate_str(user_text, 100), from_queue));
+    msg_debug(&format!(
+        "[handle_text_message] START chat_id={}, user_text={:?}, from_queue={}",
+        chat_id.0,
+        truncate_str(user_text, 100),
+        from_queue
+    ));
+    ai_trace(&format!(
+        "[START] chat_id={}, user_text={:?}, from_queue={}",
+        chat_id.0,
+        truncate_str(user_text, 100),
+        from_queue
+    ));
 
     // Register cancel token early (prevents duplicate requests while waiting for group lock)
     let cancel_token = new_cancel_token();
@@ -9746,11 +15240,16 @@ async fn handle_text_message(
         let mut data = state.lock().await;
         // For queued messages: check if placeholder was cancelled (e.g., /stop during dequeue window)
         if from_queue {
-            let placeholder_cancelled = data.cancel_tokens.get(&chat_id)
+            let placeholder_cancelled = data
+                .cancel_tokens
+                .get(&chat_id)
                 .map(|t| t.cancelled.load(Ordering::Relaxed))
                 .unwrap_or(false);
             if placeholder_cancelled {
-                msg_debug(&format!("[handle_text_message] chat_id={}, placeholder cancelled during dequeue", chat_id.0));
+                msg_debug(&format!(
+                    "[handle_text_message] chat_id={}, placeholder cancelled during dequeue",
+                    chat_id.0
+                ));
                 // Clean up pending_uploads restored for this cancelled message
                 if let Some(session) = data.sessions.get_mut(&chat_id) {
                     if !session.pending_uploads.is_empty() {
@@ -9772,39 +15271,69 @@ async fn handle_text_message(
         }
         // For non-queued messages: if another task is active, queue (ON) or redirect (OFF)
         if !from_queue && data.cancel_tokens.contains_key(&chat_id) {
-            msg_debug(&format!("[handle_text_message] chat_id={}, cancel_token exists (busy)", chat_id.0));
+            msg_debug(&format!(
+                "[handle_text_message] chat_id={}, cancel_token exists (busy)",
+                chat_id.0
+            ));
             let qkey = chat_id.0.to_string();
-            let qmode = data.settings.queue.get(&qkey).copied().unwrap_or(QUEUE_MODE_DEFAULT);
+            let qmode = data
+                .settings
+                .queue
+                .get(&qkey)
+                .copied()
+                .unwrap_or(QUEUE_MODE_DEFAULT);
             let (qid, redirect) = if qmode {
                 let cur_len = data.message_queues.get(&chat_id).map_or(0, |q| q.len());
                 let qid = if cur_len < MAX_QUEUE_SIZE {
-                    let uploads = data.sessions.get_mut(&chat_id)
+                    let uploads = data
+                        .sessions
+                        .get_mut(&chat_id)
                         .map(|s| s.take_pending_uploads())
                         .unwrap_or_default();
                     let id = generate_queue_id();
-                    data.message_queues.entry(chat_id)
+                    data.message_queues
+                        .entry(chat_id)
                         .or_insert_with(std::collections::VecDeque::new)
                         .push_back(QueuedMessage {
                             id: id.clone(),
-                            text: user_text.to_string(),
                             user_display_name: user_display_name.to_string(),
-                            pending_uploads: uploads,
+                            payload: QueuedPayload::Text {
+                                text: user_text.to_string(),
+                                pending_uploads: uploads,
+                            },
                         });
-                    msg_debug(&format!("[handle_text_message] chat_id={}, QUEUED id={}", chat_id.0, id));
+                    msg_debug(&format!(
+                        "[handle_text_message] chat_id={}, QUEUED id={}",
+                        chat_id.0, id
+                    ));
                     Some(id)
                 } else {
-                    msg_debug(&format!("[handle_text_message] chat_id={}, queue FULL", chat_id.0));
+                    msg_debug(&format!(
+                        "[handle_text_message] chat_id={}, queue FULL",
+                        chat_id.0
+                    ));
                     None
                 };
                 (qid, None)
             } else {
                 // OFF mode: messages reaching handle_text_message are user-prompt-style (slash
                 // commands are routed elsewhere in handle_message), so redirect them.
-                let uploads = data.sessions.get_mut(&chat_id)
+                let uploads = data
+                    .sessions
+                    .get_mut(&chat_id)
                     .map(|s| s.take_pending_uploads())
                     .unwrap_or_default();
-                let (rid, replaced) = enqueue_redirect_locked(&mut *data, chat_id, user_text.to_string(), user_display_name.to_string(), uploads);
-                msg_debug(&format!("[handle_text_message] chat_id={}, REDIRECT id={}, replaced={}", chat_id.0, rid, replaced));
+                let (rid, replaced) = enqueue_redirect_locked(
+                    &mut *data,
+                    chat_id,
+                    user_text.to_string(),
+                    user_display_name.to_string(),
+                    uploads,
+                );
+                msg_debug(&format!(
+                    "[handle_text_message] chat_id={}, REDIRECT id={}, replaced={}",
+                    chat_id.0, rid, replaced
+                ));
                 (None, Some((rid, replaced)))
             };
             Some((qmode, qid, redirect))
@@ -9829,12 +15358,24 @@ async fn handle_text_message(
                 tg!("send_message", bot.send_message(chat_id, &format!("Queued ({qid}) \"{preview}\"\n- /stopall to cancel all\n- /stop_{qid} to cancel this"))
                     .await)?;
             } else {
-                tg!("send_message", bot.send_message(chat_id, &format!("Queue full (max {}). Use /stopall to clear.", MAX_QUEUE_SIZE))
-                    .await)?;
+                tg!(
+                    "send_message",
+                    bot.send_message(
+                        chat_id,
+                        &format!(
+                            "Queue full (max {}). Use /stopall to clear.",
+                            MAX_QUEUE_SIZE
+                        )
+                    )
+                    .await
+                )?;
             }
         } else {
-            tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
-                .await)?;
+            tg!(
+                "send_message",
+                bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
+                    .await
+            )?;
         }
         return Ok(());
     }
@@ -9846,47 +15387,89 @@ async fn handle_text_message(
     // request on this bot for this chat.
 
     // Get session info, allowed tools, model, pending uploads, history, instruction, and bot_username (drop lock before any await)
-    let (session_info, allowed_tools, pending_uploads, model, history, instruction, context_count, bot_username_for_prompt, bot_display_name_for_prompt, chrome_enabled, effort, codex_fast_enabled) = {
+    let (
+        session_info,
+        allowed_tools,
+        pending_uploads,
+        model,
+        history,
+        instruction,
+        context_count,
+        bot_username_for_prompt,
+        bot_display_name_for_prompt,
+        chrome_enabled,
+        effort,
+        codex_fast_enabled,
+    ) = {
         let mut data = state.lock().await;
         let info = data.sessions.get(&chat_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
-                (session.session_id.clone(), session.current_path.clone().unwrap_or_default())
+                (
+                    session.session_id.clone(),
+                    session.current_path.clone().unwrap_or_default(),
+                )
             })
         });
         let tools = get_allowed_tools(&data.settings, chat_id);
         let mdl = get_model(&data.settings, chat_id);
-        let hist = data.sessions.get(&chat_id)
+        let hist = data
+            .sessions
+            .get(&chat_id)
             .map(|s| s.history.clone())
             .unwrap_or_default();
         // Drain pending uploads so they are sent to Claude exactly once
-        let uploads = data.sessions.get_mut(&chat_id)
+        let uploads = data
+            .sessions
+            .get_mut(&chat_id)
             .map(|s| s.take_pending_uploads())
             .unwrap_or_default();
-        let instr = data.settings.instructions.get(&chat_id.0.to_string()).cloned();
-        let ctx_count = data.settings.context.get(&chat_id.0.to_string()).copied().unwrap_or(12);
+        let instr = data
+            .settings
+            .instructions
+            .get(&chat_id.0.to_string())
+            .cloned();
+        let ctx_count = data
+            .settings
+            .context
+            .get(&chat_id.0.to_string())
+            .copied()
+            .unwrap_or(12);
         let buname = data.bot_username.clone();
         let bdname = data.bot_display_name.clone();
-        let chrome = data.settings.use_chrome.get(&chat_id.0.to_string()).copied().unwrap_or(false);
+        let chrome = data
+            .settings
+            .use_chrome
+            .get(&chat_id.0.to_string())
+            .copied()
+            .unwrap_or(false);
         let provider = detect_provider(mdl.as_deref());
         let effort = get_effort_for_provider(&data.settings, chat_id, provider);
         let codex_fast = is_codex_fast(&data.settings, chat_id);
         msg_debug(&format!("[handle_text_message] session_id={:?}, current_path={:?}, model={:?}, uploads={}, history_len={}, instruction={:?}",
             info.as_ref().map(|(sid, _)| sid), info.as_ref().map(|(_, p)| p), mdl, uploads.len(), hist.len(), instr.is_some()));
-        (info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname, chrome, effort, codex_fast)
+        (
+            info, tools, uploads, mdl, hist, instr, ctx_count, buname, bdname, chrome, effort,
+            codex_fast,
+        )
     };
 
     let (session_id, current_path) = match session_info {
         Some(info) => info,
         None => {
             // Auto-create a workspace session instead of rejecting the message
-            let Some((auto_sid, auto_current)) = auto_create_workspace_session(bot, state, chat_id, bot.token()).await else {
+            let Some((auto_sid, auto_current)) =
+                auto_create_workspace_session(bot, state, chat_id, bot.token()).await
+            else {
                 {
                     let mut data = state.lock().await;
                     remove_cancel_token_locked(&mut data, chat_id);
                 }
                 shared_rate_limit_wait(state, chat_id).await;
-                let _ = tg!("send_message", bot.send_message(chat_id, "Failed to create workspace.")
-                    .await);
+                let _ = tg!(
+                    "send_message",
+                    bot.send_message(chat_id, "Failed to create workspace.")
+                        .await
+                );
                 process_next_queued_message(bot, chat_id, state).await;
                 return Ok(());
             };
@@ -9916,9 +15499,14 @@ async fn handle_text_message(
     };
 
     // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> = DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> = allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools.iter().filter(|t| !allowed_set.contains(**t)).collect();
+    let default_tools: std::collections::HashSet<&str> =
+        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
+    let allowed_set: std::collections::HashSet<&str> =
+        allowed_tools.iter().map(|s| s.as_str()).collect();
+    let disabled: Vec<&&str> = default_tools
+        .iter()
+        .filter(|t| !allowed_set.contains(**t))
+        .collect();
     let disabled_notice = if disabled.is_empty() {
         String::new()
     } else {
@@ -9937,7 +15525,10 @@ async fn handle_text_message(
     let bot_key_for_prompt = token_hash(bot.token());
     let platform = capitalize_platform(detect_platform(bot.token()));
     let role = match &instruction {
-        Some(instr) => format!("You are chatting with a user through {}.\n\nUser's instruction for this chat:\n{}", platform, instr),
+        Some(instr) => format!(
+            "You are chatting with a user through {}.\n\nUser's instruction for this chat:\n{}",
+            platform, instr
+        ),
         None => format!("You are chatting with a user through {}.", platform),
     };
     ai_trace(&format!(
@@ -9948,9 +15539,16 @@ async fn handle_text_message(
     ));
     let system_prompt_owned = build_system_prompt(
         &role,
-        &current_path, chat_id.0, &bot_key_for_prompt, &disabled_notice,
-        session_id.as_deref(), &bot_username_for_prompt, &bot_display_name_for_prompt,
-        Some(user_text), context_count, &platform,
+        &current_path,
+        chat_id.0,
+        &bot_key_for_prompt,
+        &disabled_notice,
+        session_id.as_deref(),
+        &bot_username_for_prompt,
+        &bot_display_name_for_prompt,
+        Some(user_text),
+        context_count,
+        &platform,
     );
 
     // Create channel for streaming
@@ -10012,8 +15610,14 @@ async fn handle_text_message(
         // acquired and the placeholder is sent), so cleanup is just state +
         // queue processing; no child to SIGKILL, no API calls billed.
         if cancel_token.cancelled.load(Ordering::Relaxed) {
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=text_cancelled_during_lock", chat_id.0));
-            { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=text_cancelled_during_lock",
+                chat_id.0
+            ));
+            {
+                let mut data = state_owned.lock().await;
+                remove_cancel_token_locked(&mut data, chat_id);
+            }
             drop(group_lock);
             process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
             return;
@@ -10027,8 +15631,14 @@ async fn handle_text_message(
         let placeholder = match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
             Ok(m) => m,
             Err(e) => {
-                msg_debug(&format!("[queue:trigger] chat_id={}, source=text_placeholder_error: {}", chat_id.0, e));
-                { let mut data = state_owned.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+                msg_debug(&format!(
+                    "[queue:trigger] chat_id={}, source=text_placeholder_error: {}",
+                    chat_id.0, e
+                ));
+                {
+                    let mut data = state_owned.lock().await;
+                    remove_cancel_token_locked(&mut data, chat_id);
+                }
                 process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
                 return;
             }
@@ -10046,11 +15656,16 @@ async fn handle_text_message(
             context_prompt.len(), system_prompt_owned.len(), session_id_clone, current_path_clone, history_clone.len()));
         let _ = spawn_tracked_blocking_task(request_tasks_for_ai, move || {
             let provider = detect_provider(model_clone.as_deref());
-            msg_debug(&format!("[handle_text_message] provider={}, model={:?}", provider, model_clone));
+            msg_debug(&format!(
+                "[handle_text_message] provider={}, model={:?}",
+                provider, model_clone
+            ));
             ai_trace(&format!("[EXEC] provider={}, model={:?}, prompt_len={}, system_prompt_len={}, history_len={}, session={:?}, path={}",
                 provider, model_clone, context_prompt.len(), system_prompt_owned.len(), history_clone.len(), session_id_clone, current_path_clone));
             let result = if provider == "opencode" {
-                let opencode_model = model_clone.as_deref().and_then(opencode::strip_opencode_prefix);
+                let opencode_model = model_clone
+                    .as_deref()
+                    .and_then(opencode::strip_opencode_prefix);
                 msg_debug(&format!("[handle_text_message] → opencode::execute, opencode_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
                     opencode_model, session_id_clone, current_path_clone, context_prompt.len(), system_prompt_owned.len()));
                 opencode::execute_command_streaming(
@@ -10081,7 +15696,8 @@ async fn handle_text_message(
                 )
             } else if provider == "codex" {
                 let codex_model = model_clone.as_deref().and_then(codex::strip_codex_prefix);
-                let codex_system_prompt = format!("{}{}", system_prompt_owned, codex_extra_instructions());
+                let codex_system_prompt =
+                    format!("{}{}", system_prompt_owned, codex_extra_instructions());
                 let is_resume = session_id_clone.is_some();
                 let has_history = !history_clone.is_empty();
                 msg_debug(&format!("[handle_text_message] codex: is_resume={}, has_history={}, history_len={}, sp_len={}",
@@ -10107,7 +15723,9 @@ async fn handle_text_message(
                     if is_resume {
                         msg_debug("[handle_text_message] codex: RESUME path — no history injection, sp via -c file");
                     } else {
-                        msg_debug("[handle_text_message] codex: NEW session, no history — sp via -c file");
+                        msg_debug(
+                            "[handle_text_message] codex: NEW session, no history — sp via -c file",
+                        );
                     }
                     context_prompt.clone()
                 };
@@ -10134,7 +15752,10 @@ async fn handle_text_message(
                 )
             } else {
                 let claude_model = model_clone.as_deref().and_then(claude::strip_claude_prefix);
-                msg_debug(&format!("[handle_text_message] → claude::execute, claude_model={:?}", claude_model));
+                msg_debug(&format!(
+                    "[handle_text_message] → claude::execute, claude_model={:?}",
+                    claude_model
+                ));
                 claude::execute_command_streaming(
                     &context_prompt,
                     session_id_clone.as_deref(),
@@ -10161,15 +15782,28 @@ async fn handle_text_message(
                 }
             }
             if let Err(e) = result {
-                let _ = tx.send(StreamMessage::Error { message: e, stdout: String::new(), stderr: String::new(), exit_code: None });
+                let _ = tx.send(StreamMessage::Error {
+                    message: e,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                });
             }
         });
 
         const SPINNER: &[&str] = &[
-            "🕐 P",           "🕑 Pr",          "🕒 Pro",
-            "🕓 Proc",        "🕔 Proce",       "🕕 Proces",
-            "🕖 Process",     "🕗 Processi",    "🕘 Processin",
-            "🕙 Processing",  "🕚 Processing.", "🕛 Processing..",
+            "🕐 P",
+            "🕑 Pr",
+            "🕒 Pro",
+            "🕓 Proc",
+            "🕔 Proce",
+            "🕕 Proces",
+            "🕖 Process",
+            "🕗 Processi",
+            "🕘 Processin",
+            "🕙 Processing",
+            "🕚 Processing.",
+            "🕛 Processing..",
         ];
         let mut full_response = String::new();
         let mut raw_entries: Vec<RawPayloadEntry> = Vec::new();
@@ -10193,7 +15827,9 @@ async fn handle_text_message(
         while !done || !queue_done {
             // Check cancel token
             if cancel_token.cancelled.load(Ordering::Relaxed) {
-                if !done { cancelled = true; }
+                if !done {
+                    cancelled = true;
+                }
                 break;
             }
 
@@ -10202,7 +15838,9 @@ async fn handle_text_message(
 
             // Check cancel token again after sleep
             if cancel_token.cancelled.load(Ordering::Relaxed) {
-                if !done { cancelled = true; }
+                if !done {
+                    cancelled = true;
+                }
                 break;
             }
 
@@ -10211,163 +15849,235 @@ async fn handle_text_message(
                 // Drain all available messages
                 loop {
                     match rx.try_recv() {
-                        Ok(msg) => {
-                            match msg {
-                                StreamMessage::Init { session_id: sid } => {
-                                    msg_debug(&format!("[polling] Init: session_id={}", sid));
-                                    ai_trace(&format!("[STREAM] Init: session_id={}", sid));
-                                    new_session_id = Some(sid);
-                                }
-                                StreamMessage::Text { content } => {
-                                    msg_debug(&format!("[polling] Text: {} chars, preview={:?}",
-                                        content.len(), truncate_str(&content, 80)));
-                                    ai_trace(&format!("[STREAM] Text: {} chars, total_so_far={}", content.len(), full_response.len() + content.len()));
-                                    raw_entries.push(RawPayloadEntry { tag: "Text".into(), content: content.clone() });
-                                    let _fr_before = full_response.len();
-                                    full_response.push_str(&content);
-                                    msg_debug(&format!("[fr_trace][{}] +Text: added={}, preview={:?}, total={} (was {})",
+                        Ok(msg) => match msg {
+                            StreamMessage::Init { session_id: sid } => {
+                                msg_debug(&format!("[polling] Init: session_id={}", sid));
+                                ai_trace(&format!("[STREAM] Init: session_id={}", sid));
+                                new_session_id = Some(sid);
+                            }
+                            StreamMessage::Text { content } => {
+                                msg_debug(&format!(
+                                    "[polling] Text: {} chars, preview={:?}",
+                                    content.len(),
+                                    truncate_str(&content, 80)
+                                ));
+                                ai_trace(&format!(
+                                    "[STREAM] Text: {} chars, total_so_far={}",
+                                    content.len(),
+                                    full_response.len() + content.len()
+                                ));
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "Text".into(),
+                                    content: content.clone(),
+                                });
+                                let _fr_before = full_response.len();
+                                full_response.push_str(&content);
+                                msg_debug(&format!("[fr_trace][{}] +Text: added={}, preview={:?}, total={} (was {})",
                                         chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
-                                }
-                                StreamMessage::ToolUse { name, input } => {
-                                    pending_cokacdir = detect_cokacdir_command(&name, &input);
-                                    suppress_tool_display = detect_chat_log_read(&name, &input);
-                                    last_tool_name = name.clone();
-                                    let summary = format_tool_input(&name, &input);
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}]   ⚙ {name}: {summary}");
-                                    msg_debug(&format!("[polling] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, silent_mode={}, response_len={}, ends_with_nl={}",
+                            }
+                            StreamMessage::ToolUse { name, input } => {
+                                pending_cokacdir = detect_cokacdir_command(&name, &input);
+                                suppress_tool_display = detect_chat_log_read(&name, &input);
+                                last_tool_name = name.clone();
+                                let summary = format_tool_input(&name, &input);
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                println!("  [{ts}]   ⚙ {name}: {summary}");
+                                msg_debug(&format!("[polling] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, silent_mode={}, response_len={}, ends_with_nl={}",
                                         name, truncate_str(&input, 200), pending_cokacdir, silent_mode, full_response.len(), full_response.ends_with('\n')));
-                                    raw_entries.push(RawPayloadEntry { tag: "ToolUse".into(), content: format!("{}: {}", name, input) });
-                                    if !pending_cokacdir && !silent_mode {
-                                        let _fr_before = full_response.len();
-                                        if name == "Bash" {
-                                            full_response.push_str(&format!("\n\n```\n{}\n```\n", format_bash_command(&input)));
-                                            msg_debug(&format!("[fr_trace][{}] +ToolUse/Bash: added={}, cmd={:?}, total={} (was {})",
-                                                chat_id.0, full_response.len() - _fr_before, truncate_str(&input, 100), full_response.len(), _fr_before));
-                                        } else {
-                                            full_response.push_str(&format!("\n\n⚙️ {}\n", summary));
-                                            msg_debug(&format!("[fr_trace][{}] +ToolUse/{}: added={}, summary={:?}, total={} (was {})",
-                                                chat_id.0, name, full_response.len() - _fr_before, truncate_str(&summary, 100), full_response.len(), _fr_before));
-                                        }
-                                    } else if !pending_cokacdir && silent_mode && !full_response.is_empty() && !full_response.ends_with('\n') {
-                                        msg_debug(&format!("[polling] silent mode: inserting \\n\\n after tool_use={}", name));
-                                        full_response.push_str("\n\n");
-                                        msg_debug(&format!("[fr_trace][{}] +ToolUse/silent_nl: added=2, total={}", chat_id.0, full_response.len()));
-                                    } else if silent_mode {
-                                        msg_debug(&format!("[polling] silent mode: skipped \\n\\n (pending_cokacdir={}, empty={}, ends_nl={})",
-                                            pending_cokacdir, full_response.is_empty(), full_response.ends_with('\n')));
-                                    }
-                                }
-                                StreamMessage::ToolResult { content, is_error } => {
-                                    msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
-                                    if is_error {
-                                        msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
-                                    }
-                                    raw_entries.push(RawPayloadEntry { tag: "ToolResult".into(), content: format!("is_error={}, content={}", is_error, content) });
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "ToolUse".into(),
+                                    content: format!("{}: {}", name, input),
+                                });
+                                if !pending_cokacdir && !silent_mode {
                                     let _fr_before = full_response.len();
-                                    if std::mem::take(&mut pending_cokacdir) {
-                                        let ts = chrono::Local::now().format("%H:%M:%S");
-                                        if std::mem::take(&mut suppress_tool_display) {
-                                            println!("  [{ts}]   ↩ cokacdir (chat_log, suppressed)");
-                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir_suppressed: added=0, total={}", chat_id.0, full_response.len()));
-                                        } else {
-                                            println!("  [{ts}]   ↩ cokacdir: {content}");
-                                            let formatted = format_cokacdir_result(&content);
-                                            if !formatted.is_empty() {
-                                                full_response.push_str(&format!("\n{}\n", formatted));
-                                                msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir: added={}, preview={:?}, total={} (was {})",
-                                                    chat_id.0, full_response.len() - _fr_before, truncate_str(&formatted, 200), full_response.len(), _fr_before));
-                                            } else {
-                                                msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir: formatted_empty, added=0, total={}", chat_id.0, full_response.len()));
-                                            }
-                                        }
-                                    } else if is_error && !silent_mode {
-                                        let ts = chrono::Local::now().format("%H:%M:%S");
-                                        println!("  [{ts}]   ✗ Error: {content}");
-                                        let truncated = truncate_str(&content, 500);
-                                        if truncated.contains('\n') {
-                                            full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
-                                        } else {
-                                            full_response.push_str(&format!("\n`{}`\n\n", truncated));
-                                        }
-                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/error({}): added={}, preview={:?}, total={} (was {})",
-                                            chat_id.0, last_tool_name, full_response.len() - _fr_before, truncate_str(&truncated, 200), full_response.len(), _fr_before));
-                                    } else if !silent_mode {
-                                        if last_tool_name == "Read" {
-                                            full_response.push_str(&format!("\n✅ `{} bytes`\n\n", content.len()));
-                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/Read: added={}, content_bytes={}, total={} (was {})",
-                                                chat_id.0, full_response.len() - _fr_before, content.len(), full_response.len(), _fr_before));
-                                        } else if !content.is_empty() {
-                                            let truncated = truncate_str(&content, 300);
-                                            if truncated.contains('\n') {
-                                                full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
-                                            } else {
-                                                full_response.push_str(&format!("\n✅ `{}`\n\n", truncated));
-                                            }
-                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): added={}, raw_content_len={}, preview={:?}, total={} (was {})",
-                                                chat_id.0, last_tool_name, full_response.len() - _fr_before, content.len(), truncate_str(&truncated, 200), full_response.len(), _fr_before));
-                                        } else {
-                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): content_empty, added=0, total={}", chat_id.0, last_tool_name, full_response.len()));
-                                        }
+                                    if name == "Bash" {
+                                        full_response.push_str(&format!(
+                                            "\n\n```\n{}\n```\n",
+                                            format_bash_command(&input)
+                                        ));
+                                        msg_debug(&format!("[fr_trace][{}] +ToolUse/Bash: added={}, cmd={:?}, total={} (was {})",
+                                                chat_id.0, full_response.len() - _fr_before, truncate_str(&input, 100), full_response.len(), _fr_before));
                                     } else {
-                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/silent: skipped, last_tool={}, content_len={}, total={}", chat_id.0, last_tool_name, content.len(), full_response.len()));
+                                        full_response.push_str(&format!("\n\n⚙️ {}\n", summary));
+                                        msg_debug(&format!("[fr_trace][{}] +ToolUse/{}: added={}, summary={:?}, total={} (was {})",
+                                                chat_id.0, name, full_response.len() - _fr_before, truncate_str(&summary, 100), full_response.len(), _fr_before));
                                     }
+                                } else if !pending_cokacdir
+                                    && silent_mode
+                                    && !full_response.is_empty()
+                                    && !full_response.ends_with('\n')
+                                {
+                                    msg_debug(&format!(
+                                        "[polling] silent mode: inserting \\n\\n after tool_use={}",
+                                        name
+                                    ));
+                                    full_response.push_str("\n\n");
+                                    msg_debug(&format!(
+                                        "[fr_trace][{}] +ToolUse/silent_nl: added=2, total={}",
+                                        chat_id.0,
+                                        full_response.len()
+                                    ));
+                                } else if silent_mode {
+                                    msg_debug(&format!("[polling] silent mode: skipped \\n\\n (pending_cokacdir={}, empty={}, ends_nl={})",
+                                            pending_cokacdir, full_response.is_empty(), full_response.ends_with('\n')));
                                 }
-                                StreamMessage::TaskNotification { summary, .. } => {
-                                    if !summary.is_empty() {
-                                        raw_entries.push(RawPayloadEntry { tag: "TaskNotification".into(), content: summary.clone() });
-                                        let _fr_before = full_response.len();
-                                        full_response.push_str(&format!("\n[Task: {}]\n", summary));
-                                        msg_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
+                            }
+                            StreamMessage::ToolResult { content, is_error } => {
+                                msg_debug(&format!("[polling] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}", is_error, content.len(), pending_cokacdir, last_tool_name));
+                                if is_error {
+                                    msg_debug(&format!("[polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
+                                }
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "ToolResult".into(),
+                                    content: format!("is_error={}, content={}", is_error, content),
+                                });
+                                let _fr_before = full_response.len();
+                                if std::mem::take(&mut pending_cokacdir) {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    if std::mem::take(&mut suppress_tool_display) {
+                                        println!("  [{ts}]   ↩ cokacdir (chat_log, suppressed)");
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir_suppressed: added=0, total={}", chat_id.0, full_response.len()));
+                                    } else {
+                                        println!("  [{ts}]   ↩ cokacdir: {content}");
+                                        let formatted = format_cokacdir_result(&content);
+                                        if !formatted.is_empty() {
+                                            full_response.push_str(&format!("\n{}\n", formatted));
+                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir: added={}, preview={:?}, total={} (was {})",
+                                                    chat_id.0, full_response.len() - _fr_before, truncate_str(&formatted, 200), full_response.len(), _fr_before));
+                                        } else {
+                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir: formatted_empty, added=0, total={}", chat_id.0, full_response.len()));
+                                        }
+                                    }
+                                } else if is_error && !silent_mode {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    println!("  [{ts}]   ✗ Error: {content}");
+                                    let truncated = truncate_str(&content, 500);
+                                    if truncated.contains('\n') {
+                                        full_response
+                                            .push_str(&format!("\n```\n{}\n```\n", truncated));
+                                    } else {
+                                        full_response.push_str(&format!("\n`{}`\n\n", truncated));
+                                    }
+                                    msg_debug(&format!("[fr_trace][{}] +ToolResult/error({}): added={}, preview={:?}, total={} (was {})",
+                                            chat_id.0, last_tool_name, full_response.len() - _fr_before, truncate_str(&truncated, 200), full_response.len(), _fr_before));
+                                } else if !silent_mode {
+                                    if last_tool_name == "Read" {
+                                        full_response.push_str(&format!(
+                                            "\n✅ `{} bytes`\n\n",
+                                            content.len()
+                                        ));
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/Read: added={}, content_bytes={}, total={} (was {})",
+                                                chat_id.0, full_response.len() - _fr_before, content.len(), full_response.len(), _fr_before));
+                                    } else if !content.is_empty() {
+                                        let truncated = truncate_str(&content, 300);
+                                        if truncated.contains('\n') {
+                                            full_response
+                                                .push_str(&format!("\n```\n{}\n```\n", truncated));
+                                        } else {
+                                            full_response
+                                                .push_str(&format!("\n✅ `{}`\n\n", truncated));
+                                        }
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): added={}, raw_content_len={}, preview={:?}, total={} (was {})",
+                                                chat_id.0, last_tool_name, full_response.len() - _fr_before, content.len(), truncate_str(&truncated, 200), full_response.len(), _fr_before));
+                                    } else {
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): content_empty, added=0, total={}", chat_id.0, last_tool_name, full_response.len()));
+                                    }
+                                } else {
+                                    msg_debug(&format!("[fr_trace][{}] +ToolResult/silent: skipped, last_tool={}, content_len={}, total={}", chat_id.0, last_tool_name, content.len(), full_response.len()));
+                                }
+                            }
+                            StreamMessage::TaskNotification { summary, .. } => {
+                                if !summary.is_empty() {
+                                    raw_entries.push(RawPayloadEntry {
+                                        tag: "TaskNotification".into(),
+                                        content: summary.clone(),
+                                    });
+                                    let _fr_before = full_response.len();
+                                    full_response.push_str(&format!("\n[Task: {}]\n", summary));
+                                    msg_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
                                             chat_id.0, full_response.len() - _fr_before, truncate_str(&summary, 200), full_response.len(), _fr_before));
-                                    }
                                 }
-                                StreamMessage::Done { result, session_id: sid } => {
-                                    msg_debug(&format!("[polling] Done: result_len={}, session_id={:?}, full_response_len={}",
+                            }
+                            StreamMessage::Done {
+                                result,
+                                session_id: sid,
+                            } => {
+                                msg_debug(&format!("[polling] Done: result_len={}, session_id={:?}, full_response_len={}",
                                         result.len(), sid, full_response.len()));
-                                    ai_trace(&format!("[STREAM] Done: result_len={}, full_response_len={}, session_id={:?}", result.len(), full_response.len(), sid));
-                                    if !result.is_empty() && full_response.is_empty() {
-                                        msg_debug(&format!("[polling] Done: fallback full_response = result ({})", result.len()));
-                                        full_response = result.clone();
-                                        msg_debug(&format!("[fr_trace][{}] +Done/fallback: set={}, preview={:?}, total={}",
+                                ai_trace(&format!("[STREAM] Done: result_len={}, full_response_len={}, session_id={:?}", result.len(), full_response.len(), sid));
+                                if !result.is_empty() && full_response.is_empty() {
+                                    msg_debug(&format!(
+                                        "[polling] Done: fallback full_response = result ({})",
+                                        result.len()
+                                    ));
+                                    full_response = result.clone();
+                                    msg_debug(&format!("[fr_trace][{}] +Done/fallback: set={}, preview={:?}, total={}",
                                             chat_id.0, result.len(), truncate_str(&full_response, 200), full_response.len()));
-                                    } else if !result.is_empty() {
-                                        msg_debug(&format!("[fr_trace][{}] Done/discarded: result_len={} discarded (full_response already has {})",
+                                } else if !result.is_empty() {
+                                    msg_debug(&format!("[fr_trace][{}] Done/discarded: result_len={} discarded (full_response already has {})",
                                             chat_id.0, result.len(), full_response.len()));
-                                    }
-                                    if !result.is_empty() && raw_entries.is_empty() {
-                                        raw_entries.push(RawPayloadEntry { tag: "Text".into(), content: result });
-                                    }
-                                    if let Some(s) = sid {
-                                        new_session_id = Some(s);
-                                    }
-                                    msg_debug(&format!("[fr_trace][{}] =DONE: final_total={}", chat_id.0, full_response.len()));
-                                    done = true;
                                 }
-                                StreamMessage::Error { message, stdout, stderr, exit_code } => {
-                                    msg_debug(&format!("[polling] Error: message={}, exit_code={:?}, stdout_len={}, stderr_len={}",
+                                if !result.is_empty() && raw_entries.is_empty() {
+                                    raw_entries.push(RawPayloadEntry {
+                                        tag: "Text".into(),
+                                        content: result,
+                                    });
+                                }
+                                if let Some(s) = sid {
+                                    new_session_id = Some(s);
+                                }
+                                msg_debug(&format!(
+                                    "[fr_trace][{}] =DONE: final_total={}",
+                                    chat_id.0,
+                                    full_response.len()
+                                ));
+                                done = true;
+                            }
+                            StreamMessage::Error {
+                                message,
+                                stdout,
+                                stderr,
+                                exit_code,
+                            } => {
+                                msg_debug(&format!("[polling] Error: message={}, exit_code={:?}, stdout_len={}, stderr_len={}",
                                         message, exit_code, stdout.len(), stderr.len()));
-                                    ai_trace(&format!("[STREAM] Error: message={}, exit_code={:?}, stdout_len={}, stderr_len={}", message, exit_code, stdout.len(), stderr.len()));
-                                    let stdout_display = if stdout.is_empty() { "(empty)".to_string() } else { stdout };
-                                    let stderr_display = if stderr.is_empty() { "(empty)".to_string() } else { stderr };
-                                    let code_display = match exit_code {
-                                        Some(c) => c.to_string(),
-                                        None => "(unknown)".to_string(),
-                                    };
-                                    full_response = format!(
+                                ai_trace(&format!("[STREAM] Error: message={}, exit_code={:?}, stdout_len={}, stderr_len={}", message, exit_code, stdout.len(), stderr.len()));
+                                let stdout_display = if stdout.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    stdout
+                                };
+                                let stderr_display = if stderr.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    stderr
+                                };
+                                let code_display = match exit_code {
+                                    Some(c) => c.to_string(),
+                                    None => "(unknown)".to_string(),
+                                };
+                                full_response = format!(
                                         "Error: {}\n```\nexit code: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n```",
                                         message, code_display, stdout_display, stderr_display
                                     );
-                                    msg_debug(&format!("[fr_trace][{}] +Error: set={}, stdout_len={}, stderr_len={}, total={}",
+                                msg_debug(&format!("[fr_trace][{}] +Error: set={}, stdout_len={}, stderr_len={}, total={}",
                                         chat_id.0, full_response.len(), stdout_display.len(), stderr_display.len(), full_response.len()));
-                                    raw_entries.push(RawPayloadEntry { tag: "Error".into(), content: format!("exit_code={}, message={}, stdout={}, stderr={}", code_display, message, stdout_display, stderr_display) });
-                                    done = true;
-                                }
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "Error".into(),
+                                    content: format!(
+                                        "exit_code={}, message={}, stdout={}, stderr={}",
+                                        code_display, message, stdout_display, stderr_display
+                                    ),
+                                });
+                                done = true;
                             }
-                        }
+                        },
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            ai_trace(&format!("[STREAM] Channel DISCONNECTED: full_response_len={}", full_response.len()));
+                            ai_trace(&format!(
+                                "[STREAM] Channel DISCONNECTED: full_response_len={}",
+                                full_response.len()
+                            ));
                             done = true;
                             break;
                         }
@@ -10377,7 +16087,8 @@ async fn handle_text_message(
                 if !done {
                     // ── Rolling placeholder pattern (unified for all chats) ──
                     let threshold = file_attach_threshold();
-                    let delta_end = floor_char_boundary(&full_response, full_response.len().min(threshold));
+                    let delta_end =
+                        floor_char_boundary(&full_response, full_response.len().min(threshold));
                     if delta_end > last_confirmed_len {
                         // New content arrived — finalize current placeholder with delta
                         // Cap delta to threshold boundary to prevent message flood
@@ -10394,30 +16105,61 @@ async fn handle_text_message(
                                 placeholder_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, full_response.len()));
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             if html_delta.len() <= TELEGRAM_MSG_LIMIT {
-                                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_delta)
-                                    .parse_mode(ParseMode::Html).await);
+                                let _ = tg!(
+                                    "edit_message",
+                                    bot_owned
+                                        .edit_message_text(chat_id, placeholder_msg_id, &html_delta)
+                                        .parse_mode(ParseMode::Html)
+                                        .await
+                                );
                             } else {
                                 // Delta too large for single edit — send via send_long_message
-                                if send_long_message(&bot_owned, chat_id, &html_delta, Some(ParseMode::Html), &state_owned).await.is_ok() {
+                                if send_long_message(
+                                    &bot_owned,
+                                    chat_id,
+                                    &html_delta,
+                                    Some(ParseMode::Html),
+                                    &state_owned,
+                                )
+                                .await
+                                .is_ok()
+                                {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                    let _ = tg!(
+                                        "delete_message",
+                                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                    );
                                 } else {
-                                    let truncated_delta = truncate_str(&normalized_delta, TELEGRAM_MSG_LIMIT);
-                                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated_delta).await);
+                                    let truncated_delta =
+                                        truncate_str(&normalized_delta, TELEGRAM_MSG_LIMIT);
+                                    let _ = tg!(
+                                        "edit_message",
+                                        bot_owned
+                                            .edit_message_text(
+                                                chat_id,
+                                                placeholder_msg_id,
+                                                &truncated_delta
+                                            )
+                                            .await
+                                    );
                                 }
                             }
                             last_confirmed_len = delta_end;
                             // Create new placeholder for next cycle
                             let old_ph_id = placeholder_msg_id;
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
+                            match tg!("send_message", bot_owned.send_message(chat_id, "...").await)
+                            {
                                 Ok(new_ph) => {
                                     placeholder_msg_id = new_ph.id;
                                     msg_debug(&format!("[rolling_ph] NEW placeholder: old_msg_id={}, new_msg_id={}", old_ph_id, placeholder_msg_id));
                                 }
                                 Err(e) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}]   ⚠ new placeholder failed: {}", redact_err(&e));
+                                    println!(
+                                        "  [{ts}]   ⚠ new placeholder failed: {}",
+                                        redact_err(&e)
+                                    );
                                     msg_debug(&format!("[rolling_ph] NEW placeholder FAILED: keeping msg_id={}, err={}", placeholder_msg_id, e));
                                 }
                             }
@@ -10432,16 +16174,30 @@ async fn handle_text_message(
                         if display_text != last_edit_text {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             let html_text = markdown_to_telegram_html(&display_text);
-                            if let Err(e) = tg!("edit_message", &state_owned, chat_id, bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
-                                .parse_mode(ParseMode::Html).await)
-                            {
+                            if let Err(e) = tg!(
+                                "edit_message",
+                                &state_owned,
+                                chat_id,
+                                bot_owned
+                                    .edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                                    .parse_mode(ParseMode::Html)
+                                    .await
+                            ) {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
-                                println!("  [{ts}]   ⚠ edit_message failed (streaming): {}", redact_err(&e));
+                                println!(
+                                    "  [{ts}]   ⚠ edit_message failed (streaming): {}",
+                                    redact_err(&e)
+                                );
                             }
                             last_edit_text = display_text;
                         } else {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("send_chat_action", bot_owned.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await);
+                            let _ = tg!(
+                                "send_chat_action",
+                                bot_owned
+                                    .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                                    .await
+                            );
                         }
                     }
                 }
@@ -10469,61 +16225,149 @@ async fn handle_text_message(
                 if was_originally_empty {
                     ai_trace(&format!("[FINAL] full_response is EMPTY → (No response). cancelled={}, last_confirmed_len={}", cancelled, last_confirmed_len));
                     full_response = "(No response)".to_string();
-                    msg_debug(&format!("[fr_trace][{}] =NoResponse: set to '(No response)', cancelled={}", chat_id.0, cancelled));
+                    msg_debug(&format!(
+                        "[fr_trace][{}] =NoResponse: set to '(No response)', cancelled={}",
+                        chat_id.0, cancelled
+                    ));
                 } else {
-                    ai_trace(&format!("[FINAL] full_response_len={}, last_confirmed_len={}, remaining_len={}",
-                        full_response.len(), last_confirmed_len, full_response.len().saturating_sub(last_confirmed_len)));
+                    ai_trace(&format!(
+                        "[FINAL] full_response_len={}, last_confirmed_len={}, remaining_len={}",
+                        full_response.len(),
+                        last_confirmed_len,
+                        full_response.len().saturating_sub(last_confirmed_len)
+                    ));
                 }
 
                 let final_response = normalize_empty_lines(&full_response);
 
                 // ── Send only remaining delta (unified rolling placeholder) ──
-                if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
+                if full_response.len() < last_confirmed_len
+                    || !full_response.is_char_boundary(last_confirmed_len)
+                {
+                    last_confirmed_len = 0;
+                }
                 let remaining = &full_response[last_confirmed_len..];
                 msg_debug(&format!("[rolling_ph] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
                     placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
                 if was_originally_empty || remaining.trim().is_empty() {
                     // No new content — delete the spinner placeholder
-                    msg_debug(&format!("[rolling_ph] FINAL DELETE placeholder: msg_id={}", placeholder_msg_id));
+                    msg_debug(&format!(
+                        "[rolling_ph] FINAL DELETE placeholder: msg_id={}",
+                        placeholder_msg_id
+                    ));
                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                    let _ = tg!(
+                        "delete_message",
+                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                    );
                 } else if should_attach_response_as_file(full_response.len(), provider_str) {
                     // Response too large — send as file attachment
-                    msg_debug(&format!("[rolling_ph] FINAL FILE ATTACH: total={}", full_response.len()));
+                    msg_debug(&format!(
+                        "[rolling_ph] FINAL FILE ATTACH: total={}",
+                        full_response.len()
+                    ));
                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, "\u{1f4c4} Response attached as file").await);
-                    send_response_as_file(&bot_owned, chat_id, &final_response, &state_owned, "response").await;
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(
+                                chat_id,
+                                placeholder_msg_id,
+                                "\u{1f4c4} Response attached as file"
+                            )
+                            .await
+                    );
+                    send_response_as_file(
+                        &bot_owned,
+                        chat_id,
+                        &final_response,
+                        &state_owned,
+                        "response",
+                    )
+                    .await;
                 } else {
                     let normalized_remaining = normalize_empty_lines(remaining);
                     let html_remaining = markdown_to_telegram_html(&normalized_remaining);
-                    msg_debug(&format!("[rolling_ph] FINAL EDIT placeholder: msg_id={}, html_len={}", placeholder_msg_id, html_remaining.len()));
+                    msg_debug(&format!(
+                        "[rolling_ph] FINAL EDIT placeholder: msg_id={}, html_len={}",
+                        placeholder_msg_id,
+                        html_remaining.len()
+                    ));
                     if html_remaining.len() <= TELEGRAM_MSG_LIMIT {
-                        if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_remaining)
-                            .parse_mode(ParseMode::Html).await)
-                        {
+                        if let Err(e) = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(chat_id, placeholder_msg_id, &html_remaining)
+                                .parse_mode(ParseMode::Html)
+                                .await
+                        ) {
                             let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!("  [{ts}]   ⚠ edit_message failed (final HTML): {}", redact_err(&e));
+                            println!(
+                                "  [{ts}]   ⚠ edit_message failed (final HTML): {}",
+                                redact_err(&e)
+                            );
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &normalized_remaining).await);
+                            let _ = tg!(
+                                "edit_message",
+                                bot_owned
+                                    .edit_message_text(
+                                        chat_id,
+                                        placeholder_msg_id,
+                                        &normalized_remaining
+                                    )
+                                    .await
+                            );
                         }
                     } else {
-                        let send_result = send_long_message(&bot_owned, chat_id, &html_remaining, Some(ParseMode::Html), &state_owned).await;
+                        let send_result = send_long_message(
+                            &bot_owned,
+                            chat_id,
+                            &html_remaining,
+                            Some(ParseMode::Html),
+                            &state_owned,
+                        )
+                        .await;
                         match send_result {
                             Ok(_) => {
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                let _ = tg!(
+                                    "delete_message",
+                                    bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                );
                             }
                             Err(_) => {
-                                let fallback = send_long_message(&bot_owned, chat_id, &normalized_remaining, None, &state_owned).await;
+                                let fallback = send_long_message(
+                                    &bot_owned,
+                                    chat_id,
+                                    &normalized_remaining,
+                                    None,
+                                    &state_owned,
+                                )
+                                .await;
                                 match fallback {
                                     Ok(_) => {
                                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                        let _ = tg!(
+                                            "delete_message",
+                                            bot_owned
+                                                .delete_message(chat_id, placeholder_msg_id)
+                                                .await
+                                        );
                                     }
                                     Err(_) => {
                                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let truncated = truncate_str(&normalized_remaining, TELEGRAM_MSG_LIMIT);
-                                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated).await);
+                                        let truncated =
+                                            truncate_str(&normalized_remaining, TELEGRAM_MSG_LIMIT);
+                                        let _ = tg!(
+                                            "edit_message",
+                                            bot_owned
+                                                .edit_message_text(
+                                                    chat_id,
+                                                    placeholder_msg_id,
+                                                    &truncated
+                                                )
+                                                .await
+                                        );
                                     }
                                 }
                             }
@@ -10534,7 +16378,10 @@ async fn handle_text_message(
                 // Clean up leftover "Stopping..." message if /stop raced with normal completion
                 if let Some(msg_id) = stop_msg_id {
                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+                    let _ = tg!(
+                        "delete_message",
+                        bot_owned.delete_message(chat_id, msg_id).await
+                    );
                 }
 
                 // Update session state
@@ -10555,8 +16402,14 @@ async fn handle_text_message(
                     // writeback.
                     let model_now = data.settings.models.get(&chat_id.0.to_string()).cloned();
                     let provider_now = detect_provider(model_now.as_deref());
-                    let path_now = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
-                    let sid_now = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+                    let path_now = data
+                        .sessions
+                        .get(&chat_id)
+                        .and_then(|s| s.current_path.clone());
+                    let sid_now = data
+                        .sessions
+                        .get(&chat_id)
+                        .and_then(|s| s.session_id.clone());
                     let epoch_now = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
                     // sid comparison catches /clear (sid → None) and /start <session-id>
                     // same-path swaps (sid → different value). epoch_now catches /clear on
@@ -10591,35 +16444,51 @@ async fn handle_text_message(
                             });
                         }
                         save_session_to_file(session, &current_path, provider_str);
-                        msg_debug(&format!("[polling] session saved: session_id={:?}, history_len={}",
-                            session.session_id, session.history.len()));
+                        msg_debug(&format!(
+                            "[polling] session saved: session_id={:?}, history_len={}",
+                            session.session_id,
+                            session.history.len()
+                        ));
                     }
                     // Write to group chat shared log (for cross-bot context sharing)
-                    msg_debug(&format!("[polling] JSONL check: chat_id={}, raw_entries_count={}",
-                        chat_id.0, raw_entries.len()));
+                    msg_debug(&format!(
+                        "[polling] JSONL check: chat_id={}, raw_entries_count={}",
+                        chat_id.0,
+                        raw_entries.len()
+                    ));
                     if chat_id.0 < 0 {
                         let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                        let dn = if bot_display_name_for_log.is_empty() { None } else { Some(bot_display_name_for_log.clone()) };
-                        append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                            ts: now_ts.clone(),
-                            bot: bot_username_for_log.clone(),
-                            bot_display_name: dn.clone(),
-                            role: "user".to_string(),
-                            from: Some(user_display_name_owned.clone()),
-                            text: user_text_owned.clone(),
-                            clear: false,
-                        });
+                        let dn = if bot_display_name_for_log.is_empty() {
+                            None
+                        } else {
+                            Some(bot_display_name_for_log.clone())
+                        };
+                        append_group_chat_log(
+                            chat_id.0,
+                            &GroupChatLogEntry {
+                                ts: now_ts.clone(),
+                                bot: bot_username_for_log.clone(),
+                                bot_display_name: dn.clone(),
+                                role: "user".to_string(),
+                                from: Some(user_display_name_owned.clone()),
+                                text: user_text_owned.clone(),
+                                clear: false,
+                            },
+                        );
                         if !raw_entries.is_empty() {
                             msg_debug(&format!("[polling] JSONL: writing user+assistant entries, raw_entries_count={}", raw_entries.len()));
-                            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                                ts: now_ts,
-                                bot: bot_username_for_log.clone(),
-                                bot_display_name: dn,
-                                role: "assistant".to_string(),
-                                from: None,
-                                text: serialize_payload(&std::mem::take(&mut raw_entries)),
-                                clear: false,
-                            });
+                            append_group_chat_log(
+                                chat_id.0,
+                                &GroupChatLogEntry {
+                                    ts: now_ts,
+                                    bot: bot_username_for_log.clone(),
+                                    bot_display_name: dn,
+                                    role: "assistant".to_string(),
+                                    from: None,
+                                    text: serialize_payload(&std::mem::take(&mut raw_entries)),
+                                    clear: false,
+                                },
+                            );
                         } else {
                             msg_debug(&format!("[polling] JSONL: user entry written, assistant SKIPPED (raw_entries is empty)"));
                         }
@@ -10637,7 +16506,10 @@ async fn handle_text_message(
                     };
                     if let Some(hook_msg) = end_hook_msg {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("send_message", bot_owned.send_message(chat_id, &hook_msg).await);
+                        let _ = tg!(
+                            "send_message",
+                            bot_owned.send_message(chat_id, &hook_msg).await
+                        );
                     }
                 }
 
@@ -10646,22 +16518,56 @@ async fn handle_text_message(
                 // --fork-session; Codex reads the full-fidelity archive and
                 // dispatches an independent --ephemeral exec). The surrounding
                 // loop-state / cancel / re-inject logic is shared.
-                if !cancelled && !cancel_token.cancelled.load(Ordering::Relaxed)
-                    && (provider_str == "claude" || provider_str == "codex" || provider_str == "opencode") {
-                        let loop_info = {
-                            let data = state_owned.lock().await;
-                            data.loop_states.get(&chat_id).map(|ls| {
-                                let sid = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
-                                let cwd = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone()).unwrap_or_default();
-                                let effort = get_effort_for_provider(&data.settings, chat_id, provider_str);
-                                let codex_fast = is_codex_fast(&data.settings, chat_id);
-                                (ls.remaining, ls.max_iterations, ls.original_request.clone(), sid, cwd, effort, codex_fast)
-                            })
-                        };
-                    if let Some((remaining, max_iterations, original_request, sid, cwd, effort_for_verify, codex_fast_for_verify)) = loop_info {
+                if !cancelled
+                    && !cancel_token.cancelled.load(Ordering::Relaxed)
+                    && (provider_str == "claude"
+                        || provider_str == "codex"
+                        || provider_str == "opencode")
+                {
+                    let loop_info = {
+                        let data = state_owned.lock().await;
+                        data.loop_states.get(&chat_id).map(|ls| {
+                            let sid = data
+                                .sessions
+                                .get(&chat_id)
+                                .and_then(|s| s.session_id.clone());
+                            let cwd = data
+                                .sessions
+                                .get(&chat_id)
+                                .and_then(|s| s.current_path.clone())
+                                .unwrap_or_default();
+                            let effort =
+                                get_effort_for_provider(&data.settings, chat_id, provider_str);
+                            let codex_fast = is_codex_fast(&data.settings, chat_id);
+                            (
+                                ls.remaining,
+                                ls.max_iterations,
+                                ls.original_request.clone(),
+                                sid,
+                                cwd,
+                                effort,
+                                codex_fast,
+                            )
+                        })
+                    };
+                    if let Some((
+                        remaining,
+                        max_iterations,
+                        original_request,
+                        sid,
+                        cwd,
+                        effort_for_verify,
+                        codex_fast_for_verify,
+                    )) = loop_info
+                    {
                         if let Some(session_id) = sid {
-                            msg_debug(&format!("[loop] verifying ({}): session_id={}, remaining={}, request={:?}",
-                                provider_str, session_id, remaining, truncate_str(&original_request, 60)));
+                            msg_debug(&format!(
+                                "[loop] verifying ({}): session_id={}, remaining={}, request={:?}",
+                                provider_str,
+                                session_id,
+                                remaining,
+                                truncate_str(&original_request, 60)
+                            ));
                             // Show spinner during verification. Alternating
                             // magnifying-glass frames (🔍/🔎) typed one letter
                             // at a time give a lightweight "scanning" feel
@@ -10670,13 +16576,24 @@ async fn handle_text_message(
                             // by frame edits; it is stopped once verify
                             // returns, before the message is deleted.
                             const VERIFY_SPINNER: &[&str] = &[
-                                "🔍 V",           "🔎 Ve",          "🔍 Ver",
-                                "🔎 Veri",        "🔍 Verif",       "🔎 Verify",
-                                "🔍 Verifyi",     "🔎 Verifyin",    "🔍 Verifying",
-                                "🔎 Verifying.",  "🔍 Verifying..", "🔎 Verifying...",
+                                "🔍 V",
+                                "🔎 Ve",
+                                "🔍 Ver",
+                                "🔎 Veri",
+                                "🔍 Verif",
+                                "🔎 Verify",
+                                "🔍 Verifyi",
+                                "🔎 Verifyin",
+                                "🔍 Verifying",
+                                "🔎 Verifying.",
+                                "🔍 Verifying..",
+                                "🔎 Verifying...",
                             ];
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let verify_msg = tg!("send_message", bot_owned.send_message(chat_id, VERIFY_SPINNER[0]).await);
+                            let verify_msg = tg!(
+                                "send_message",
+                                bot_owned.send_message(chat_id, VERIFY_SPINNER[0]).await
+                            );
                             let verify_msg_id = verify_msg.ok().map(|m| m.id);
 
                             // Start background frame-edit task
@@ -10693,14 +16610,26 @@ async fn handle_text_message(
                                     let mut idx: usize = 1;
                                     let mut last_text = VERIFY_SPINNER[0].to_string();
                                     while !stop_flag.load(Ordering::Relaxed) {
-                                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                                        if stop_flag.load(Ordering::Relaxed) { break; }
+                                        tokio::time::sleep(std::time::Duration::from_millis(400))
+                                            .await;
+                                        if stop_flag.load(Ordering::Relaxed) {
+                                            break;
+                                        }
                                         let frame = VERIFY_SPINNER[idx % VERIFY_SPINNER.len()];
                                         idx += 1;
                                         if frame != last_text {
                                             shared_rate_limit_wait(&state_anim, chat_id).await;
-                                            if stop_flag.load(Ordering::Relaxed) { break; }
-                                            let _ = tg!("edit_message", &state_anim, chat_id, bot_anim.edit_message_text(chat_id, msg_id, frame).await);
+                                            if stop_flag.load(Ordering::Relaxed) {
+                                                break;
+                                            }
+                                            let _ = tg!(
+                                                "edit_message",
+                                                &state_anim,
+                                                chat_id,
+                                                bot_anim
+                                                    .edit_message_text(chat_id, msg_id, frame)
+                                                    .await
+                                            );
                                             last_text = frame.to_string();
                                         }
                                     }
@@ -10758,21 +16687,41 @@ async fn handle_text_message(
                                 let data = state_owned.lock().await;
                                 data.request_tasks.clone()
                             };
-                            let verify_result = spawn_tracked_blocking_result(request_tasks, move || {
-                                match provider_for_verify {
-                                    "codex" => crate::services::codex::verify_completion_codex(&sid_clone, &cwd_clone, effort_for_verify.as_deref(), codex_fast_for_verify),
-                                    "opencode" => crate::services::opencode::verify_completion_opencode(&sid_clone, &cwd_clone),
-                                    _ => crate::services::claude::verify_completion(&sid_clone, &cwd_clone, effort_for_verify.as_deref()),
-                                }
-                            }).await;
+                            let verify_result =
+                                spawn_tracked_blocking_result(request_tasks, move || {
+                                    match provider_for_verify {
+                                        "codex" => crate::services::codex::verify_completion_codex(
+                                            &sid_clone,
+                                            &cwd_clone,
+                                            effort_for_verify.as_deref(),
+                                            codex_fast_for_verify,
+                                        ),
+                                        "opencode" => {
+                                            crate::services::opencode::verify_completion_opencode(
+                                                &sid_clone, &cwd_clone,
+                                            )
+                                        }
+                                        _ => crate::services::claude::verify_completion(
+                                            &sid_clone,
+                                            &cwd_clone,
+                                            effort_for_verify.as_deref(),
+                                        ),
+                                    }
+                                })
+                                .await;
                             // Stop animation and await its task so no stray
                             // edit lands after the delete below.
                             verify_anim_stop.store(true, Ordering::Relaxed);
-                            if let Some(h) = verify_anim_handle { let _ = h.await; }
+                            if let Some(h) = verify_anim_handle {
+                                let _ = h.await;
+                            }
                             // Remove spinner
                             if let Some(msg_id) = verify_msg_id {
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+                                let _ = tg!(
+                                    "delete_message",
+                                    bot_owned.delete_message(chat_id, msg_id).await
+                                );
                             }
                             // Re-check: /stop may have been called during verification.
                             // /clear or /model (provider switch) may have removed loop_states
@@ -10792,114 +16741,163 @@ async fn handle_text_message(
                             } else if !loop_active_post_verify {
                                 msg_debug("[loop] loop_states removed during verification — skip post-verify outcome");
                             } else {
-                            match verify_result {
-                                Ok(Some(Ok(result))) => {
-                                    if result.complete {
-                                        msg_debug("[loop] mission_complete — loop finished");
-                                        // Re-check loop_states under the lock: /clear or /model
-                                        // (provider switch) may have removed it between the outer
-                                        // gate and now. Honour that intent — skip the outcome
-                                        // message uniformly with the reinject branch's safety net.
-                                        let still_active = {
-                                            let mut data = state_owned.lock().await;
-                                            data.loop_states.remove(&chat_id).is_some()
-                                        };
-                                        if still_active {
-                                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                                            let _ = tg!("send_message", bot_owned.send_message(chat_id, "✅ Loop complete — task verified as done.").await);
+                                match verify_result {
+                                    Ok(Some(Ok(result))) => {
+                                        if result.complete {
+                                            msg_debug("[loop] mission_complete — loop finished");
+                                            // Re-check loop_states under the lock: /clear or /model
+                                            // (provider switch) may have removed it between the outer
+                                            // gate and now. Honour that intent — skip the outcome
+                                            // message uniformly with the reinject branch's safety net.
+                                            let still_active = {
+                                                let mut data = state_owned.lock().await;
+                                                data.loop_states.remove(&chat_id).is_some()
+                                            };
+                                            if still_active {
+                                                shared_rate_limit_wait(&state_owned, chat_id).await;
+                                                let _ = tg!("send_message", bot_owned.send_message(chat_id, "✅ Loop complete — task verified as done.").await);
+                                            } else {
+                                                msg_debug("[loop] loop_states removed before complete-message — skip");
+                                            }
+                                        } else if max_iterations > 0 && remaining <= 1 {
+                                            msg_debug(
+                                                "[loop] max iterations reached — loop stopped",
+                                            );
+                                            // Same race-safety net as the complete branch.
+                                            let still_active = {
+                                                let mut data = state_owned.lock().await;
+                                                data.loop_states.remove(&chat_id).is_some()
+                                            };
+                                            if still_active {
+                                                shared_rate_limit_wait(&state_owned, chat_id).await;
+                                                let feedback_preview = result
+                                                    .feedback
+                                                    .as_deref()
+                                                    .unwrap_or("(no details)");
+                                                let msg = format!(
+                                                    "⚠️ Loop limit reached. Remaining issue:\n{}",
+                                                    feedback_preview
+                                                );
+                                                let _ = tg!(
+                                                    "send_message",
+                                                    bot_owned.send_message(chat_id, &msg).await
+                                                );
+                                            } else {
+                                                msg_debug("[loop] loop_states removed before limit-message — skip");
+                                            }
                                         } else {
-                                            msg_debug("[loop] loop_states removed before complete-message — skip");
-                                        }
-                                    } else if max_iterations > 0 && remaining <= 1 {
-                                        msg_debug("[loop] max iterations reached — loop stopped");
-                                        // Same race-safety net as the complete branch.
-                                        let still_active = {
-                                            let mut data = state_owned.lock().await;
-                                            data.loop_states.remove(&chat_id).is_some()
-                                        };
-                                        if still_active {
-                                            shared_rate_limit_wait(&state_owned, chat_id).await;
-                                            let feedback_preview = result.feedback.as_deref().unwrap_or("(no details)");
-                                            let msg = format!("⚠️ Loop limit reached. Remaining issue:\n{}", feedback_preview);
-                                            let _ = tg!("send_message", bot_owned.send_message(chat_id, &msg).await);
-                                        } else {
-                                            msg_debug("[loop] loop_states removed before limit-message — skip");
-                                        }
-                                    } else {
-                                        // Incomplete: use feedback if available, otherwise fall back to original request
-                                        let reinject_text = result.feedback.unwrap_or_else(|| {
+                                            // Incomplete: use feedback if available, otherwise fall back to original request
+                                            let reinject_text = result.feedback.unwrap_or_else(|| {
                                             format!("Continue the previous task. The original request was: {}", original_request)
                                         });
-                                        // For unlimited (max_iterations==0): don't decrement, track iteration count separately
-                                        let (new_remaining, iteration) = if max_iterations == 0 {
-                                            // remaining counts UP from 0 for display; never decremented to trigger limit
-                                            (remaining.saturating_add(1), remaining.saturating_add(1))
-                                        } else {
-                                            let nr = remaining - 1;
-                                            (nr, max_iterations - nr)
-                                        };
-                                        msg_debug(&format!("[loop] incomplete — re-requesting (remaining={}): {:?}",
-                                            new_remaining, truncate_str(&reinject_text, 100)));
-                                        let iter_label = if max_iterations == 0 {
-                                            format!("🔄 Loop iteration {}\n{}", iteration, reinject_text)
-                                        } else {
-                                            format!("🔄 Loop iteration {}/{}\n{}", iteration, max_iterations, reinject_text)
-                                        };
-                                        shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let _ = tg!("send_message", bot_owned.send_message(chat_id, &iter_label).await);
-                                        // Store feedback for dispatch_loop_feedback to pick up.
-                                        // Cannot call handle_text_message directly here because
-                                        // its future is not Send-safe inside tokio::spawn.
-                                        // Re-check cancellation under the lock so /stop arriving
-                                        // between the verify-result check and this insert cannot
-                                        // leave behind a feedback that re-injects after /stop.
-                                        {
-                                            let mut data = state_owned.lock().await;
-                                            if cancel_token.cancelled.load(Ordering::Relaxed) {
-                                                msg_debug("[loop] cancelled during result processing — skip reinject");
-                                            } else if !data.loop_states.contains_key(&chat_id) {
-                                                // loop_states cleared externally (e.g. /clear, /model provider switch)
-                                                // between verify start and finish — honour that intent and skip reinject
-                                                // so the loop does not silently resume.
-                                                msg_debug("[loop] loop_states removed during verification — skip reinject");
+                                            // For unlimited (max_iterations==0): don't decrement, track iteration count separately
+                                            let (new_remaining, iteration) = if max_iterations == 0
+                                            {
+                                                // remaining counts UP from 0 for display; never decremented to trigger limit
+                                                (
+                                                    remaining.saturating_add(1),
+                                                    remaining.saturating_add(1),
+                                                )
                                             } else {
-                                                if let Some(ls) = data.loop_states.get_mut(&chat_id) {
-                                                    ls.remaining = new_remaining;
+                                                let nr = remaining - 1;
+                                                (nr, max_iterations - nr)
+                                            };
+                                            msg_debug(&format!("[loop] incomplete — re-requesting (remaining={}): {:?}",
+                                            new_remaining, truncate_str(&reinject_text, 100)));
+                                            let iter_label = if max_iterations == 0 {
+                                                format!(
+                                                    "🔄 Loop iteration {}\n{}",
+                                                    iteration, reinject_text
+                                                )
+                                            } else {
+                                                format!(
+                                                    "🔄 Loop iteration {}/{}\n{}",
+                                                    iteration, max_iterations, reinject_text
+                                                )
+                                            };
+                                            shared_rate_limit_wait(&state_owned, chat_id).await;
+                                            let _ = tg!(
+                                                "send_message",
+                                                bot_owned.send_message(chat_id, &iter_label).await
+                                            );
+                                            // Store feedback for dispatch_loop_feedback to pick up.
+                                            // Cannot call handle_text_message directly here because
+                                            // its future is not Send-safe inside tokio::spawn.
+                                            // Re-check cancellation under the lock so /stop arriving
+                                            // between the verify-result check and this insert cannot
+                                            // leave behind a feedback that re-injects after /stop.
+                                            {
+                                                let mut data = state_owned.lock().await;
+                                                if cancel_token.cancelled.load(Ordering::Relaxed) {
+                                                    msg_debug("[loop] cancelled during result processing — skip reinject");
+                                                } else if !data.loop_states.contains_key(&chat_id) {
+                                                    // loop_states cleared externally (e.g. /clear, /model provider switch)
+                                                    // between verify start and finish — honour that intent and skip reinject
+                                                    // so the loop does not silently resume.
+                                                    msg_debug("[loop] loop_states removed during verification — skip reinject");
+                                                } else {
+                                                    if let Some(ls) =
+                                                        data.loop_states.get_mut(&chat_id)
+                                                    {
+                                                        ls.remaining = new_remaining;
+                                                    }
+                                                    data.loop_feedback.insert(
+                                                        chat_id,
+                                                        (
+                                                            reinject_text,
+                                                            user_display_name_owned.clone(),
+                                                        ),
+                                                    );
+                                                    loop_reinjected = true;
                                                 }
-                                                data.loop_feedback.insert(chat_id, (reinject_text, user_display_name_owned.clone()));
-                                                loop_reinjected = true;
                                             }
                                         }
                                     }
-                                }
-                                Ok(Some(Err(e))) => {
-                                    msg_debug(&format!("[loop] verify_completion error: {}", e));
-                                    {
-                                        let mut data = state_owned.lock().await;
-                                        data.loop_states.remove(&chat_id);
+                                    Ok(Some(Err(e))) => {
+                                        msg_debug(&format!(
+                                            "[loop] verify_completion error: {}",
+                                            e
+                                        ));
+                                        {
+                                            let mut data = state_owned.lock().await;
+                                            data.loop_states.remove(&chat_id);
+                                        }
+                                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                                        let _ = tg!(
+                                            "send_message",
+                                            bot_owned
+                                                .send_message(
+                                                    chat_id,
+                                                    &format!("⚠️ Loop verification failed: {}", e)
+                                                )
+                                                .await
+                                        );
                                     }
-                                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("send_message", bot_owned.send_message(chat_id,
-                                        &format!("⚠️ Loop verification failed: {}", e)).await);
-                                }
-                                Ok(None) => {
-                                    msg_debug("[loop] verify task aborted before start");
-                                    {
-                                        let mut data = state_owned.lock().await;
-                                        data.loop_states.remove(&chat_id);
+                                    Ok(None) => {
+                                        msg_debug("[loop] verify task aborted before start");
+                                        {
+                                            let mut data = state_owned.lock().await;
+                                            data.loop_states.remove(&chat_id);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        msg_debug(&format!("[loop] spawn_blocking error: {}", e));
+                                        {
+                                            let mut data = state_owned.lock().await;
+                                            data.loop_states.remove(&chat_id);
+                                        }
+                                        shared_rate_limit_wait(&state_owned, chat_id).await;
+                                        let _ = tg!(
+                                            "send_message",
+                                            bot_owned
+                                                .send_message(
+                                                    chat_id,
+                                                    &format!("⚠️ Loop verification failed: {}", e)
+                                                )
+                                                .await
+                                        );
                                     }
                                 }
-                                Err(e) => {
-                                    msg_debug(&format!("[loop] spawn_blocking error: {}", e));
-                                    {
-                                        let mut data = state_owned.lock().await;
-                                        data.loop_states.remove(&chat_id);
-                                    }
-                                    shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("send_message", bot_owned.send_message(chat_id,
-                                        &format!("⚠️ Loop verification failed: {}", e)).await);
-                                }
-                            }
                             } // else (not cancelled during verification)
                         } else {
                             msg_debug("[loop] no session_id available — cannot verify");
@@ -10937,16 +16935,43 @@ async fn handle_text_message(
             shared_rate_limit_wait(&state_owned, chat_id).await;
 
             // ── Show only remaining delta + [Stopped] (unified rolling placeholder) ──
-            if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
+            if full_response.len() < last_confirmed_len
+                || !full_response.is_char_boundary(last_confirmed_len)
+            {
+                last_confirmed_len = 0;
+            }
             let remaining = &full_response[last_confirmed_len..];
-            msg_debug(&format!("[rolling_ph] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
-                placeholder_msg_id, last_confirmed_len, remaining.trim().len()));
+            msg_debug(&format!(
+                "[rolling_ph] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
+                placeholder_msg_id,
+                last_confirmed_len,
+                remaining.trim().len()
+            ));
             if should_attach_response_as_file(full_response.len(), provider_str) {
                 // Large stopped response — send as file
-                msg_debug(&format!("[rolling_ph] STOPPED FILE ATTACH: total={}", full_response.len()));
+                msg_debug(&format!(
+                    "[rolling_ph] STOPPED FILE ATTACH: total={}",
+                    full_response.len()
+                ));
                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, "\u{1f4c4} Response attached as file [Stopped]").await);
-                send_response_as_file(&bot_owned, chat_id, &stopped_response, &state_owned, "response").await;
+                let _ = tg!(
+                    "edit_message",
+                    bot_owned
+                        .edit_message_text(
+                            chat_id,
+                            placeholder_msg_id,
+                            "\u{1f4c4} Response attached as file [Stopped]"
+                        )
+                        .await
+                );
+                send_response_as_file(
+                    &bot_owned,
+                    chat_id,
+                    &stopped_response,
+                    &state_owned,
+                    "response",
+                )
+                .await;
             } else {
                 let display_stopped = if remaining.trim().is_empty() {
                     "[Stopped]".to_string()
@@ -10956,32 +16981,74 @@ async fn handle_text_message(
                 };
                 let html_stopped = markdown_to_telegram_html(&display_stopped);
                 if html_stopped.len() <= TELEGRAM_MSG_LIMIT {
-                    if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
-                        .parse_mode(ParseMode::Html).await)
-                    {
+                    if let Err(e) = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
+                            .parse_mode(ParseMode::Html)
+                            .await
+                    ) {
                         let ts_err = chrono::Local::now().format("%H:%M:%S");
-                        println!("  [{ts_err}]   ⚠ edit_message failed (stopped HTML): {}", redact_err(&e));
+                        println!(
+                            "  [{ts_err}]   ⚠ edit_message failed (stopped HTML): {}",
+                            redact_err(&e)
+                        );
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &display_stopped).await);
+                        let _ = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(chat_id, placeholder_msg_id, &display_stopped)
+                                .await
+                        );
                     }
                 } else {
-                    let send_result = send_long_message(&bot_owned, chat_id, &html_stopped, Some(ParseMode::Html), &state_owned).await;
+                    let send_result = send_long_message(
+                        &bot_owned,
+                        chat_id,
+                        &html_stopped,
+                        Some(ParseMode::Html),
+                        &state_owned,
+                    )
+                    .await;
                     match send_result {
                         Ok(_) => {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                            let _ = tg!(
+                                "delete_message",
+                                bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                            );
                         }
                         Err(_) => {
-                            let fallback = send_long_message(&bot_owned, chat_id, &display_stopped, None, &state_owned).await;
+                            let fallback = send_long_message(
+                                &bot_owned,
+                                chat_id,
+                                &display_stopped,
+                                None,
+                                &state_owned,
+                            )
+                            .await;
                             match fallback {
                                 Ok(_) => {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                    let _ = tg!(
+                                        "delete_message",
+                                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                    );
                                 }
                                 Err(_) => {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let truncated = truncate_str(&display_stopped, TELEGRAM_MSG_LIMIT);
-                                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated).await);
+                                    let truncated =
+                                        truncate_str(&display_stopped, TELEGRAM_MSG_LIMIT);
+                                    let _ = tg!(
+                                        "edit_message",
+                                        bot_owned
+                                            .edit_message_text(
+                                                chat_id,
+                                                placeholder_msg_id,
+                                                &truncated
+                                            )
+                                            .await
+                                    );
                                 }
                             }
                         }
@@ -10995,7 +17062,10 @@ async fn handle_text_message(
             };
             if let Some(msg_id) = stop_msg_id {
                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+                let _ = tg!(
+                    "delete_message",
+                    bot_owned.delete_message(chat_id, msg_id).await
+                );
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -11013,8 +17083,14 @@ async fn handle_text_message(
             // and brand-new-session /clear (where sid stays None).
             let model_now = data.settings.models.get(&chat_id.0.to_string()).cloned();
             let provider_now = detect_provider(model_now.as_deref());
-            let path_now = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
-            let sid_now = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+            let path_now = data
+                .sessions
+                .get(&chat_id)
+                .and_then(|s| s.current_path.clone());
+            let sid_now = data
+                .sessions
+                .get(&chat_id)
+                .and_then(|s| s.session_id.clone());
             let epoch_now = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
             let session_changed = provider_now != provider_str
                 || path_now.as_deref() != Some(current_path.as_str())
@@ -11039,31 +17115,44 @@ async fn handle_text_message(
             }
             // Write to group chat shared log (for cross-bot context sharing).
             // Mirrors the normal-completion branch: written regardless of session_changed.
-            msg_debug(&format!("[polling] JSONL stopped check: chat_id={}, raw_entries_count={}",
-                chat_id.0, raw_entries.len()));
+            msg_debug(&format!(
+                "[polling] JSONL stopped check: chat_id={}, raw_entries_count={}",
+                chat_id.0,
+                raw_entries.len()
+            ));
             if chat_id.0 < 0 {
                 let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                let dn = if bot_display_name_for_log.is_empty() { None } else { Some(bot_display_name_for_log.clone()) };
-                append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                    ts: now_ts.clone(),
-                    bot: bot_username_for_log.clone(),
-                    bot_display_name: dn.clone(),
-                    role: "user".to_string(),
-                    from: Some(user_display_name_owned.clone()),
-                    text: user_text_owned,
-                    clear: false,
-                });
+                let dn = if bot_display_name_for_log.is_empty() {
+                    None
+                } else {
+                    Some(bot_display_name_for_log.clone())
+                };
+                append_group_chat_log(
+                    chat_id.0,
+                    &GroupChatLogEntry {
+                        ts: now_ts.clone(),
+                        bot: bot_username_for_log.clone(),
+                        bot_display_name: dn.clone(),
+                        role: "user".to_string(),
+                        from: Some(user_display_name_owned.clone()),
+                        text: user_text_owned,
+                        clear: false,
+                    },
+                );
                 if !raw_entries.is_empty() {
                     msg_debug(&format!("[polling] JSONL stopped: writing user+assistant entries, raw_entries_count={}", raw_entries.len()));
-                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                        ts: now_ts,
-                        bot: bot_username_for_log.clone(),
-                        bot_display_name: dn,
-                        role: "assistant".to_string(),
-                        from: None,
-                        text: serialize_payload(&std::mem::take(&mut raw_entries)),
-                        clear: false,
-                    });
+                    append_group_chat_log(
+                        chat_id.0,
+                        &GroupChatLogEntry {
+                            ts: now_ts,
+                            bot: bot_username_for_log.clone(),
+                            bot_display_name: dn,
+                            role: "assistant".to_string(),
+                            from: None,
+                            text: serialize_payload(&std::mem::take(&mut raw_entries)),
+                            clear: false,
+                        },
+                    );
                 } else {
                     msg_debug(&format!("[polling] JSONL stopped: user entry written, assistant SKIPPED (raw_entries is empty)"));
                 }
@@ -11071,7 +17160,10 @@ async fn handle_text_message(
             remove_cancel_token_locked(&mut data, chat_id);
             data.stop_message_ids.remove(&chat_id);
             drop(data);
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=text_poll_cancelled", chat_id.0));
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=text_poll_cancelled",
+                chat_id.0
+            ));
             drop(_group_lock); // release group chat lock before processing queue
             process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
             return;
@@ -11089,7 +17181,10 @@ async fn handle_text_message(
             };
             if let Some(msg_id) = orphan_stop_msg {
                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+                let _ = tg!(
+                    "delete_message",
+                    bot_owned.delete_message(chat_id, msg_id).await
+                );
             }
             drop(_group_lock);
             dispatch_loop_feedback(&bot_owned, chat_id, &state_owned).await;
@@ -11106,9 +17201,15 @@ async fn handle_text_message(
         };
         if let Some(msg_id) = orphan_stop_msg {
             shared_rate_limit_wait(&state_owned, chat_id).await;
-            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+            let _ = tg!(
+                "delete_message",
+                bot_owned.delete_message(chat_id, msg_id).await
+            );
         }
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=text_poll_completed", chat_id.0));
+        msg_debug(&format!(
+            "[queue:trigger] chat_id={}, source=text_poll_completed",
+            chat_id.0
+        ));
         drop(_group_lock); // release group chat lock before processing queue
         process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
     });
@@ -11117,12 +17218,21 @@ async fn handle_text_message(
 }
 
 /// Load existing session from ai_sessions directory matching the given path and provider
-fn load_existing_session(current_path: &str, provider: &str) -> Option<(SessionData, std::time::SystemTime)> {
-    msg_debug(&format!("[load_session] looking for path={:?}, provider={}", current_path, provider));
+fn load_existing_session(
+    current_path: &str,
+    provider: &str,
+) -> Option<(SessionData, std::time::SystemTime)> {
+    msg_debug(&format!(
+        "[load_session] looking for path={:?}, provider={}",
+        current_path, provider
+    ));
     let sessions_dir = ai_screen::ai_sessions_dir()?;
 
     if !sessions_dir.exists() {
-        msg_debug(&format!("[load_session] sessions_dir not found: {}", sessions_dir.display()));
+        msg_debug(&format!(
+            "[load_session] sessions_dir not found: {}",
+            sessions_dir.display()
+        ));
         return None;
     }
 
@@ -11140,7 +17250,9 @@ fn load_existing_session(current_path: &str, provider: &str) -> Option<(SessionD
                     if let Ok(session_data) = serde_json::from_str::<SessionData>(&content) {
                         if session_data.current_path == current_path {
                             // Provider filter: match exact provider, or allow empty (legacy files)
-                            if !session_data.provider.is_empty() && session_data.provider != provider {
+                            if !session_data.provider.is_empty()
+                                && session_data.provider != provider
+                            {
                                 msg_debug(&format!("[load_session] skipped session_id={} (provider mismatch: {} != {})",
                                     session_data.session_id, session_data.provider, provider));
                                 continue;
@@ -11174,11 +17286,21 @@ fn load_existing_session(current_path: &str, provider: &str) -> Option<(SessionD
 
     let matching_session = with_session_id.or(without_session_id);
 
-    msg_debug(&format!("[load_session] scanned {} json files, result={}", file_count,
-        if matching_session.is_some() { "found" } else { "None" }));
+    msg_debug(&format!(
+        "[load_session] scanned {} json files, result={}",
+        file_count,
+        if matching_session.is_some() {
+            "found"
+        } else {
+            "None"
+        }
+    ));
     if matching_session.is_none() && file_count > 0 {
         if let Some(sample) = path_mismatch_sample {
-            msg_debug(&format!("[load_session] path mismatch example: stored={:?} vs wanted={:?}", sample, current_path));
+            msg_debug(&format!(
+                "[load_session] path mismatch example: stored={:?} vs wanted={:?}",
+                sample, current_path
+            ));
         }
     }
 
@@ -11190,8 +17312,12 @@ fn load_existing_session(current_path: &str, provider: &str) -> Option<(SessionD
 /// Keeps the most recently modified empty file (the one selected by load_existing_session)
 /// and deletes the rest.
 fn cleanup_session_files(current_path: &str, provider: &str) {
-    let Some(sessions_dir) = ai_screen::ai_sessions_dir() else { return; };
-    let Ok(entries) = fs::read_dir(&sessions_dir) else { return; };
+    let Some(sessions_dir) = ai_screen::ai_sessions_dir() else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(&sessions_dir) else {
+        return;
+    };
 
     // Collect matching empty files with their modification time
     let mut empty_files: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
@@ -11204,7 +17330,9 @@ fn cleanup_session_files(current_path: &str, provider: &str) {
                         && (data.provider == provider || data.provider.is_empty())
                         && data.session_id.is_empty()
                     {
-                        let modified = path.metadata().ok()
+                        let modified = path
+                            .metadata()
+                            .ok()
                             .and_then(|m| m.modified().ok())
                             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
                         empty_files.push((path, modified));
@@ -11214,10 +17342,14 @@ fn cleanup_session_files(current_path: &str, provider: &str) {
         }
     }
 
-    if empty_files.len() <= 1 { return; }
+    if empty_files.len() <= 1 {
+        return;
+    }
 
     // Find the latest modified one to keep
-    let latest_idx = empty_files.iter().enumerate()
+    let latest_idx = empty_files
+        .iter()
+        .enumerate()
         .max_by_key(|(_, (_, t))| *t)
         .map(|(i, _)| i)
         .unwrap();
@@ -11253,7 +17385,9 @@ fn save_session_to_file(session: &ChatSession, current_path: &str, provider: &st
     }
 
     // Filter out system messages
-    let saveable_history: Vec<HistoryItem> = session.history.iter()
+    let saveable_history: Vec<HistoryItem> = session
+        .history
+        .iter()
         .filter(|item| !matches!(item.item_type, HistoryType::System))
         .cloned()
         .collect();
@@ -11269,10 +17403,16 @@ fn save_session_to_file(session: &ChatSession, current_path: &str, provider: &st
         created_at: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         provider: provider.to_string(),
     };
-    msg_debug(&format!("[save_session] provider={}, session_id={}, path={}", provider, session_id, current_path));
+    msg_debug(&format!(
+        "[save_session] provider={}, session_id={}, path={}",
+        provider, session_id, current_path
+    ));
 
     // Security: whitelist session_id to alphanumeric, hyphens, underscores only
-    if !session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !session_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
         return;
     }
 
@@ -11287,7 +17427,9 @@ fn save_session_to_file(session: &ChatSession, current_path: &str, provider: &st
     if let Ok(entries) = fs::read_dir(&sessions_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p == file_path { continue; }
+            if p == file_path {
+                continue;
+            }
             if p.extension().map(|e| e == "json").unwrap_or(false) {
                 if let Ok(content) = fs::read_to_string(&p) {
                     if let Ok(old) = serde_json::from_str::<SessionData>(&content) {
@@ -11373,10 +17515,11 @@ async fn process_upload_queue(bot: &Bot, chat_id: ChatId, state: &SharedState) -
 
         // Rate limit and send
         shared_rate_limit_wait(state, chat_id).await;
-        match tg!("send_document", bot.send_document(
-            chat_id,
-            teloxide::types::InputFile::file(&path),
-        ).await) {
+        match tg!(
+            "send_document",
+            bot.send_document(chat_id, teloxide::types::InputFile::file(&path),)
+                .await
+        ) {
             Ok(_) => {
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}]   📤 Upload sent: {}", file_path);
@@ -11399,12 +17542,17 @@ async fn shared_rate_limit_wait(state: &SharedState, chat_id: ChatId) {
     let sleep_until = {
         let mut data = state.lock().await;
         let min_gap = tokio::time::Duration::from_millis(data.polling_time_ms);
-        let last = data.api_timestamps.entry(chat_id).or_insert_with(||
-            tokio::time::Instant::now() - tokio::time::Duration::from_secs(10)
-        );
+        let last = data
+            .api_timestamps
+            .entry(chat_id)
+            .or_insert_with(|| tokio::time::Instant::now() - tokio::time::Duration::from_secs(10));
         let earliest_next = *last + min_gap;
         let now = tokio::time::Instant::now();
-        let target = if earliest_next > now { earliest_next } else { now };
+        let target = if earliest_next > now {
+            earliest_next
+        } else {
+            now
+        };
         *last = target; // Reserve this slot
         target
     }; // Mutex released here
@@ -11427,10 +17575,7 @@ async fn honor_telegram_retry_after<T>(
     if let Err(teloxide::RequestError::RetryAfter(seconds)) = result {
         let until = tokio::time::Instant::now() + seconds.duration();
         let mut data = state.lock().await;
-        let entry = data
-            .api_timestamps
-            .entry(chat_id)
-            .or_insert(until);
+        let entry = data.api_timestamps.entry(chat_id).or_insert(until);
         if *entry < until {
             *entry = until;
         }
@@ -11538,7 +17683,9 @@ async fn send_response_as_file(
     state: &SharedState,
     label: &str,
 ) -> bool {
-    let Some(home) = dirs::home_dir() else { return false };
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
     let tmp_dir = home.join(".cokacdir").join("tmp");
     let _ = std::fs::create_dir_all(&tmp_dir);
     let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S");
@@ -11547,10 +17694,11 @@ async fn send_response_as_file(
         return false;
     }
     shared_rate_limit_wait(state, chat_id).await;
-    let result = tg!("send_document", bot.send_document(
-        chat_id,
-        teloxide::types::InputFile::file(&tmp_path),
-    ).await);
+    let result = tg!(
+        "send_document",
+        bot.send_document(chat_id, teloxide::types::InputFile::file(&tmp_path),)
+            .await
+    );
     let _ = std::fs::remove_file(&tmp_path);
     result.is_ok()
 }
@@ -11643,13 +17791,19 @@ fn markdown_to_telegram_html(md: &str) -> String {
 
         // Unordered list (- or *)
         if trimmed.starts_with("- ") {
-            result.push_str(&format!("• {}", convert_inline(&html_escape(&trimmed[2..]))));
+            result.push_str(&format!(
+                "• {}",
+                convert_inline(&html_escape(&trimmed[2..]))
+            ));
             result.push('\n');
             i += 1;
             continue;
         }
         if trimmed.starts_with("* ") && !trimmed.starts_with("**") {
-            result.push_str(&format!("• {}", convert_inline(&html_escape(&trimmed[2..]))));
+            result.push_str(&format!(
+                "• {}",
+                convert_inline(&html_escape(&trimmed[2..]))
+            ));
             result.push('\n');
             i += 1;
             continue;
@@ -11776,11 +17930,17 @@ fn find_closing_single(chars: &[char], start: usize, marker: char) -> Option<usi
 /// NOTE: Returns bool (not subcommand name), so console logs show "cokacdir: ..." without
 /// the specific --flag. format_cokacdir_result() auto-detects subcommand from JSON fields instead.
 fn detect_cokacdir_command(name: &str, input: &str) -> bool {
-    if name != "Bash" { return false; }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else { return false };
+    if name != "Bash" {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else {
+        return false;
+    };
     let cmd = v.get("command").and_then(|v| v.as_str()).unwrap_or("");
     let expected = crate::bin_path().rsplit(['/', '\\']).next().unwrap_or("");
-    if expected.is_empty() { return false; }
+    if expected.is_empty() {
+        return false;
+    }
     // Strip surrounding quotes from each token, then compare basename
     cmd.split_whitespace().any(|tok| {
         let unquoted = tok.trim_matches(|c| c == '"' || c == '\'');
@@ -11791,8 +17951,12 @@ fn detect_cokacdir_command(name: &str, input: &str) -> bool {
 
 /// Check if a Bash tool call contains --read_chat_log (result should be suppressed from display).
 fn detect_chat_log_read(name: &str, input: &str) -> bool {
-    if name != "Bash" { return false; }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else { return false };
+    if name != "Bash" {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(input) else {
+        return false;
+    };
     let cmd = v.get("command").and_then(|v| v.as_str()).unwrap_or("");
     cmd.contains("--read_chat_log")
 }
@@ -11800,11 +17964,23 @@ fn detect_chat_log_read(name: &str, input: &str) -> bool {
 /// Read the most recent .result file from schedule dir and delete it
 fn read_latest_cron_result() -> Option<String> {
     let dir = schedule_dir()?;
-    let mut results: Vec<_> = fs::read_dir(&dir).ok()?
+    let mut results: Vec<_> = fs::read_dir(&dir)
+        .ok()?
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map(|ext| ext == "result").unwrap_or(false))
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "result")
+                .unwrap_or(false)
+        })
         .collect();
-    results.sort_by_key(|e| std::cmp::Reverse(e.metadata().and_then(|m| m.modified()).unwrap_or(std::time::SystemTime::UNIX_EPOCH)));
+    results.sort_by_key(|e| {
+        std::cmp::Reverse(
+            e.metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+        )
+    });
     let entry = results.first()?;
     let content = fs::read_to_string(entry.path()).ok()?;
     let _ = fs::remove_file(entry.path());
@@ -11845,7 +18021,10 @@ fn format_cokacdir_result(content: &str) -> String {
     let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
 
     if status == "error" {
-        let msg = v.get("message").and_then(|s| s.as_str()).unwrap_or("unknown error");
+        let msg = v
+            .get("message")
+            .and_then(|s| s.as_str())
+            .unwrap_or("unknown error");
         return format!("Error: {}", msg);
     }
 
@@ -11865,20 +18044,36 @@ fn format_cokacdir_result(content: &str) -> String {
                     let id = s.get("id").and_then(|v| v.as_str()).unwrap_or("?");
                     let schedule = s.get("schedule").and_then(|v| v.as_str()).unwrap_or("");
                     let prompt = s.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-                    let schedule_type = s.get("schedule_type").and_then(|v| v.as_str()).unwrap_or("");
+                    let schedule_type = s
+                        .get("schedule_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     let once = s.get("once").and_then(|b| b.as_bool()).unwrap_or(false);
                     let kind = match schedule_type {
                         "absolute" => "1회",
                         "cron" if once => "1회 cron",
                         "cron" => "반복",
-                        _ => if schedule.split_whitespace().count() == 5 { "반복" } else { "1회" },
+                        _ => {
+                            if schedule.split_whitespace().count() == 5 {
+                                "반복"
+                            } else {
+                                "1회"
+                            }
+                        }
                     };
                     let prompt_preview = if prompt.chars().count() > 40 {
                         format!("{}...", prompt.chars().take(40).collect::<String>())
                     } else {
                         prompt.to_string()
                     };
-                    lines.push(format!("\n{}. [{}] {}\n   🕐 `{}`\n   🔖 {}", i + 1, kind, prompt_preview, schedule, id));
+                    lines.push(format!(
+                        "\n{}. [{}] {}\n   🕐 `{}`\n   🔖 {}",
+                        i + 1,
+                        kind,
+                        prompt_preview,
+                        schedule,
+                        id
+                    ));
                 }
                 lines.join("\n")
             }
@@ -11893,15 +18088,27 @@ fn format_cokacdir_result(content: &str) -> String {
         let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
         let prompt = v["prompt"].as_str().unwrap_or("");
         let schedule = v.get("schedule").and_then(|s| s.as_str()).unwrap_or("");
-        let schedule_type = v.get("schedule_type").and_then(|s| s.as_str()).unwrap_or("");
+        let schedule_type = v
+            .get("schedule_type")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
         let once = v.get("once").and_then(|b| b.as_bool()).unwrap_or(false);
         let kind = match schedule_type {
             "absolute" => "1회",
             "cron" if once => "1회 cron",
             "cron" => "반복",
-            _ => if schedule.split_whitespace().count() == 5 { "반복" } else { "1회" },
+            _ => {
+                if schedule.split_whitespace().count() == 5 {
+                    "반복"
+                } else {
+                    "1회"
+                }
+            }
         };
-        format!("✅ Scheduled [{}]\n🔖 {}\n📝 {}\n🕐 `{}`", kind, id, prompt, schedule)
+        format!(
+            "✅ Scheduled [{}]\n🔖 {}\n📝 {}\n🕐 `{}`",
+            kind, id, prompt, schedule
+        )
     } else if v.get("schedule").is_some() {
         // --cron-update → {"status":"ok","id":"...","schedule":"..."}
         let id = v.get("id").and_then(|s| s.as_str()).unwrap_or("?");
@@ -11941,11 +18148,14 @@ fn format_tool_input(name: &str, input: &str) -> String {
     if name == "FileChange" {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(input) {
             if let Some(changes) = v.get("changes").and_then(|v| v.as_array()) {
-                let summary: Vec<String> = changes.iter().map(|c| {
-                    let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("update");
-                    format!("{}: {}", kind, path)
-                }).collect();
+                let summary: Vec<String> = changes
+                    .iter()
+                    .map(|c| {
+                        let path = c.get("path").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let kind = c.get("kind").and_then(|v| v.as_str()).unwrap_or("update");
+                        format!("{}: {}", kind, path)
+                    })
+                    .collect();
                 return format!("\u{1F4DD} {}", summary.join(", "));
             }
         }
@@ -11956,13 +18166,19 @@ fn format_tool_input(name: &str, input: &str) -> String {
         // Non-JSON input — Codex tools produce human-readable strings directly
         return match name {
             "WebSearch" => {
-                if input.is_empty() { "Search".to_string() }
-                else { format!("Search: {}", input) }
+                if input.is_empty() {
+                    "Search".to_string()
+                } else {
+                    format!("Search: {}", input)
+                }
             }
             n if n.starts_with("Collab:") => {
                 let tool = n.strip_prefix("Collab:").unwrap_or(n);
-                if input.is_empty() { format!("Agent: {}", tool) }
-                else { format!("Agent {}: {}", tool, input) }
+                if input.is_empty() {
+                    format!("Agent: {}", tool)
+                } else {
+                    format!("Agent {}: {}", tool, input)
+                }
             }
             _ => format!("{} {}", name, input),
         };
@@ -11995,7 +18211,10 @@ fn format_tool_input(name: &str, input: &str) -> String {
         "Edit" => {
             let fp = v.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
             if !fp.is_empty() {
-                let replace_all = v.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+                let replace_all = v
+                    .get("replace_all")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 if replace_all {
                     format!("Edit {} (replace all)", fp)
                 } else {
@@ -12029,7 +18248,10 @@ fn format_tool_input(name: &str, input: &str) -> String {
             }
         }
         "NotebookEdit" => {
-            let nb_path = v.get("notebook_path").and_then(|v| v.as_str()).unwrap_or("");
+            let nb_path = v
+                .get("notebook_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let cell_id = v.get("cell_id").and_then(|v| v.as_str()).unwrap_or("");
             if !cell_id.is_empty() {
                 format!("Notebook {} ({})", nb_path, cell_id)
@@ -12047,7 +18269,10 @@ fn format_tool_input(name: &str, input: &str) -> String {
         }
         "Task" => {
             let desc = v.get("description").and_then(|v| v.as_str()).unwrap_or("");
-            let subagent_type = v.get("subagent_type").and_then(|v| v.as_str()).unwrap_or("");
+            let subagent_type = v
+                .get("subagent_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if !subagent_type.is_empty() {
                 format!("Task [{}]: {}", subagent_type, desc)
             } else {
@@ -12064,16 +18289,22 @@ fn format_tool_input(name: &str, input: &str) -> String {
         }
         "TodoWrite" => {
             if let Some(todos) = v.get("todos").and_then(|v| v.as_array()) {
-                let pending = todos.iter().filter(|t| {
-                    t.get("status").and_then(|s| s.as_str()) == Some("pending")
-                }).count();
-                let in_progress = todos.iter().filter(|t| {
-                    t.get("status").and_then(|s| s.as_str()) == Some("in_progress")
-                }).count();
-                let completed = todos.iter().filter(|t| {
-                    t.get("status").and_then(|s| s.as_str()) == Some("completed")
-                }).count();
-                format!("Todo: {} pending, {} in progress, {} completed", pending, in_progress, completed)
+                let pending = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("pending"))
+                    .count();
+                let in_progress = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
+                    .count();
+                let completed = todos
+                    .iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("completed"))
+                    .count();
+                format!(
+                    "Todo: {} pending, {} in progress, {} completed",
+                    pending, in_progress, completed
+                )
             } else {
                 "Update todos".to_string()
             }
@@ -12094,12 +18325,8 @@ fn format_tool_input(name: &str, input: &str) -> String {
                 "Ask user question".to_string()
             }
         }
-        "ExitPlanMode" => {
-            "Exit plan mode".to_string()
-        }
-        "EnterPlanMode" => {
-            "Enter plan mode".to_string()
-        }
+        "ExitPlanMode" => "Exit plan mode".to_string(),
+        "EnterPlanMode" => "Enter plan mode".to_string(),
         "TaskCreate" => {
             let subject = v.get("subject").and_then(|v| v.as_str()).unwrap_or("");
             format!("Create task: {}", subject)
@@ -12117,9 +18344,7 @@ fn format_tool_input(name: &str, input: &str) -> String {
             let task_id = v.get("taskId").and_then(|v| v.as_str()).unwrap_or("");
             format!("Get task: {}", task_id)
         }
-        "TaskList" => {
-            "List tasks".to_string()
-        }
+        "TaskList" => "List tasks".to_string(),
         _ => {
             // Codex Collab:* tools — input is prompt text (or empty)
             if name.starts_with("Collab:") {
@@ -12141,21 +18366,38 @@ fn format_tool_input(name: &str, input: &str) -> String {
 /// Check if a schedule entry should trigger now
 fn should_trigger(entry: &ScheduleEntry) -> bool {
     let now = chrono::Local::now();
-    sched_debug(&format!("[should_trigger] id={}, type={}, schedule={}, now={}, last_run={:?}",
-        entry.id, entry.schedule_type, entry.schedule, now.format("%Y-%m-%d %H:%M:%S"), entry.last_run));
+    sched_debug(&format!(
+        "[should_trigger] id={}, type={}, schedule={}, now={}, last_run={:?}",
+        entry.id,
+        entry.schedule_type,
+        entry.schedule,
+        now.format("%Y-%m-%d %H:%M:%S"),
+        entry.last_run
+    ));
     match entry.schedule_type.as_str() {
         "absolute" => {
-            let Ok(schedule_time) = chrono::NaiveDateTime::parse_from_str(&entry.schedule, "%Y-%m-%d %H:%M:%S") else {
-                sched_debug(&format!("[should_trigger] id={}, parse failed → false", entry.id));
+            let Ok(schedule_time) =
+                chrono::NaiveDateTime::parse_from_str(&entry.schedule, "%Y-%m-%d %H:%M:%S")
+            else {
+                sched_debug(&format!(
+                    "[should_trigger] id={}, parse failed → false",
+                    entry.id
+                ));
                 return false;
             };
             let schedule_dt = schedule_time.and_local_timezone(chrono::Local).single();
             let Some(schedule_dt) = schedule_dt else {
-                sched_debug(&format!("[should_trigger] id={}, timezone conversion failed → false", entry.id));
+                sched_debug(&format!(
+                    "[should_trigger] id={}, timezone conversion failed → false",
+                    entry.id
+                ));
                 return false;
             };
             if now < schedule_dt {
-                sched_debug(&format!("[should_trigger] id={}, not yet (now < schedule_dt) → false", entry.id));
+                sched_debug(&format!(
+                    "[should_trigger] id={}, not yet (now < schedule_dt) → false",
+                    entry.id
+                ));
                 return false;
             }
             // Already ran? An unparseable / timezone-ambiguous `last_run`
@@ -12184,12 +18426,18 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
                     }
                 }
             }
-            sched_debug(&format!("[should_trigger] id={}, absolute ready → true", entry.id));
+            sched_debug(&format!(
+                "[should_trigger] id={}, absolute ready → true",
+                entry.id
+            ));
             true
         }
         "cron" => {
             if !cron_matches(&entry.schedule, now) {
-                sched_debug(&format!("[should_trigger] id={}, cron not matching → false", entry.id));
+                sched_debug(&format!(
+                    "[should_trigger] id={}, cron not matching → false",
+                    entry.id
+                ));
                 return false;
             }
             // Check last_run to avoid duplicate triggers within the same
@@ -12200,31 +18448,39 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
             // write rewrites `last_run`.
             if let Some(ref last) = entry.last_run {
                 match chrono::NaiveDateTime::parse_from_str(last, "%Y-%m-%d %H:%M:%S") {
-                    Ok(last_dt) => match last_dt.and_local_timezone(chrono::Local).single() {
-                        Some(last_local) => {
-                            let now_min = now.format("%Y-%m-%d %H:%M").to_string();
-                            let last_min = last_local.format("%Y-%m-%d %H:%M").to_string();
-                            if now_min == last_min {
-                                sched_debug(&format!("[should_trigger] id={}, already ran this minute ({}) → false", entry.id, now_min));
+                    Ok(last_dt) => {
+                        match last_dt.and_local_timezone(chrono::Local).single() {
+                            Some(last_local) => {
+                                let now_min = now.format("%Y-%m-%d %H:%M").to_string();
+                                let last_min = last_local.format("%Y-%m-%d %H:%M").to_string();
+                                if now_min == last_min {
+                                    sched_debug(&format!("[should_trigger] id={}, already ran this minute ({}) → false", entry.id, now_min));
+                                    return false;
+                                }
+                            }
+                            None => {
+                                sched_debug(&format!("[should_trigger] id={}, last_run timezone-ambiguous {:?} → defensively false", entry.id, last));
                                 return false;
                             }
                         }
-                        None => {
-                            sched_debug(&format!("[should_trigger] id={}, last_run timezone-ambiguous {:?} → defensively false", entry.id, last));
-                            return false;
-                        }
-                    },
+                    }
                     Err(e) => {
                         sched_debug(&format!("[should_trigger] id={}, last_run parse failed {:?}: {} → defensively false", entry.id, last, e));
                         return false;
                     }
                 }
             }
-            sched_debug(&format!("[should_trigger] id={}, cron matched → true", entry.id));
+            sched_debug(&format!(
+                "[should_trigger] id={}, cron matched → true",
+                entry.id
+            ));
             true
         }
         _ => {
-            sched_debug(&format!("[should_trigger] id={}, unknown type={} → false", entry.id, entry.schedule_type));
+            sched_debug(&format!(
+                "[should_trigger] id={}, unknown type={} → false",
+                entry.id, entry.schedule_type
+            ));
             false
         }
     }
@@ -12233,36 +18489,57 @@ fn should_trigger(entry: &ScheduleEntry) -> bool {
 /// Update schedule entry after a run: set last_run, delete if once
 fn update_schedule_after_run(entry: &ScheduleEntry, new_context_summary: Option<String>) {
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    sched_debug(&format!("[update_schedule_after_run] id={}, type={}, once={:?}, now={}, has_new_context={}",
-        entry.id, entry.schedule_type, entry.once, now, new_context_summary.is_some()));
+    sched_debug(&format!(
+        "[update_schedule_after_run] id={}, type={}, once={:?}, now={}, has_new_context={}",
+        entry.id,
+        entry.schedule_type,
+        entry.once,
+        now,
+        new_context_summary.is_some()
+    ));
 
     // 실행 중 사용자가 삭제한 경우 부활 방지
     let dir = match schedule_dir() {
         Some(d) => d,
         None => {
-            sched_debug(&format!("[update_schedule_after_run] id={}, no schedule dir → skip", entry.id));
+            sched_debug(&format!(
+                "[update_schedule_after_run] id={}, no schedule dir → skip",
+                entry.id
+            ));
             return;
         }
     };
     let path = dir.join(format!("{}.json", entry.id));
     if !path.exists() {
-        sched_debug(&format!("[update_schedule_after_run] id={}, file already deleted → skip (no resurrection)", entry.id));
+        sched_debug(&format!(
+            "[update_schedule_after_run] id={}, file already deleted → skip (no resurrection)",
+            entry.id
+        ));
         return; // 이미 삭제됨 - write하지 않음
     }
 
     // One-time schedules (absolute / cron --once) are already deleted before execution,
     // so this function only handles recurring cron updates.
-    sched_debug(&format!("[update_schedule_after_run] id={}, cron recurring → update last_run", entry.id));
+    sched_debug(&format!(
+        "[update_schedule_after_run] id={}, cron recurring → update last_run",
+        entry.id
+    ));
     let mut updated = entry.clone();
     updated.last_run = Some(now);
     if new_context_summary.is_some() {
         updated.context_summary = new_context_summary;
     }
     if let Err(e) = write_schedule_entry(&updated) {
-        sched_debug(&format!("[update_schedule_after_run] id={}, write failed: {}", entry.id, e));
+        sched_debug(&format!(
+            "[update_schedule_after_run] id={}, write failed: {}",
+            entry.id, e
+        ));
         eprintln!("[Schedule] Failed to update entry {}: {}", entry.id, e);
     } else {
-        sched_debug(&format!("[update_schedule_after_run] id={}, updated successfully", entry.id));
+        sched_debug(&format!(
+            "[update_schedule_after_run] id={}, updated successfully",
+            entry.id
+        ));
     }
 }
 
@@ -12289,11 +18566,19 @@ async fn execute_schedule(
     // to entry.current_path with no session_id, which is the same shape
     // isolated mode would have used. clear_epoch defaults to 0 (a /clear
     // bumps it, matching the post-completion guard in handle_text_message).
-    let (inline_session_id, inline_path, inline_clear_epoch): (Option<String>, Option<String>, u64) = if inline_mode {
+    let (inline_session_id, inline_path, inline_clear_epoch): (
+        Option<String>,
+        Option<String>,
+        u64,
+    ) = if inline_mode {
         let data = state.lock().await;
         let s = data.sessions.get(&chat_id);
         let epoch = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
-        (s.and_then(|s| s.session_id.clone()), s.and_then(|s| s.current_path.clone()), epoch)
+        (
+            s.and_then(|s| s.session_id.clone()),
+            s.and_then(|s| s.current_path.clone()),
+            epoch,
+        )
     } else {
         (None, None, 0)
     };
@@ -12304,12 +18589,16 @@ async fn execute_schedule(
     // Check if cancelled during lock wait
     let cancelled_during_wait = {
         let data = state.lock().await;
-        data.cancel_tokens.get(&chat_id)
+        data.cancel_tokens
+            .get(&chat_id)
             .map(|ct| ct.cancelled.load(Ordering::Relaxed))
             .unwrap_or(false)
     };
     if cancelled_during_wait {
-        sched_debug(&format!("[execute_schedule] cancelled during lock wait, id={}", entry.id));
+        sched_debug(&format!(
+            "[execute_schedule] cancelled during lock wait, id={}",
+            entry.id
+        ));
         {
             let mut data = state.lock().await;
             if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
@@ -12325,7 +18614,10 @@ async fn execute_schedule(
                 }
             }
         }
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_cancelled_during_lock", chat_id.0));
+        msg_debug(&format!(
+            "[queue:trigger] chat_id={}, source=schedule_cancelled_during_lock",
+            chat_id.0
+        ));
         drop(group_lock);
         process_next_queued_message(bot, chat_id, state).await;
         return;
@@ -12338,7 +18630,11 @@ async fn execute_schedule(
     let user_prompt = entry.prompt.clone();
     let prompt = match (&entry.context_summary, inline_mode) {
         (Some(summary), false) => {
-            sched_debug(&format!("[execute_schedule] id={}, injecting context summary ({} chars)", entry.id, summary.len()));
+            sched_debug(&format!(
+                "[execute_schedule] id={}, injecting context summary ({} chars)",
+                entry.id,
+                summary.len()
+            ));
             format!(
                 "[이전 작업 맥락]\n{}\n\n[작업 지시]\n{}",
                 summary, user_prompt
@@ -12351,7 +18647,10 @@ async fn execute_schedule(
 
     // Delete schedule files before execution for one-time schedules (absolute / cron --once)
     if entry.once.unwrap_or(false) || entry.schedule_type == "absolute" {
-        sched_debug(&format!("[execute_schedule] id={}, one-time → deleting schedule files before execution", schedule_id));
+        sched_debug(&format!(
+            "[execute_schedule] id={}, one-time → deleting schedule files before execution",
+            schedule_id
+        ));
         delete_schedule_entry(&schedule_id);
     }
 
@@ -12362,8 +18661,13 @@ async fn execute_schedule(
     // (no isolated workspace), so we skip the create_dir_all entirely. Isolated
     // mode creates ~/.cokacdir/workspace/<schedule_id> as before.
     let workspace_path: String = if inline_mode {
-        let path = inline_path.clone().unwrap_or_else(|| entry.current_path.clone());
-        sched_debug(&format!("[execute_schedule] id={}, inline mode → working dir={}", schedule_id, path));
+        let path = inline_path
+            .clone()
+            .unwrap_or_else(|| entry.current_path.clone());
+        sched_debug(&format!(
+            "[execute_schedule] id={}, inline mode → working dir={}",
+            schedule_id, path
+        ));
         path
     } else {
         let Some(home) = dirs::home_dir() else {
@@ -12381,17 +18685,27 @@ async fn execute_schedule(
                     data.sessions.remove(&chat_id);
                 }
             }
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_no_home", chat_id.0));
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=schedule_no_home",
+                chat_id.0
+            ));
             drop(group_lock); // release before queue processing to avoid deadlock
             process_next_queued_message(bot, chat_id, state).await;
             return;
         };
         let workspace_dir = home.join(".cokacdir").join("workspace").join(&schedule_id);
-        sched_debug(&format!("[execute_schedule] id={}, creating workspace: {}", schedule_id, workspace_dir.display()));
+        sched_debug(&format!(
+            "[execute_schedule] id={}, creating workspace: {}",
+            schedule_id,
+            workspace_dir.display()
+        ));
         if let Err(e) = fs::create_dir_all(&workspace_dir) {
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ⚠ [Schedule] Failed to create workspace: {e}");
-            sched_debug(&format!("[execute_schedule] id={}, workspace creation failed: {}, restoring session", schedule_id, e));
+            sched_debug(&format!(
+                "[execute_schedule] id={}, workspace creation failed: {}, restoring session",
+                schedule_id, e
+            ));
             {
                 let mut data = state.lock().await;
                 if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
@@ -12404,7 +18718,10 @@ async fn execute_schedule(
                     data.sessions.remove(&chat_id);
                 }
             }
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_workspace_error", chat_id.0));
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=schedule_workspace_error",
+                chat_id.0
+            ));
             drop(group_lock); // release before queue processing to avoid deadlock
             process_next_queued_message(bot, chat_id, state).await;
             return;
@@ -12415,21 +18732,38 @@ async fn execute_schedule(
     // Get allowed tools, model, and provider options for this chat
     let (allowed_tools, model, sched_chrome_enabled, effort, codex_fast_enabled) = {
         let data = state.lock().await;
-        let chrome = data.settings.use_chrome.get(&chat_id.0.to_string()).copied().unwrap_or(false);
+        let chrome = data
+            .settings
+            .use_chrome
+            .get(&chat_id.0.to_string())
+            .copied()
+            .unwrap_or(false);
         let model = get_model(&data.settings, chat_id);
         let provider = detect_provider(model.as_deref());
         let effort = get_effort_for_provider(&data.settings, chat_id, provider);
         let codex_fast = is_codex_fast(&data.settings, chat_id);
-        (get_allowed_tools(&data.settings, chat_id), model, chrome, effort, codex_fast)
+        (
+            get_allowed_tools(&data.settings, chat_id),
+            model,
+            chrome,
+            effort,
+            codex_fast,
+        )
     };
 
     // Send placeholder (show only the user's original prompt, not the context summary)
     shared_rate_limit_wait(state, chat_id).await;
-    let placeholder = match tg!("send_message", bot.send_message(chat_id, format!("⏰ {user_prompt}")).await) {
+    let placeholder = match tg!(
+        "send_message",
+        bot.send_message(chat_id, format!("⏰ {user_prompt}")).await
+    ) {
         Ok(msg) => msg,
         Err(e) => {
             let ts = chrono::Local::now().format("%H:%M:%S");
-            println!("  [{ts}] ⚠ [Schedule] Failed to send placeholder: {}", redact_err(&e));
+            println!(
+                "  [{ts}] ⚠ [Schedule] Failed to send placeholder: {}",
+                redact_err(&e)
+            );
             // Clean up pending + cancel_token, restore session (workspace preserved)
             {
                 let mut data = state.lock().await;
@@ -12446,7 +18780,10 @@ async fn execute_schedule(
                     }
                 }
             }
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_placeholder_error", chat_id.0));
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=schedule_placeholder_error",
+                chat_id.0
+            ));
             drop(group_lock); // release before queue processing to avoid deadlock
             process_next_queued_message(bot, chat_id, state).await;
             return;
@@ -12455,9 +18792,14 @@ async fn execute_schedule(
     let placeholder_msg_id = placeholder.id;
 
     // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> = DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> = allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools.iter().filter(|t| !allowed_set.contains(**t)).collect();
+    let default_tools: std::collections::HashSet<&str> =
+        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
+    let allowed_set: std::collections::HashSet<&str> =
+        allowed_tools.iter().map(|s| s.as_str()).collect();
+    let disabled: Vec<&&str> = default_tools
+        .iter()
+        .filter(|t| !allowed_set.contains(**t))
+        .collect();
     let disabled_notice = if disabled.is_empty() {
         String::new()
     } else {
@@ -12475,8 +18817,21 @@ async fn execute_schedule(
     let bot_key = token_hash(token);
     let (sched_instruction, sched_context_count, sched_bot_username, sched_bot_display_name) = {
         let data = state.lock().await;
-        let ctx = data.settings.context.get(&chat_id.0.to_string()).copied().unwrap_or(12);
-        (data.settings.instructions.get(&chat_id.0.to_string()).cloned(), ctx, data.bot_username.clone(), data.bot_display_name.clone())
+        let ctx = data
+            .settings
+            .context
+            .get(&chat_id.0.to_string())
+            .copied()
+            .unwrap_or(12);
+        (
+            data.settings
+                .instructions
+                .get(&chat_id.0.to_string())
+                .cloned(),
+            ctx,
+            data.bot_username.clone(),
+            data.bot_display_name.clone(),
+        )
     };
     let platform = capitalize_platform(detect_platform(token));
     let sched_role = {
@@ -12505,11 +18860,16 @@ async fn execute_schedule(
     };
     let system_prompt_owned = build_system_prompt(
         &sched_role,
-        &crate::utils::format::to_shell_path(&workspace_path), chat_id.0, &bot_key, &disabled_notice,
+        &crate::utils::format::to_shell_path(&workspace_path),
+        chat_id.0,
+        &bot_key,
+        &disabled_notice,
         None, // scheduled tasks don't need to register further schedules with session context
-        &sched_bot_username, &sched_bot_display_name,
+        &sched_bot_username,
+        &sched_bot_display_name,
         None, // scheduled tasks: no user message dedup
-        sched_context_count, &platform,
+        sched_context_count,
+        &platform,
     );
 
     // Retrieve pre-inserted cancel token (from scheduler_loop), or create a new one
@@ -12535,7 +18895,11 @@ async fn execute_schedule(
     //   prompt and reply are appended to that conversation.
     // Session persistence must be kept so users can resume via /SCHEDULE_ID
     let workspace_path_for_claude = workspace_path.clone();
-    let resume_session_id: Option<String> = if inline_mode { inline_session_id.clone() } else { None };
+    let resume_session_id: Option<String> = if inline_mode {
+        inline_session_id.clone()
+    } else {
+        None
+    };
     let model_clone_for_exec = model.clone();
     let effort_for_exec: Option<String> = effort.clone();
     let codex_fast_for_exec = codex_fast_enabled;
@@ -12546,11 +18910,15 @@ async fn execute_schedule(
     };
     let _ = spawn_tracked_blocking_task(request_tasks, move || {
         let provider = detect_provider(model_clone_for_exec.as_deref());
-        sched_debug(&format!("[execute_schedule:spawn_blocking] provider={}, model={:?}, resume_session_id={:?}",
-            provider, model_clone_for_exec, resume_session_id));
+        sched_debug(&format!(
+            "[execute_schedule:spawn_blocking] provider={}, model={:?}, resume_session_id={:?}",
+            provider, model_clone_for_exec, resume_session_id
+        ));
         let resume_ref = resume_session_id.as_deref();
         let result = if provider == "opencode" {
-            let opencode_model = model_clone_for_exec.as_deref().and_then(opencode::strip_opencode_prefix);
+            let opencode_model = model_clone_for_exec
+                .as_deref()
+                .and_then(opencode::strip_opencode_prefix);
             sched_debug(&format!("[execute_schedule] → opencode::execute, opencode_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
                 opencode_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
             opencode::execute_command_streaming(
@@ -12565,7 +18933,9 @@ async fn execute_schedule(
                 false,
             )
         } else if provider == "gemini" {
-            let gemini_model = model_clone_for_exec.as_deref().and_then(gemini::strip_gemini_prefix);
+            let gemini_model = model_clone_for_exec
+                .as_deref()
+                .and_then(gemini::strip_gemini_prefix);
             sched_debug(&format!("[execute_schedule] → gemini::execute, gemini_model={:?}, session_id={:?}, workspace={}, prompt_len={}, system_prompt_len={}",
                 gemini_model, resume_ref, workspace_path_for_claude, prompt.len(), system_prompt_owned.len()));
             gemini::execute_command_streaming(
@@ -12580,8 +18950,11 @@ async fn execute_schedule(
                 false,
             )
         } else if provider == "codex" {
-            let codex_model = model_clone_for_exec.as_deref().and_then(codex::strip_codex_prefix);
-            let codex_system_prompt = format!("{}{}", system_prompt_owned, codex_extra_instructions());
+            let codex_model = model_clone_for_exec
+                .as_deref()
+                .and_then(codex::strip_codex_prefix);
+            let codex_system_prompt =
+                format!("{}{}", system_prompt_owned, codex_extra_instructions());
             let codex_auto_send = codex::CodexAutoSendCtx {
                 cokacdir_bin: crate::bin_path().to_string(),
                 chat_id: chat_id.0,
@@ -12602,7 +18975,9 @@ async fn execute_schedule(
                 codex_fast_for_exec,
             )
         } else {
-            let claude_model = model_clone_for_exec.as_deref().and_then(claude::strip_claude_prefix);
+            let claude_model = model_clone_for_exec
+                .as_deref()
+                .and_then(claude::strip_claude_prefix);
             claude::execute_command_streaming(
                 &prompt,
                 resume_ref,
@@ -12618,7 +18993,12 @@ async fn execute_schedule(
             )
         };
         if let Err(e) = result {
-            let _ = tx.send(StreamMessage::Error { message: e, stdout: String::new(), stderr: String::new(), exit_code: None });
+            let _ = tx.send(StreamMessage::Error {
+                message: e,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+            });
         }
     });
 
@@ -12649,10 +19029,18 @@ async fn execute_schedule(
     let _ = spawn_tracked_request_task(request_tasks, async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
-            "🕐 P",           "🕑 Pr",          "🕒 Pro",
-            "🕓 Proc",        "🕔 Proce",       "🕕 Proces",
-            "🕖 Process",     "🕗 Processi",    "🕘 Processin",
-            "🕙 Processing",  "🕚 Processing.", "🕛 Processing..",
+            "🕐 P",
+            "🕑 Pr",
+            "🕒 Pro",
+            "🕓 Proc",
+            "🕔 Proce",
+            "🕕 Proces",
+            "🕖 Process",
+            "🕗 Processi",
+            "🕘 Processin",
+            "🕙 Processing",
+            "🕚 Processing.",
+            "🕛 Processing..",
         ];
         let mut full_response = String::new();
         let mut raw_entries: Vec<RawPayloadEntry> = Vec::new();
@@ -12676,14 +19064,18 @@ async fn execute_schedule(
         let mut queue_done = false;
         while !done || !queue_done {
             if cancel_token.cancelled.load(Ordering::Relaxed) {
-                if !done { cancelled = true; }
+                if !done {
+                    cancelled = true;
+                }
                 break;
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(polling_time_ms)).await;
 
             if cancel_token.cancelled.load(Ordering::Relaxed) {
-                if !done { cancelled = true; }
+                if !done {
+                    cancelled = true;
+                }
                 break;
             }
 
@@ -12696,9 +19088,15 @@ async fn execute_schedule(
                                 exec_session_id = Some(session_id);
                             }
                             StreamMessage::Text { content } => {
-                                sched_debug(&format!("[sched] Text: {} chars, preview={:?}",
-                                    content.len(), truncate_str(&content, 80)));
-                                raw_entries.push(RawPayloadEntry { tag: "Text".into(), content: content.clone() });
+                                sched_debug(&format!(
+                                    "[sched] Text: {} chars, preview={:?}",
+                                    content.len(),
+                                    truncate_str(&content, 80)
+                                ));
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "Text".into(),
+                                    content: content.clone(),
+                                });
                                 let _fr_before = full_response.len();
                                 full_response.push_str(&content);
                                 sched_debug(&format!("[fr_trace][{}] +Text: added={}, preview={:?}, total={} (was {})",
@@ -12713,11 +19111,17 @@ async fn execute_schedule(
                                 println!("  [{ts}]   ⚙ [Schedule] {name}: {summary}");
                                 sched_debug(&format!("[schedule_polling] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, silent_mode={}, response_len={}, ends_with_nl={}",
                                     name, truncate_str(&input, 200), pending_cokacdir, silent_mode, full_response.len(), full_response.ends_with('\n')));
-                                raw_entries.push(RawPayloadEntry { tag: "ToolUse".into(), content: format!("{}: {}", name, input) });
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "ToolUse".into(),
+                                    content: format!("{}: {}", name, input),
+                                });
                                 if !pending_cokacdir && !silent_mode {
                                     let _fr_before = full_response.len();
                                     if name == "Bash" {
-                                        full_response.push_str(&format!("\n\n```\n{}\n```\n", format_bash_command(&input)));
+                                        full_response.push_str(&format!(
+                                            "\n\n```\n{}\n```\n",
+                                            format_bash_command(&input)
+                                        ));
                                         sched_debug(&format!("[fr_trace][{}] +ToolUse/Bash: added={}, cmd={:?}, total={} (was {})",
                                             chat_id.0, full_response.len() - _fr_before, truncate_str(&input, 100), full_response.len(), _fr_before));
                                     } else {
@@ -12725,10 +19129,18 @@ async fn execute_schedule(
                                         sched_debug(&format!("[fr_trace][{}] +ToolUse/{}: added={}, summary={:?}, total={} (was {})",
                                             chat_id.0, name, full_response.len() - _fr_before, truncate_str(&summary, 100), full_response.len(), _fr_before));
                                     }
-                                } else if !pending_cokacdir && silent_mode && !full_response.is_empty() && !full_response.ends_with('\n') {
+                                } else if !pending_cokacdir
+                                    && silent_mode
+                                    && !full_response.is_empty()
+                                    && !full_response.ends_with('\n')
+                                {
                                     sched_debug(&format!("[schedule_polling] silent mode: inserting \\n\\n after tool_use={}", name));
                                     full_response.push_str("\n\n");
-                                    sched_debug(&format!("[fr_trace][{}] +ToolUse/silent_nl: added=2, total={}", chat_id.0, full_response.len()));
+                                    sched_debug(&format!(
+                                        "[fr_trace][{}] +ToolUse/silent_nl: added=2, total={}",
+                                        chat_id.0,
+                                        full_response.len()
+                                    ));
                                 } else if silent_mode {
                                     sched_debug(&format!("[schedule_polling] silent mode: skipped \\n\\n (pending_cokacdir={}, empty={}, ends_nl={})",
                                         pending_cokacdir, full_response.is_empty(), full_response.ends_with('\n')));
@@ -12739,7 +19151,10 @@ async fn execute_schedule(
                                 if is_error {
                                     sched_debug(&format!("[schedule_polling] ToolResult ERROR: last_tool={}, content_preview={:?}", last_tool_name, truncate_str(&content, 300)));
                                 }
-                                raw_entries.push(RawPayloadEntry { tag: "ToolResult".into(), content: format!("is_error={}, content={}", is_error, content) });
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "ToolResult".into(),
+                                    content: format!("is_error={}, content={}", is_error, content),
+                                });
                                 let _fr_before = full_response.len();
                                 if std::mem::take(&mut pending_cokacdir) {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
@@ -12760,7 +19175,8 @@ async fn execute_schedule(
                                 } else if is_error && !silent_mode {
                                     let truncated = truncate_str(&content, 500);
                                     if truncated.contains('\n') {
-                                        full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
+                                        full_response
+                                            .push_str(&format!("\n```\n{}\n```\n", truncated));
                                     } else {
                                         full_response.push_str(&format!("\n`{}`\n\n", truncated));
                                     }
@@ -12768,15 +19184,20 @@ async fn execute_schedule(
                                         chat_id.0, last_tool_name, full_response.len() - _fr_before, truncate_str(&truncated, 200), full_response.len(), _fr_before));
                                 } else if !silent_mode {
                                     if last_tool_name == "Read" {
-                                        full_response.push_str(&format!("\n✅ `{} bytes`\n\n", content.len()));
+                                        full_response.push_str(&format!(
+                                            "\n✅ `{} bytes`\n\n",
+                                            content.len()
+                                        ));
                                         sched_debug(&format!("[fr_trace][{}] +ToolResult/Read: added={}, content_bytes={}, total={} (was {})",
                                             chat_id.0, full_response.len() - _fr_before, content.len(), full_response.len(), _fr_before));
                                     } else if !content.is_empty() {
                                         let truncated = truncate_str(&content, 300);
                                         if truncated.contains('\n') {
-                                            full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
+                                            full_response
+                                                .push_str(&format!("\n```\n{}\n```\n", truncated));
                                         } else {
-                                            full_response.push_str(&format!("\n✅ `{}`\n\n", truncated));
+                                            full_response
+                                                .push_str(&format!("\n✅ `{}`\n\n", truncated));
                                         }
                                         sched_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): added={}, raw_content_len={}, preview={:?}, total={} (was {})",
                                             chat_id.0, last_tool_name, full_response.len() - _fr_before, content.len(), truncate_str(&truncated, 200), full_response.len(), _fr_before));
@@ -12789,7 +19210,10 @@ async fn execute_schedule(
                             }
                             StreamMessage::TaskNotification { summary, .. } => {
                                 if !summary.is_empty() {
-                                    raw_entries.push(RawPayloadEntry { tag: "TaskNotification".into(), content: summary.clone() });
+                                    raw_entries.push(RawPayloadEntry {
+                                        tag: "TaskNotification".into(),
+                                        content: summary.clone(),
+                                    });
                                     let _fr_before = full_response.len();
                                     full_response.push_str(&format!("\n[Task: {}]\n", summary));
                                     sched_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
@@ -12797,10 +19221,16 @@ async fn execute_schedule(
                                 }
                             }
                             StreamMessage::Done { result, session_id } => {
-                                sched_debug(&format!("[sched] Done: result_len={}, full_response_len={}",
-                                    result.len(), full_response.len()));
+                                sched_debug(&format!(
+                                    "[sched] Done: result_len={}, full_response_len={}",
+                                    result.len(),
+                                    full_response.len()
+                                ));
                                 if !result.is_empty() && full_response.is_empty() {
-                                    sched_debug(&format!("[sched] Done: fallback full_response = result ({})", result.len()));
+                                    sched_debug(&format!(
+                                        "[sched] Done: fallback full_response = result ({})",
+                                        result.len()
+                                    ));
                                     full_response = result.clone();
                                     sched_debug(&format!("[fr_trace][{}] +Done/fallback: set={}, preview={:?}, total={}",
                                         chat_id.0, result.len(), truncate_str(&full_response, 200), full_response.len()));
@@ -12809,17 +19239,37 @@ async fn execute_schedule(
                                         chat_id.0, result.len(), full_response.len()));
                                 }
                                 if !result.is_empty() && raw_entries.is_empty() {
-                                    raw_entries.push(RawPayloadEntry { tag: "Text".into(), content: result });
+                                    raw_entries.push(RawPayloadEntry {
+                                        tag: "Text".into(),
+                                        content: result,
+                                    });
                                 }
                                 if let Some(sid) = session_id {
                                     exec_session_id = Some(sid);
                                 }
-                                sched_debug(&format!("[fr_trace][{}] =DONE: final_total={}", chat_id.0, full_response.len()));
+                                sched_debug(&format!(
+                                    "[fr_trace][{}] =DONE: final_total={}",
+                                    chat_id.0,
+                                    full_response.len()
+                                ));
                                 done = true;
                             }
-                            StreamMessage::Error { message, stdout, stderr, exit_code } => {
-                                let stdout_display = if stdout.is_empty() { "(empty)".to_string() } else { stdout };
-                                let stderr_display = if stderr.is_empty() { "(empty)".to_string() } else { stderr };
+                            StreamMessage::Error {
+                                message,
+                                stdout,
+                                stderr,
+                                exit_code,
+                            } => {
+                                let stdout_display = if stdout.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    stdout
+                                };
+                                let stderr_display = if stderr.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    stderr
+                                };
                                 let code_display = match exit_code {
                                     Some(c) => c.to_string(),
                                     None => "(unknown)".to_string(),
@@ -12830,7 +19280,13 @@ async fn execute_schedule(
                                 );
                                 sched_debug(&format!("[fr_trace][{}] +Error: set={}, stdout_len={}, stderr_len={}, total={}",
                                     chat_id.0, full_response.len(), stdout_display.len(), stderr_display.len(), full_response.len()));
-                                raw_entries.push(RawPayloadEntry { tag: "Error".into(), content: format!("exit_code={}, message={}, stdout={}, stderr={}", code_display, message, stdout_display, stderr_display) });
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "Error".into(),
+                                    content: format!(
+                                        "exit_code={}, message={}, stdout={}, stderr={}",
+                                        code_display, message, stdout_display, stderr_display
+                                    ),
+                                });
                                 had_error = true;
                                 done = true;
                             }
@@ -12838,7 +19294,9 @@ async fn execute_schedule(
                     }
                     Err(std::sync::mpsc::TryRecvError::Empty) => break,
                     Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        if !done { had_error = true; }
+                        if !done {
+                            had_error = true;
+                        }
                         done = true;
                         break;
                     }
@@ -12849,7 +19307,8 @@ async fn execute_schedule(
             if !done {
                 // ── Rolling placeholder pattern (unified for all chats) ──
                 let threshold = file_attach_threshold();
-                let delta_end = floor_char_boundary(&full_response, full_response.len().min(threshold));
+                let delta_end =
+                    floor_char_boundary(&full_response, full_response.len().min(threshold));
                 if delta_end > last_confirmed_len {
                     let delta = &full_response[last_confirmed_len..delta_end];
                     let normalized_delta = normalize_empty_lines(delta);
@@ -12863,15 +19322,42 @@ async fn execute_schedule(
                             placeholder_msg_id, normalized_delta.len(), html_delta.len(), last_confirmed_len, delta_end));
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         if html_delta.len() <= TELEGRAM_MSG_LIMIT {
-                            let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_delta)
-                                .parse_mode(ParseMode::Html).await);
+                            let _ = tg!(
+                                "edit_message",
+                                bot_owned
+                                    .edit_message_text(chat_id, placeholder_msg_id, &html_delta)
+                                    .parse_mode(ParseMode::Html)
+                                    .await
+                            );
                         } else {
-                            if send_long_message(&bot_owned, chat_id, &html_delta, Some(ParseMode::Html), &state_owned).await.is_ok() {
+                            if send_long_message(
+                                &bot_owned,
+                                chat_id,
+                                &html_delta,
+                                Some(ParseMode::Html),
+                                &state_owned,
+                            )
+                            .await
+                            .is_ok()
+                            {
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                let _ = tg!(
+                                    "delete_message",
+                                    bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                );
                             } else {
-                                let truncated_delta = truncate_str(&normalized_delta, TELEGRAM_MSG_LIMIT);
-                                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated_delta).await);
+                                let truncated_delta =
+                                    truncate_str(&normalized_delta, TELEGRAM_MSG_LIMIT);
+                                let _ = tg!(
+                                    "edit_message",
+                                    bot_owned
+                                        .edit_message_text(
+                                            chat_id,
+                                            placeholder_msg_id,
+                                            &truncated_delta
+                                        )
+                                        .await
+                                );
                             }
                         }
                         last_confirmed_len = delta_end;
@@ -12884,7 +19370,10 @@ async fn execute_schedule(
                             }
                             Err(e) => {
                                 let ts = chrono::Local::now().format("%H:%M:%S");
-                                println!("  [{ts}]   ⚠ new placeholder failed (schedule): {}", redact_err(&e));
+                                println!(
+                                    "  [{ts}]   ⚠ new placeholder failed (schedule): {}",
+                                    redact_err(&e)
+                                );
                                 msg_debug(&format!("[rolling_ph/sched] NEW placeholder FAILED: keeping msg_id={}, err={}", placeholder_msg_id, e));
                             }
                         }
@@ -12898,12 +19387,24 @@ async fn execute_schedule(
                     if display_text != last_edit_text {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
                         let html_text = markdown_to_telegram_html(&display_text);
-                        let _ = tg!("edit_message", &state_owned, chat_id, bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
-                            .parse_mode(ParseMode::Html).await);
+                        let _ = tg!(
+                            "edit_message",
+                            &state_owned,
+                            chat_id,
+                            bot_owned
+                                .edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                                .parse_mode(ParseMode::Html)
+                                .await
+                        );
                         last_edit_text = display_text;
                     } else {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("send_chat_action", bot_owned.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await);
+                        let _ = tg!(
+                            "send_chat_action",
+                            bot_owned
+                                .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                                .await
+                        );
                     }
                 }
             }
@@ -12916,8 +19417,13 @@ async fn execute_schedule(
         }
 
         // Final response
-        sched_debug(&format!("[execute_schedule] id={}, polling done: cancelled={}, had_error={}, response_len={}",
-            schedule_id, cancelled, had_error, full_response.len()));
+        sched_debug(&format!(
+            "[execute_schedule] id={}, polling done: cancelled={}, had_error={}, response_len={}",
+            schedule_id,
+            cancelled,
+            had_error,
+            full_response.len()
+        ));
         // Snapshot whether the AI actually produced any output, taken BEFORE the
         // not-cancelled branch below replaces an empty `full_response` with the
         // user-facing "(No response)" sentinel. Inline cleanup uses this flag so
@@ -12932,22 +19438,48 @@ async fn execute_schedule(
         let continue_hint: String = if inline_mode_owned {
             String::new()
         } else {
-            format!("\n\nUse /{} to continue this schedule session.", schedule_id)
+            format!(
+                "\n\nUse /{} to continue this schedule session.",
+                schedule_id
+            )
         };
         if cancelled {
-            sched_debug(&format!("[execute_schedule] id={}, cancelled — killing child process", schedule_id));
+            sched_debug(&format!(
+                "[execute_schedule] id={}, cancelled — killing child process",
+                schedule_id
+            ));
             // Re-send SIGKILL as a safety belt (cancel_now is idempotent).
             cancel_token.cancel_now();
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
             // ── Show remaining delta + stopped (unified rolling placeholder) ──
-            if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
+            if full_response.len() < last_confirmed_len
+                || !full_response.is_char_boundary(last_confirmed_len)
+            {
+                last_confirmed_len = 0;
+            }
             let remaining = &full_response[last_confirmed_len..];
             if should_attach_response_as_file(full_response.len(), provider_str) {
-                let notice = format!("\u{1f4c4} Response attached as file [Stopped]{}", continue_hint);
-                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &notice).await);
-                let stopped_content = format!("{}\n\n[Stopped]", normalize_empty_lines(&full_response));
-                send_response_as_file(&bot_owned, chat_id, &stopped_content, &state_owned, "schedule").await;
+                let notice = format!(
+                    "\u{1f4c4} Response attached as file [Stopped]{}",
+                    continue_hint
+                );
+                let _ = tg!(
+                    "edit_message",
+                    bot_owned
+                        .edit_message_text(chat_id, placeholder_msg_id, &notice)
+                        .await
+                );
+                let stopped_content =
+                    format!("{}\n\n[Stopped]", normalize_empty_lines(&full_response));
+                send_response_as_file(
+                    &bot_owned,
+                    chat_id,
+                    &stopped_content,
+                    &state_owned,
+                    "schedule",
+                )
+                .await;
             } else {
                 let display_stopped = if remaining.trim().is_empty() {
                     format!("⛔ Stopped{}", continue_hint)
@@ -12955,7 +19487,12 @@ async fn execute_schedule(
                     let normalized = normalize_empty_lines(remaining);
                     format!("{}\n\n⛔ Stopped{}", normalized, continue_hint)
                 };
-                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &display_stopped).await);
+                let _ = tg!(
+                    "edit_message",
+                    bot_owned
+                        .edit_message_text(chat_id, placeholder_msg_id, &display_stopped)
+                        .await
+                );
             }
 
             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -12968,55 +19505,120 @@ async fn execute_schedule(
             // and is also gated out of session history below.
             if full_response.is_empty() {
                 full_response = "(No response)".to_string();
-                sched_debug(&format!("[fr_trace][{}] =NoResponse: set to '(No response)'", chat_id.0));
+                sched_debug(&format!(
+                    "[fr_trace][{}] =NoResponse: set to '(No response)'",
+                    chat_id.0
+                ));
             }
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
 
             // ── Send only remaining delta (unified rolling placeholder) ──
-            if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
+            if full_response.len() < last_confirmed_len
+                || !full_response.is_char_boundary(last_confirmed_len)
+            {
+                last_confirmed_len = 0;
+            }
             let remaining = &full_response[last_confirmed_len..];
             msg_debug(&format!("[rolling_ph/sched] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
                 placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
             if !had_real_response || remaining.trim().is_empty() {
-                msg_debug(&format!("[rolling_ph/sched] FINAL DELETE placeholder: msg_id={}", placeholder_msg_id));
-                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                msg_debug(&format!(
+                    "[rolling_ph/sched] FINAL DELETE placeholder: msg_id={}",
+                    placeholder_msg_id
+                ));
+                let _ = tg!(
+                    "delete_message",
+                    bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                );
             } else if should_attach_response_as_file(full_response.len(), provider_str) {
-                msg_debug(&format!("[rolling_ph/sched] FINAL FILE ATTACH: total={}", full_response.len()));
+                msg_debug(&format!(
+                    "[rolling_ph/sched] FINAL FILE ATTACH: total={}",
+                    full_response.len()
+                ));
                 let notice = format!("\u{1f4c4} Response attached as file{}", continue_hint);
-                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &notice).await);
-                let final_text = format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
-                send_response_as_file(&bot_owned, chat_id, &final_text, &state_owned, "schedule").await;
+                let _ = tg!(
+                    "edit_message",
+                    bot_owned
+                        .edit_message_text(chat_id, placeholder_msg_id, &notice)
+                        .await
+                );
+                let final_text =
+                    format!("{}{}", normalize_empty_lines(&full_response), continue_hint);
+                send_response_as_file(&bot_owned, chat_id, &final_text, &state_owned, "schedule")
+                    .await;
             } else {
                 let normalized_remaining = normalize_empty_lines(remaining);
                 let final_text = format!("{}{}", normalized_remaining, continue_hint);
                 let html_response = markdown_to_telegram_html(&final_text);
-                msg_debug(&format!("[rolling_ph/sched] FINAL EDIT placeholder: msg_id={}, html_len={}", placeholder_msg_id, html_response.len()));
+                msg_debug(&format!(
+                    "[rolling_ph/sched] FINAL EDIT placeholder: msg_id={}, html_len={}",
+                    placeholder_msg_id,
+                    html_response.len()
+                ));
                 if html_response.len() <= TELEGRAM_MSG_LIMIT {
-                    if let Err(_) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_response)
-                        .parse_mode(ParseMode::Html).await)
-                    {
+                    if let Err(_) = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(chat_id, placeholder_msg_id, &html_response)
+                            .parse_mode(ParseMode::Html)
+                            .await
+                    ) {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &final_text).await);
+                        let _ = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(chat_id, placeholder_msg_id, &final_text)
+                                .await
+                        );
                     }
                 } else {
-                    let send_result = send_long_message(&bot_owned, chat_id, &html_response, Some(ParseMode::Html), &state_owned).await;
+                    let send_result = send_long_message(
+                        &bot_owned,
+                        chat_id,
+                        &html_response,
+                        Some(ParseMode::Html),
+                        &state_owned,
+                    )
+                    .await;
                     match send_result {
                         Ok(_) => {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                            let _ = tg!(
+                                "delete_message",
+                                bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                            );
                         }
                         Err(_) => {
-                            let fallback = send_long_message(&bot_owned, chat_id, &final_text, None, &state_owned).await;
+                            let fallback = send_long_message(
+                                &bot_owned,
+                                chat_id,
+                                &final_text,
+                                None,
+                                &state_owned,
+                            )
+                            .await;
                             match fallback {
                                 Ok(_) => {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                    let _ = tg!(
+                                        "delete_message",
+                                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                    );
                                 }
                                 Err(_) => {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
                                     let truncated = truncate_str(&final_text, TELEGRAM_MSG_LIMIT);
-                                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated).await);
+                                    let _ = tg!(
+                                        "edit_message",
+                                        bot_owned
+                                            .edit_message_text(
+                                                chat_id,
+                                                placeholder_msg_id,
+                                                &truncated
+                                            )
+                                            .await
+                                    );
                                 }
                             }
                         }
@@ -13035,7 +19637,10 @@ async fn execute_schedule(
                 };
                 if let Some(hook_msg) = end_hook_msg {
                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!("send_message", bot_owned.send_message(chat_id, &hook_msg).await);
+                    let _ = tg!(
+                        "send_message",
+                        bot_owned.send_message(chat_id, &hook_msg).await
+                    );
                 }
             }
         }
@@ -13048,14 +19653,28 @@ async fn execute_schedule(
             schedule_id, cancelled, had_error, entry_clone.schedule_type, entry_clone.once, entry_clone.context_summary.is_some(), inline_mode_owned));
         let sched_provider = detect_provider(model_for_summary.as_deref());
         let new_context_summary = if inline_mode_owned {
-            sched_debug(&format!("[execute_schedule] id={}, inline mode — skipping context summary extraction", schedule_id));
+            sched_debug(&format!(
+                "[execute_schedule] id={}, inline mode — skipping context summary extraction",
+                schedule_id
+            ));
             None
         } else if sched_provider != "claude" {
             // Codex/Gemini/OpenCode: skip summary extraction (not supported via Claude API)
-            sched_debug(&format!("[execute_schedule] id={}, non-Claude backend — skipping context summary", schedule_id));
+            sched_debug(&format!(
+                "[execute_schedule] id={}, non-Claude backend — skipping context summary",
+                schedule_id
+            ));
             None
-        } else if !cancelled && !had_error && entry_clone.schedule_type == "cron" && !entry_clone.once.unwrap_or(false) && entry_clone.context_summary.is_some() {
-            sched_debug(&format!("[execute_schedule] id={}, extracting result summary", schedule_id));
+        } else if !cancelled
+            && !had_error
+            && entry_clone.schedule_type == "cron"
+            && !entry_clone.once.unwrap_or(false)
+            && entry_clone.context_summary.is_some()
+        {
+            sched_debug(&format!(
+                "[execute_schedule] id={}, extracting result summary",
+                schedule_id
+            ));
             if let Some(ref sid) = exec_session_id {
                 let sid = sid.clone();
                 let path = workspace_path_owned.clone();
@@ -13066,24 +19685,31 @@ async fn execute_schedule(
                 };
                 let summary_result = spawn_tracked_blocking_result(request_tasks, move || {
                     let claude_model = model.as_deref().and_then(claude::strip_claude_prefix);
-                    claude::extract_result_summary(
-                        &sid,
-                        &path,
-                        claude_model,
-                    )
-                }).await;
+                    claude::extract_result_summary(&sid, &path, claude_model)
+                })
+                .await;
                 match summary_result {
                     Ok(Some(Ok(ref summary))) => {
-                        sched_debug(&format!("[execute_schedule] id={}, new context summary: {} chars", schedule_id, summary.len()));
+                        sched_debug(&format!(
+                            "[execute_schedule] id={}, new context summary: {} chars",
+                            schedule_id,
+                            summary.len()
+                        ));
                         Some(summary.clone())
                     }
                     _ => {
-                        sched_debug(&format!("[execute_schedule] id={}, summary extraction failed", schedule_id));
+                        sched_debug(&format!(
+                            "[execute_schedule] id={}, summary extraction failed",
+                            schedule_id
+                        ));
                         None
                     }
                 }
             } else {
-                sched_debug(&format!("[execute_schedule] id={}, no session_id for summary", schedule_id));
+                sched_debug(&format!(
+                    "[execute_schedule] id={}, no session_id for summary",
+                    schedule_id
+                ));
                 None
             }
         } else {
@@ -13126,33 +19752,51 @@ async fn execute_schedule(
         }
 
         // Write to group chat shared log (scheduled task)
-        sched_debug(&format!("[sched] JSONL check: chat_id={}, raw_entries_count={}",
-            chat_id.0, raw_entries.len()));
+        sched_debug(&format!(
+            "[sched] JSONL check: chat_id={}, raw_entries_count={}",
+            chat_id.0,
+            raw_entries.len()
+        ));
         if chat_id.0 < 0 && !sched_bot_username.is_empty() {
             let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-            let dn = if sched_bot_display_name.is_empty() { None } else { Some(sched_bot_display_name.clone()) };
-            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                ts: now_ts.clone(),
-                bot: sched_bot_username.clone(),
-                bot_display_name: dn.clone(),
-                role: "user".to_string(),
-                from: Some("scheduled_task".to_string()),
-                text: entry_clone.prompt.clone(),
-                clear: false,
-            });
-            if !raw_entries.is_empty() {
-                sched_debug(&format!("[sched] JSONL: writing user+assistant entries, raw_entries_count={}", raw_entries.len()));
-                append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                    ts: now_ts,
-                    bot: sched_bot_username.clone(),
-                    bot_display_name: dn,
-                    role: "assistant".to_string(),
-                    from: None,
-                    text: serialize_payload(&std::mem::take(&mut raw_entries)),
-                    clear: false,
-                });
+            let dn = if sched_bot_display_name.is_empty() {
+                None
             } else {
-                sched_debug(&format!("[sched] JSONL: user entry written, assistant SKIPPED (raw_entries is empty)"));
+                Some(sched_bot_display_name.clone())
+            };
+            append_group_chat_log(
+                chat_id.0,
+                &GroupChatLogEntry {
+                    ts: now_ts.clone(),
+                    bot: sched_bot_username.clone(),
+                    bot_display_name: dn.clone(),
+                    role: "user".to_string(),
+                    from: Some("scheduled_task".to_string()),
+                    text: entry_clone.prompt.clone(),
+                    clear: false,
+                },
+            );
+            if !raw_entries.is_empty() {
+                sched_debug(&format!(
+                    "[sched] JSONL: writing user+assistant entries, raw_entries_count={}",
+                    raw_entries.len()
+                ));
+                append_group_chat_log(
+                    chat_id.0,
+                    &GroupChatLogEntry {
+                        ts: now_ts,
+                        bot: sched_bot_username.clone(),
+                        bot_display_name: dn,
+                        role: "assistant".to_string(),
+                        from: None,
+                        text: serialize_payload(&std::mem::take(&mut raw_entries)),
+                        clear: false,
+                    },
+                );
+            } else {
+                sched_debug(&format!(
+                    "[sched] JSONL: user entry written, assistant SKIPPED (raw_entries is empty)"
+                ));
             }
         }
 
@@ -13182,7 +19826,10 @@ async fn execute_schedule(
         );
 
         // Update schedule file (last_run / delete if once)
-        sched_debug(&format!("[execute_schedule] id={}, calling update_schedule_after_run", schedule_id));
+        sched_debug(&format!(
+            "[execute_schedule] id={}, calling update_schedule_after_run",
+            schedule_id
+        ));
         update_schedule_after_run(&entry_clone, new_context_summary);
 
         // Workspace directory is preserved for user to continue work via /start
@@ -13216,7 +19863,9 @@ async fn execute_schedule(
                 let now_clear_epoch = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
                 let now_model = get_model(&data.settings, chat_id);
                 let now_provider = detect_provider(now_model.as_deref());
-                let (now_sid, now_path) = data.sessions.get(&chat_id)
+                let (now_sid, now_path) = data
+                    .sessions
+                    .get(&chat_id)
                     .map(|s| (s.session_id.clone(), s.current_path.clone()))
                     .unwrap_or((None, None));
                 let session_changed = now_provider != provider_str
@@ -13280,9 +19929,15 @@ async fn execute_schedule(
         };
         if let Some(msg_id) = stop_msg_id {
             shared_rate_limit_wait(&state_owned, chat_id).await;
-            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+            let _ = tg!(
+                "delete_message",
+                bot_owned.delete_message(chat_id, msg_id).await
+            );
         }
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=schedule_poll_completed", chat_id.0));
+        msg_debug(&format!(
+            "[queue:trigger] chat_id={}, source=schedule_poll_completed",
+            chat_id.0
+        ));
         drop(_group_lock); // release group chat lock before processing queue
         process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
     });
@@ -13306,7 +19961,10 @@ async fn process_bot_message(
     {
         let mut data = state.lock().await;
         if data.cancel_tokens.contains_key(&chat_id) {
-            msg_debug(&format!("[process_bot_message] chat_id={}, cancel_token exists (busy), skipping id={}", chat_id.0, msg.id));
+            msg_debug(&format!(
+                "[process_bot_message] chat_id={}, cancel_token exists (busy), skipping id={}",
+                chat_id.0, msg.id
+            ));
             // Slot was claimed by someone else between the scheduler's
             // busy-check and our claim attempt. Leave the bot-message
             // file on disk so the next scheduler tick re-tries — without
@@ -13337,34 +19995,75 @@ async fn process_bot_message(
         // this file via scan_messages and re-runs process_bot_message. This
         // is the recovery path for /stop landing while we waited for the
         // group lock — without it the message vanishes silently.
-        msg_debug(&format!("[process_bot_message] cancelled during lock wait, id={} (file preserved for retry)", msg.id));
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=botmsg_cancelled_during_lock", chat_id.0));
-        { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+        msg_debug(&format!(
+            "[process_bot_message] cancelled during lock wait, id={} (file preserved for retry)",
+            msg.id
+        ));
+        msg_debug(&format!(
+            "[queue:trigger] chat_id={}, source=botmsg_cancelled_during_lock",
+            chat_id.0
+        ));
+        {
+            let mut data = state.lock().await;
+            remove_cancel_token_locked(&mut data, chat_id);
+        }
         drop(group_lock); // release before queue processing to avoid deadlock
         process_next_queued_message(bot, chat_id, state).await;
         return;
     }
 
     // Auto-restore session
-    msg_debug(&format!("[process_bot_message] auto_restore_session for bot:{}", msg.from));
+    msg_debug(&format!(
+        "[process_bot_message] auto_restore_session for bot:{}",
+        msg.from
+    ));
     auto_restore_session(state, chat_id, &format!("bot:{}", msg.from)).await;
 
     // Get session info, allowed tools, model, history, instruction, and provider options
-    let (session_info, allowed_tools, model, history, instruction, context_count, botmsg_chrome_enabled, effort, codex_fast_enabled) = {
+    let (
+        session_info,
+        allowed_tools,
+        model,
+        history,
+        instruction,
+        context_count,
+        botmsg_chrome_enabled,
+        effort,
+        codex_fast_enabled,
+    ) = {
         let data = state.lock().await;
         let info = data.sessions.get(&chat_id).and_then(|session| {
             session.current_path.as_ref().map(|_| {
-                (session.session_id.clone(), session.current_path.clone().unwrap_or_default())
+                (
+                    session.session_id.clone(),
+                    session.current_path.clone().unwrap_or_default(),
+                )
             })
         });
         let tools = get_allowed_tools(&data.settings, chat_id);
         let mdl = get_model(&data.settings, chat_id);
-        let hist = data.sessions.get(&chat_id)
+        let hist = data
+            .sessions
+            .get(&chat_id)
             .map(|s| s.history.clone())
             .unwrap_or_default();
-        let instr = data.settings.instructions.get(&chat_id.0.to_string()).cloned();
-        let ctx = data.settings.context.get(&chat_id.0.to_string()).copied().unwrap_or(12);
-        let chrome = data.settings.use_chrome.get(&chat_id.0.to_string()).copied().unwrap_or(false);
+        let instr = data
+            .settings
+            .instructions
+            .get(&chat_id.0.to_string())
+            .cloned();
+        let ctx = data
+            .settings
+            .context
+            .get(&chat_id.0.to_string())
+            .copied()
+            .unwrap_or(12);
+        let chrome = data
+            .settings
+            .use_chrome
+            .get(&chat_id.0.to_string())
+            .copied()
+            .unwrap_or(false);
         let provider = detect_provider(mdl.as_deref());
         let eff = get_effort_for_provider(&data.settings, chat_id, provider);
         let codex_fast = is_codex_fast(&data.settings, chat_id);
@@ -13375,32 +20074,52 @@ async fn process_bot_message(
 
     let (session_id, current_path) = match session_info {
         Some(info) => {
-            msg_debug(&format!("[process_bot_message] session found: session_id={:?}, path={}", info.0, info.1));
+            msg_debug(&format!(
+                "[process_bot_message] session found: session_id={:?}, path={}",
+                info.0, info.1
+            ));
             info
         }
         None => {
             // No active session — create an error response
-            msg_debug(&format!("[process_bot_message] no session for chat_id={}, sending error response", chat_id.0));
+            msg_debug(&format!(
+                "[process_bot_message] no session for chat_id={}, sending error response",
+                chat_id.0
+            ));
             // Discard the on-disk file: re-queueing would loop the same
             // "no session" error every scheduler tick. The user has been
             // (best-effort) notified via the send_message below.
             let remove_result = fs::remove_file(&msg.file_path);
             msg_debug(&format!(
                 "[process_bot_message] deleted message file (no session): id={}, ok={}",
-                msg.id, remove_result.is_ok()
+                msg.id,
+                remove_result.is_ok()
             ));
             {
                 let mut data = state.lock().await;
                 remove_cancel_token_locked(&mut data, chat_id);
-                let cleared = data.message_queues.remove(&chat_id).map(|q| q.len()).unwrap_or(0);
+                let cleared = data
+                    .message_queues
+                    .remove(&chat_id)
+                    .map(|q| q.len())
+                    .unwrap_or(0);
                 if cleared > 0 {
                     msg_debug(&format!("[queue:clear] chat_id={}, no session (bot msg), cleared {} queued messages", chat_id.0, cleared));
                 }
             }
             shared_rate_limit_wait(state, chat_id).await;
-            let _ = tg!("send_message", bot.send_message(chat_id,
-                format!("📨 @{}: {}\n\n⚠️ No active session. Use /start <path> first.",
-                    msg.from, truncate_str(&msg.content, 200))).await);
+            let _ = tg!(
+                "send_message",
+                bot.send_message(
+                    chat_id,
+                    format!(
+                        "📨 @{}: {}\n\n⚠️ No active session. Use /start <path> first.",
+                        msg.from,
+                        truncate_str(&msg.content, 200)
+                    )
+                )
+                .await
+            );
             msg_debug("[process_bot_message] END (no session)");
             return;
         }
@@ -13411,13 +20130,25 @@ async fn process_bot_message(
     shared_rate_limit_wait(state, chat_id).await;
     let placeholder = match tg!("send_message", bot.send_message(chat_id, "...").await) {
         Ok(m) => {
-            msg_debug(&format!("[process_bot_message] placeholder sent: msg_id={}", m.id));
+            msg_debug(&format!(
+                "[process_bot_message] placeholder sent: msg_id={}",
+                m.id
+            ));
             m
         }
         Err(e) => {
-            msg_debug(&format!("[process_bot_message] failed to send placeholder: {}, aborting", e));
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=botmsg_placeholder_error", chat_id.0));
-            { let mut data = state.lock().await; remove_cancel_token_locked(&mut data, chat_id); }
+            msg_debug(&format!(
+                "[process_bot_message] failed to send placeholder: {}, aborting",
+                e
+            ));
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=botmsg_placeholder_error",
+                chat_id.0
+            ));
+            {
+                let mut data = state.lock().await;
+                remove_cancel_token_locked(&mut data, chat_id);
+            }
             // Discard the on-disk file: leaving it would let the scheduler
             // re-attempt every 5s, which for a permanent failure (bot kicked,
             // chat closed, token revoked) becomes log spam with the same
@@ -13426,14 +20157,16 @@ async fn process_bot_message(
             let remove_result = fs::remove_file(&msg.file_path);
             msg_debug(&format!(
                 "[process_bot_message] deleted message file (placeholder failed): id={}, ok={}",
-                msg.id, remove_result.is_ok()
+                msg.id,
+                remove_result.is_ok()
             ));
             // Best-effort surface the dropped bot-to-bot message. The notice
             // itself may also fail (the original placeholder error was likely
             // a network / rate-limit / permissions issue affecting all
             // outbound messages in this chat) — that's why this is `let _ =`.
             shared_rate_limit_wait(state, chat_id).await;
-            let _ = tg!("send_message", bot.send_message(chat_id,
+            let _ =
+                tg!("send_message", bot.send_message(chat_id,
                 format!("📨 @{}: {}\n\n⚠️ Failed to deliver bot message ({}). Please try again.",
                     msg.from, truncate_str(&msg.content, 200), e)).await);
             drop(group_lock); // release before queue processing to avoid deadlock
@@ -13453,19 +20186,32 @@ async fn process_bot_message(
     let remove_result = fs::remove_file(&msg.file_path);
     msg_debug(&format!(
         "[process_bot_message] deleted message file post-placeholder: id={}, path={}, ok={}",
-        msg.id, msg.file_path.display(), remove_result.is_ok()
+        msg.id,
+        msg.file_path.display(),
+        remove_result.is_ok()
     ));
 
     // Build disabled tools notice
-    let default_tools: std::collections::HashSet<&str> = DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
-    let allowed_set: std::collections::HashSet<&str> = allowed_tools.iter().map(|s| s.as_str()).collect();
-    let disabled: Vec<&&str> = default_tools.iter().filter(|t| !allowed_set.contains(**t)).collect();
-    msg_debug(&format!("[process_bot_message] disabled_tools={}", disabled.len()));
+    let default_tools: std::collections::HashSet<&str> =
+        DEFAULT_ALLOWED_TOOLS.iter().copied().collect();
+    let allowed_set: std::collections::HashSet<&str> =
+        allowed_tools.iter().map(|s| s.as_str()).collect();
+    let disabled: Vec<&&str> = default_tools
+        .iter()
+        .filter(|t| !allowed_set.contains(**t))
+        .collect();
+    msg_debug(&format!(
+        "[process_bot_message] disabled_tools={}",
+        disabled.len()
+    ));
     let disabled_notice = if disabled.is_empty() {
         String::new()
     } else {
         let names: Vec<&str> = disabled.iter().map(|t| **t).collect();
-        msg_debug(&format!("[process_bot_message] disabled: [{}]", names.join(", ")));
+        msg_debug(&format!(
+            "[process_bot_message] disabled: [{}]",
+            names.join(", ")
+        ));
         format!(
             "\n\nDISABLED TOOLS: The following tools have been disabled by the user: {}.\n\
              You MUST NOT attempt to use these tools. \
@@ -13481,8 +20227,14 @@ async fn process_bot_message(
     let platform = capitalize_platform(detect_platform(token));
     let role = match &instruction {
         Some(instr) => {
-            msg_debug(&format!("[process_bot_message] instruction present, len={}", instr.len()));
-            format!("You are chatting with a user through {}.\n\nUser's instruction for this chat:\n{}", platform, instr)
+            msg_debug(&format!(
+                "[process_bot_message] instruction present, len={}",
+                instr.len()
+            ));
+            format!(
+                "You are chatting with a user through {}.\n\nUser's instruction for this chat:\n{}",
+                platform, instr
+            )
         }
         None => {
             msg_debug("[process_bot_message] no instruction set");
@@ -13491,12 +20243,21 @@ async fn process_bot_message(
     };
     let system_prompt_owned = build_system_prompt(
         &role,
-        &current_path, chat_id.0, &bot_key, &disabled_notice,
-        session_id.as_deref(), bot_username, bot_display_name,
+        &current_path,
+        chat_id.0,
+        &bot_key,
+        &disabled_notice,
+        session_id.as_deref(),
+        bot_username,
+        bot_display_name,
         None, // bot-to-bot messages: no user message dedup
-        context_count, &platform,
+        context_count,
+        &platform,
     );
-    msg_debug(&format!("[process_bot_message] system_prompt built, len={}", system_prompt_owned.len()));
+    msg_debug(&format!(
+        "[process_bot_message] system_prompt built, len={}",
+        system_prompt_owned.len()
+    ));
 
     // Create channel for streaming
     let (tx, rx) = mpsc::channel();
@@ -13516,17 +20277,26 @@ async fn process_bot_message(
     let bot_key_for_codex = bot_key.clone();
     let effort_clone: Option<String> = effort.clone();
     let codex_fast_clone = codex_fast_enabled;
-    msg_debug(&format!("[process_bot_message] spawning AI backend: model={:?}, history_len={}, prompt_len={}",
-        model_clone, history_clone.len(), prompt_for_ai.len()));
+    msg_debug(&format!(
+        "[process_bot_message] spawning AI backend: model={:?}, history_len={}, prompt_len={}",
+        model_clone,
+        history_clone.len(),
+        prompt_for_ai.len()
+    ));
     let request_tasks = {
         let data = state.lock().await;
         data.request_tasks.clone()
     };
     let _ = spawn_tracked_blocking_task(request_tasks, move || {
         let provider = detect_provider(model_clone.as_deref());
-        msg_debug(&format!("[process_bot_message:spawn_blocking] provider={}, model={:?}", provider, model_clone));
+        msg_debug(&format!(
+            "[process_bot_message:spawn_blocking] provider={}, model={:?}",
+            provider, model_clone
+        ));
         let result = if provider == "opencode" {
-            let opencode_model = model_clone.as_deref().and_then(opencode::strip_opencode_prefix);
+            let opencode_model = model_clone
+                .as_deref()
+                .and_then(opencode::strip_opencode_prefix);
             msg_debug(&format!("[process_bot_message] → opencode::execute, opencode_model={:?}, session_id={:?}, path={}, prompt_len={}, system_prompt_len={}",
                 opencode_model, session_id_clone, current_path_clone, prompt_for_ai.len(), system_prompt_owned.len()));
             opencode::execute_command_streaming(
@@ -13557,7 +20327,8 @@ async fn process_bot_message(
             )
         } else if provider == "codex" {
             let codex_model = model_clone.as_deref().and_then(codex::strip_codex_prefix);
-            let codex_system_prompt = format!("{}{}", system_prompt_owned, codex_extra_instructions());
+            let codex_system_prompt =
+                format!("{}{}", system_prompt_owned, codex_extra_instructions());
             let is_resume = session_id_clone.is_some();
             let has_history = !history_clone.is_empty();
             msg_debug(&format!("[process_bot_message] codex: is_resume={}, has_history={}, history_len={}, sp_len={}",
@@ -13583,7 +20354,9 @@ async fn process_bot_message(
                 if is_resume {
                     msg_debug("[process_bot_message] codex: RESUME path — no history injection, sp via -c file");
                 } else {
-                    msg_debug("[process_bot_message] codex: NEW session, no history — sp via -c file");
+                    msg_debug(
+                        "[process_bot_message] codex: NEW session, no history — sp via -c file",
+                    );
                 }
                 prompt_for_ai.clone()
             };
@@ -13625,7 +20398,12 @@ async fn process_bot_message(
             )
         };
         if let Err(e) = result {
-            let _ = tx.send(StreamMessage::Error { message: e, stdout: String::new(), stderr: String::new(), exit_code: None });
+            let _ = tx.send(StreamMessage::Error {
+                message: e,
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: None,
+            });
         }
     });
 
@@ -13656,10 +20434,18 @@ async fn process_bot_message(
     let _ = spawn_tracked_request_task(request_tasks, async move {
         let _group_lock = group_lock; // hold group chat lock until task ends
         const SPINNER: &[&str] = &[
-            "🕐 P",           "🕑 Pr",          "🕒 Pro",
-            "🕓 Proc",        "🕔 Proce",       "🕕 Proces",
-            "🕖 Process",     "🕗 Processi",    "🕘 Processin",
-            "🕙 Processing",  "🕚 Processing.", "🕛 Processing..",
+            "🕐 P",
+            "🕑 Pr",
+            "🕒 Pro",
+            "🕓 Proc",
+            "🕔 Proce",
+            "🕕 Proces",
+            "🕖 Process",
+            "🕗 Processi",
+            "🕘 Processin",
+            "🕙 Processing",
+            "🕚 Processing.",
+            "🕛 Processing..",
         ];
         let mut full_response = String::new();
         let mut raw_entries: Vec<RawPayloadEntry> = Vec::new();
@@ -13678,21 +20464,31 @@ async fn process_bot_message(
             let data = state_owned.lock().await;
             (data.polling_time_ms, is_silent(&data.settings, chat_id))
         };
-        msg_debug(&format!("[botmsg_poll:{}] started: polling_time_ms={}, silent_mode={}", bmsg_id_for_log, polling_time_ms, silent_mode));
+        msg_debug(&format!(
+            "[botmsg_poll:{}] started: polling_time_ms={}, silent_mode={}",
+            bmsg_id_for_log, polling_time_ms, silent_mode
+        ));
 
         let mut queue_done = false;
         let mut response_rendered = false;
         while !done || !queue_done {
             if cancel_token.cancelled.load(Ordering::Relaxed) {
-                msg_debug(&format!("[botmsg_poll:{}] cancelled (pre-sleep check)", bmsg_id_for_log));
-                if !done { cancelled = true; }
+                msg_debug(&format!(
+                    "[botmsg_poll:{}] cancelled (pre-sleep check)",
+                    bmsg_id_for_log
+                ));
+                if !done {
+                    cancelled = true;
+                }
                 break;
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(polling_time_ms)).await;
 
             if cancel_token.cancelled.load(Ordering::Relaxed) {
-                if !done { cancelled = true; }
+                if !done {
+                    cancelled = true;
+                }
                 break;
             }
 
@@ -13700,158 +20496,238 @@ async fn process_bot_message(
             if !done {
                 loop {
                     match rx.try_recv() {
-                        Ok(stream_msg) => {
-                            match stream_msg {
-                                StreamMessage::Init { session_id: sid } => {
-                                    msg_debug(&format!("[botmsg_poll:{}] Init: session_id={}", bmsg_id_for_log, sid));
-                                    new_session_id = Some(sid);
-                                }
-                                StreamMessage::Text { content } => {
-                                    msg_debug(&format!("[botmsg_poll:{}] Text: chunk_len={}, total_len={}",
-                                        bmsg_id_for_log, content.len(), full_response.len() + content.len()));
-                                    raw_entries.push(RawPayloadEntry { tag: "Text".into(), content: content.clone() });
-                                    let _fr_before = full_response.len();
-                                    full_response.push_str(&content);
-                                    msg_debug(&format!("[fr_trace][{}] +Text: added={}, preview={:?}, total={} (was {})",
+                        Ok(stream_msg) => match stream_msg {
+                            StreamMessage::Init { session_id: sid } => {
+                                msg_debug(&format!(
+                                    "[botmsg_poll:{}] Init: session_id={}",
+                                    bmsg_id_for_log, sid
+                                ));
+                                new_session_id = Some(sid);
+                            }
+                            StreamMessage::Text { content } => {
+                                msg_debug(&format!(
+                                    "[botmsg_poll:{}] Text: chunk_len={}, total_len={}",
+                                    bmsg_id_for_log,
+                                    content.len(),
+                                    full_response.len() + content.len()
+                                ));
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "Text".into(),
+                                    content: content.clone(),
+                                });
+                                let _fr_before = full_response.len();
+                                full_response.push_str(&content);
+                                msg_debug(&format!("[fr_trace][{}] +Text: added={}, preview={:?}, total={} (was {})",
                                         chat_id.0, content.len(), truncate_str(&content, 200), full_response.len(), _fr_before));
-                                }
-                                StreamMessage::ToolUse { name, input } => {
-                                    pending_cokacdir = detect_cokacdir_command(&name, &input);
-                                    suppress_tool_display = detect_chat_log_read(&name, &input);
-                                    last_tool_name = name.clone();
-                                    let summary = format_tool_input(&name, &input);
-                                    let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}]   ⚙ [BotMsg] {name}: {summary}");
-                                    msg_debug(&format!("[botmsg_poll:{}] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, silent={}, response_len={}, ends_nl={}",
+                            }
+                            StreamMessage::ToolUse { name, input } => {
+                                pending_cokacdir = detect_cokacdir_command(&name, &input);
+                                suppress_tool_display = detect_chat_log_read(&name, &input);
+                                last_tool_name = name.clone();
+                                let summary = format_tool_input(&name, &input);
+                                let ts = chrono::Local::now().format("%H:%M:%S");
+                                println!("  [{ts}]   ⚙ [BotMsg] {name}: {summary}");
+                                msg_debug(&format!("[botmsg_poll:{}] ToolUse: name={}, input_preview={:?}, pending_cokacdir={}, silent={}, response_len={}, ends_nl={}",
                                         bmsg_id_for_log, name, truncate_str(&input, 200), pending_cokacdir, silent_mode, full_response.len(), full_response.ends_with('\n')));
-                                    raw_entries.push(RawPayloadEntry { tag: "ToolUse".into(), content: format!("{}: {}", name, input) });
-                                    if !pending_cokacdir && !silent_mode {
-                                        let _fr_before = full_response.len();
-                                        if name == "Bash" {
-                                            full_response.push_str(&format!("\n\n```\n{}\n```\n", format_bash_command(&input)));
-                                            msg_debug(&format!("[fr_trace][{}] +ToolUse/Bash: added={}, cmd={:?}, total={} (was {})",
-                                                chat_id.0, full_response.len() - _fr_before, truncate_str(&input, 100), full_response.len(), _fr_before));
-                                        } else {
-                                            full_response.push_str(&format!("\n\n⚙️ {}\n", summary));
-                                            msg_debug(&format!("[fr_trace][{}] +ToolUse/{}: added={}, summary={:?}, total={} (was {})",
-                                                chat_id.0, name, full_response.len() - _fr_before, truncate_str(&summary, 100), full_response.len(), _fr_before));
-                                        }
-                                    } else if !pending_cokacdir && silent_mode && !full_response.is_empty() && !full_response.ends_with('\n') {
-                                        msg_debug(&format!("[botmsg_poll:{}] silent mode: inserting \\n\\n after tool_use={}", bmsg_id_for_log, name));
-                                        full_response.push_str("\n\n");
-                                        msg_debug(&format!("[fr_trace][{}] +ToolUse/silent_nl: added=2, total={}", chat_id.0, full_response.len()));
-                                    }
-                                }
-                                StreamMessage::ToolResult { content, is_error } => {
-                                    msg_debug(&format!("[botmsg_poll:{}] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}",
-                                        bmsg_id_for_log, is_error, content.len(), pending_cokacdir, last_tool_name));
-                                    if is_error {
-                                        msg_debug(&format!("[botmsg_poll:{}] ToolResult ERROR: last_tool={}, content_preview={:?}", bmsg_id_for_log, last_tool_name, truncate_str(&content, 300)));
-                                    }
-                                    raw_entries.push(RawPayloadEntry { tag: "ToolResult".into(), content: format!("is_error={}, content={}", is_error, content) });
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "ToolUse".into(),
+                                    content: format!("{}: {}", name, input),
+                                });
+                                if !pending_cokacdir && !silent_mode {
                                     let _fr_before = full_response.len();
-                                    if std::mem::take(&mut pending_cokacdir) {
-                                        let ts = chrono::Local::now().format("%H:%M:%S");
-                                        if std::mem::take(&mut suppress_tool_display) {
-                                            println!("  [{ts}]   ↩ [BotMsg] cokacdir (chat_log, suppressed)");
-                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir_suppressed: added=0, total={}", chat_id.0, full_response.len()));
-                                        } else {
-                                            println!("  [{ts}]   ↩ [BotMsg] cokacdir: {content}");
-                                            let formatted = format_cokacdir_result(&content);
-                                            msg_debug(&format!("[botmsg_poll:{}] cokacdir result formatted_len={}", bmsg_id_for_log, formatted.len()));
-                                            if !formatted.is_empty() {
-                                                full_response.push_str(&format!("\n{}\n", formatted));
-                                                msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir: added={}, preview={:?}, total={} (was {})",
-                                                    chat_id.0, full_response.len() - _fr_before, truncate_str(&formatted, 200), full_response.len(), _fr_before));
-                                            } else {
-                                                msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir: formatted_empty, added=0, total={}", chat_id.0, full_response.len()));
-                                            }
-                                        }
-                                    } else if is_error && !silent_mode {
-                                        msg_debug(&format!("[botmsg_poll:{}] tool error: {}", bmsg_id_for_log, truncate_str(&content, 200)));
-                                        let truncated = truncate_str(&content, 500);
-                                        if truncated.contains('\n') {
-                                            full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
-                                        } else {
-                                            full_response.push_str(&format!("\n`{}`\n\n", truncated));
-                                        }
-                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/error({}): added={}, preview={:?}, total={} (was {})",
-                                            chat_id.0, last_tool_name, full_response.len() - _fr_before, truncate_str(&truncated, 200), full_response.len(), _fr_before));
-                                    } else if !silent_mode {
-                                        if last_tool_name == "Read" {
-                                            full_response.push_str(&format!("\n✅ `{} bytes`\n\n", content.len()));
-                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/Read: added={}, content_bytes={}, total={} (was {})",
-                                                chat_id.0, full_response.len() - _fr_before, content.len(), full_response.len(), _fr_before));
-                                        } else if !content.is_empty() {
-                                            let truncated = truncate_str(&content, 300);
-                                            if truncated.contains('\n') {
-                                                full_response.push_str(&format!("\n```\n{}\n```\n", truncated));
-                                            } else {
-                                                full_response.push_str(&format!("\n✅ `{}`\n\n", truncated));
-                                            }
-                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): added={}, raw_content_len={}, preview={:?}, total={} (was {})",
-                                                chat_id.0, last_tool_name, full_response.len() - _fr_before, content.len(), truncate_str(&truncated, 200), full_response.len(), _fr_before));
-                                        } else {
-                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): content_empty, added=0, total={}", chat_id.0, last_tool_name, full_response.len()));
-                                        }
+                                    if name == "Bash" {
+                                        full_response.push_str(&format!(
+                                            "\n\n```\n{}\n```\n",
+                                            format_bash_command(&input)
+                                        ));
+                                        msg_debug(&format!("[fr_trace][{}] +ToolUse/Bash: added={}, cmd={:?}, total={} (was {})",
+                                                chat_id.0, full_response.len() - _fr_before, truncate_str(&input, 100), full_response.len(), _fr_before));
                                     } else {
-                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/silent: skipped, last_tool={}, content_len={}, total={}", chat_id.0, last_tool_name, content.len(), full_response.len()));
+                                        full_response.push_str(&format!("\n\n⚙️ {}\n", summary));
+                                        msg_debug(&format!("[fr_trace][{}] +ToolUse/{}: added={}, summary={:?}, total={} (was {})",
+                                                chat_id.0, name, full_response.len() - _fr_before, truncate_str(&summary, 100), full_response.len(), _fr_before));
                                     }
+                                } else if !pending_cokacdir
+                                    && silent_mode
+                                    && !full_response.is_empty()
+                                    && !full_response.ends_with('\n')
+                                {
+                                    msg_debug(&format!("[botmsg_poll:{}] silent mode: inserting \\n\\n after tool_use={}", bmsg_id_for_log, name));
+                                    full_response.push_str("\n\n");
+                                    msg_debug(&format!(
+                                        "[fr_trace][{}] +ToolUse/silent_nl: added=2, total={}",
+                                        chat_id.0,
+                                        full_response.len()
+                                    ));
                                 }
-                                StreamMessage::TaskNotification { summary, .. } => {
-                                    msg_debug(&format!("[botmsg_poll:{}] TaskNotification: summary_len={}", bmsg_id_for_log, summary.len()));
-                                    if !summary.is_empty() {
-                                        raw_entries.push(RawPayloadEntry { tag: "TaskNotification".into(), content: summary.clone() });
-                                        let _fr_before = full_response.len();
-                                        full_response.push_str(&format!("\n[Task: {}]\n", summary));
-                                        msg_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
+                            }
+                            StreamMessage::ToolResult { content, is_error } => {
+                                msg_debug(&format!("[botmsg_poll:{}] ToolResult: is_error={}, content_len={}, pending_cokacdir={}, last_tool={}",
+                                        bmsg_id_for_log, is_error, content.len(), pending_cokacdir, last_tool_name));
+                                if is_error {
+                                    msg_debug(&format!("[botmsg_poll:{}] ToolResult ERROR: last_tool={}, content_preview={:?}", bmsg_id_for_log, last_tool_name, truncate_str(&content, 300)));
+                                }
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "ToolResult".into(),
+                                    content: format!("is_error={}, content={}", is_error, content),
+                                });
+                                let _fr_before = full_response.len();
+                                if std::mem::take(&mut pending_cokacdir) {
+                                    let ts = chrono::Local::now().format("%H:%M:%S");
+                                    if std::mem::take(&mut suppress_tool_display) {
+                                        println!(
+                                            "  [{ts}]   ↩ [BotMsg] cokacdir (chat_log, suppressed)"
+                                        );
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir_suppressed: added=0, total={}", chat_id.0, full_response.len()));
+                                    } else {
+                                        println!("  [{ts}]   ↩ [BotMsg] cokacdir: {content}");
+                                        let formatted = format_cokacdir_result(&content);
+                                        msg_debug(&format!(
+                                            "[botmsg_poll:{}] cokacdir result formatted_len={}",
+                                            bmsg_id_for_log,
+                                            formatted.len()
+                                        ));
+                                        if !formatted.is_empty() {
+                                            full_response.push_str(&format!("\n{}\n", formatted));
+                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir: added={}, preview={:?}, total={} (was {})",
+                                                    chat_id.0, full_response.len() - _fr_before, truncate_str(&formatted, 200), full_response.len(), _fr_before));
+                                        } else {
+                                            msg_debug(&format!("[fr_trace][{}] +ToolResult/cokacdir: formatted_empty, added=0, total={}", chat_id.0, full_response.len()));
+                                        }
+                                    }
+                                } else if is_error && !silent_mode {
+                                    msg_debug(&format!(
+                                        "[botmsg_poll:{}] tool error: {}",
+                                        bmsg_id_for_log,
+                                        truncate_str(&content, 200)
+                                    ));
+                                    let truncated = truncate_str(&content, 500);
+                                    if truncated.contains('\n') {
+                                        full_response
+                                            .push_str(&format!("\n```\n{}\n```\n", truncated));
+                                    } else {
+                                        full_response.push_str(&format!("\n`{}`\n\n", truncated));
+                                    }
+                                    msg_debug(&format!("[fr_trace][{}] +ToolResult/error({}): added={}, preview={:?}, total={} (was {})",
+                                            chat_id.0, last_tool_name, full_response.len() - _fr_before, truncate_str(&truncated, 200), full_response.len(), _fr_before));
+                                } else if !silent_mode {
+                                    if last_tool_name == "Read" {
+                                        full_response.push_str(&format!(
+                                            "\n✅ `{} bytes`\n\n",
+                                            content.len()
+                                        ));
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/Read: added={}, content_bytes={}, total={} (was {})",
+                                                chat_id.0, full_response.len() - _fr_before, content.len(), full_response.len(), _fr_before));
+                                    } else if !content.is_empty() {
+                                        let truncated = truncate_str(&content, 300);
+                                        if truncated.contains('\n') {
+                                            full_response
+                                                .push_str(&format!("\n```\n{}\n```\n", truncated));
+                                        } else {
+                                            full_response
+                                                .push_str(&format!("\n✅ `{}`\n\n", truncated));
+                                        }
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): added={}, raw_content_len={}, preview={:?}, total={} (was {})",
+                                                chat_id.0, last_tool_name, full_response.len() - _fr_before, content.len(), truncate_str(&truncated, 200), full_response.len(), _fr_before));
+                                    } else {
+                                        msg_debug(&format!("[fr_trace][{}] +ToolResult/{}(normal): content_empty, added=0, total={}", chat_id.0, last_tool_name, full_response.len()));
+                                    }
+                                } else {
+                                    msg_debug(&format!("[fr_trace][{}] +ToolResult/silent: skipped, last_tool={}, content_len={}, total={}", chat_id.0, last_tool_name, content.len(), full_response.len()));
+                                }
+                            }
+                            StreamMessage::TaskNotification { summary, .. } => {
+                                msg_debug(&format!(
+                                    "[botmsg_poll:{}] TaskNotification: summary_len={}",
+                                    bmsg_id_for_log,
+                                    summary.len()
+                                ));
+                                if !summary.is_empty() {
+                                    raw_entries.push(RawPayloadEntry {
+                                        tag: "TaskNotification".into(),
+                                        content: summary.clone(),
+                                    });
+                                    let _fr_before = full_response.len();
+                                    full_response.push_str(&format!("\n[Task: {}]\n", summary));
+                                    msg_debug(&format!("[fr_trace][{}] +TaskNotification: added={}, summary={:?}, total={} (was {})",
                                             chat_id.0, full_response.len() - _fr_before, truncate_str(&summary, 200), full_response.len(), _fr_before));
-                                    }
                                 }
-                                StreamMessage::Done { result, session_id: sid } => {
-                                    msg_debug(&format!("[botmsg_poll:{}] Done: result_len={}, session_id={:?}, full_response_len={}",
+                            }
+                            StreamMessage::Done {
+                                result,
+                                session_id: sid,
+                            } => {
+                                msg_debug(&format!("[botmsg_poll:{}] Done: result_len={}, session_id={:?}, full_response_len={}",
                                         bmsg_id_for_log, result.len(), sid, full_response.len()));
-                                    if !result.is_empty() && full_response.is_empty() {
-                                        msg_debug(&format!("[botmsg_poll:{}] Done: fallback full_response = result ({})", bmsg_id_for_log, result.len()));
-                                        full_response = result.clone();
-                                        msg_debug(&format!("[fr_trace][{}] +Done/fallback: set={}, preview={:?}, total={}",
+                                if !result.is_empty() && full_response.is_empty() {
+                                    msg_debug(&format!("[botmsg_poll:{}] Done: fallback full_response = result ({})", bmsg_id_for_log, result.len()));
+                                    full_response = result.clone();
+                                    msg_debug(&format!("[fr_trace][{}] +Done/fallback: set={}, preview={:?}, total={}",
                                             chat_id.0, result.len(), truncate_str(&full_response, 200), full_response.len()));
-                                    } else if !result.is_empty() {
-                                        msg_debug(&format!("[fr_trace][{}] Done/discarded: result_len={} discarded (full_response already has {})",
+                                } else if !result.is_empty() {
+                                    msg_debug(&format!("[fr_trace][{}] Done/discarded: result_len={} discarded (full_response already has {})",
                                             chat_id.0, result.len(), full_response.len()));
-                                    }
-                                    if !result.is_empty() && raw_entries.is_empty() {
-                                        raw_entries.push(RawPayloadEntry { tag: "Text".into(), content: result });
-                                    }
-                                    if let Some(s) = sid {
-                                        new_session_id = Some(s);
-                                    }
-                                    msg_debug(&format!("[fr_trace][{}] =DONE: final_total={}", chat_id.0, full_response.len()));
-                                    done = true;
                                 }
-                                StreamMessage::Error { message, stdout, stderr, exit_code } => {
-                                    msg_debug(&format!("[botmsg_poll:{}] Error: msg={}, exit_code={:?}, stdout_len={}, stderr_len={}",
+                                if !result.is_empty() && raw_entries.is_empty() {
+                                    raw_entries.push(RawPayloadEntry {
+                                        tag: "Text".into(),
+                                        content: result,
+                                    });
+                                }
+                                if let Some(s) = sid {
+                                    new_session_id = Some(s);
+                                }
+                                msg_debug(&format!(
+                                    "[fr_trace][{}] =DONE: final_total={}",
+                                    chat_id.0,
+                                    full_response.len()
+                                ));
+                                done = true;
+                            }
+                            StreamMessage::Error {
+                                message,
+                                stdout,
+                                stderr,
+                                exit_code,
+                            } => {
+                                msg_debug(&format!("[botmsg_poll:{}] Error: msg={}, exit_code={:?}, stdout_len={}, stderr_len={}",
                                         bmsg_id_for_log, message, exit_code, stdout.len(), stderr.len()));
-                                    let stdout_display = if stdout.is_empty() { "(empty)".to_string() } else { stdout };
-                                    let stderr_display = if stderr.is_empty() { "(empty)".to_string() } else { stderr };
-                                    let code_display = match exit_code {
-                                        Some(c) => c.to_string(),
-                                        None => "(unknown)".to_string(),
-                                    };
-                                    full_response = format!(
+                                let stdout_display = if stdout.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    stdout
+                                };
+                                let stderr_display = if stderr.is_empty() {
+                                    "(empty)".to_string()
+                                } else {
+                                    stderr
+                                };
+                                let code_display = match exit_code {
+                                    Some(c) => c.to_string(),
+                                    None => "(unknown)".to_string(),
+                                };
+                                full_response = format!(
                                         "Error: {}\n```\nexit code: {}\n\n[stdout]\n{}\n\n[stderr]\n{}\n```",
                                         message, code_display, stdout_display, stderr_display
                                     );
-                                    msg_debug(&format!("[fr_trace][{}] +Error: set={}, stdout_len={}, stderr_len={}, total={}",
+                                msg_debug(&format!("[fr_trace][{}] +Error: set={}, stdout_len={}, stderr_len={}, total={}",
                                         chat_id.0, full_response.len(), stdout_display.len(), stderr_display.len(), full_response.len()));
-                                    raw_entries.push(RawPayloadEntry { tag: "Error".into(), content: format!("exit_code={}, message={}, stdout={}, stderr={}", code_display, message, stdout_display, stderr_display) });
-                                    done = true;
-                                }
+                                raw_entries.push(RawPayloadEntry {
+                                    tag: "Error".into(),
+                                    content: format!(
+                                        "exit_code={}, message={}, stdout={}, stderr={}",
+                                        code_display, message, stdout_display, stderr_display
+                                    ),
+                                });
+                                done = true;
                             }
-                        }
+                        },
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            msg_debug(&format!("[botmsg_poll:{}] channel disconnected, setting done=true", bmsg_id_for_log));
+                            msg_debug(&format!(
+                                "[botmsg_poll:{}] channel disconnected, setting done=true",
+                                bmsg_id_for_log
+                            ));
                             done = true;
                             break;
                         }
@@ -13861,7 +20737,8 @@ async fn process_bot_message(
                 if !done {
                     // ── Rolling placeholder pattern (unified for all chats) ──
                     let threshold = file_attach_threshold();
-                    let delta_end = floor_char_boundary(&full_response, full_response.len().min(threshold));
+                    let delta_end =
+                        floor_char_boundary(&full_response, full_response.len().min(threshold));
                     if delta_end > last_confirmed_len {
                         let delta = &full_response[last_confirmed_len..delta_end];
                         let normalized_delta = normalize_empty_lines(delta);
@@ -13869,27 +20746,64 @@ async fn process_bot_message(
                         if html_delta.trim().is_empty() {
                             last_confirmed_len = delta_end;
                         } else {
-                            msg_debug(&format!("[botmsg_poll:{}] finalizing placeholder with delta_len={}", bmsg_id_for_log, normalized_delta.len()));
+                            msg_debug(&format!(
+                                "[botmsg_poll:{}] finalizing placeholder with delta_len={}",
+                                bmsg_id_for_log,
+                                normalized_delta.len()
+                            ));
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             if html_delta.len() <= TELEGRAM_MSG_LIMIT {
-                                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_delta)
-                                    .parse_mode(ParseMode::Html).await);
+                                let _ = tg!(
+                                    "edit_message",
+                                    bot_owned
+                                        .edit_message_text(chat_id, placeholder_msg_id, &html_delta)
+                                        .parse_mode(ParseMode::Html)
+                                        .await
+                                );
                             } else {
-                                if send_long_message(&bot_owned, chat_id, &html_delta, Some(ParseMode::Html), &state_owned).await.is_ok() {
+                                if send_long_message(
+                                    &bot_owned,
+                                    chat_id,
+                                    &html_delta,
+                                    Some(ParseMode::Html),
+                                    &state_owned,
+                                )
+                                .await
+                                .is_ok()
+                                {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                    let _ = tg!(
+                                        "delete_message",
+                                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                    );
                                 } else {
-                                    let truncated_delta = truncate_str(&normalized_delta, TELEGRAM_MSG_LIMIT);
-                                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated_delta).await);
+                                    let truncated_delta =
+                                        truncate_str(&normalized_delta, TELEGRAM_MSG_LIMIT);
+                                    let _ = tg!(
+                                        "edit_message",
+                                        bot_owned
+                                            .edit_message_text(
+                                                chat_id,
+                                                placeholder_msg_id,
+                                                &truncated_delta
+                                            )
+                                            .await
+                                    );
                                 }
                             }
                             last_confirmed_len = delta_end;
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            match tg!("send_message", bot_owned.send_message(chat_id, "...").await) {
-                                Ok(new_ph) => { placeholder_msg_id = new_ph.id; }
+                            match tg!("send_message", bot_owned.send_message(chat_id, "...").await)
+                            {
+                                Ok(new_ph) => {
+                                    placeholder_msg_id = new_ph.id;
+                                }
                                 Err(e) => {
                                     let ts = chrono::Local::now().format("%H:%M:%S");
-                                    println!("  [{ts}]   ⚠ new placeholder failed (botmsg): {}", redact_err(&e));
+                                    println!(
+                                        "  [{ts}]   ⚠ new placeholder failed (botmsg): {}",
+                                        redact_err(&e)
+                                    );
                                 }
                             }
                             last_edit_text.clear();
@@ -13900,15 +20814,30 @@ async fn process_bot_message(
                         spin_idx += 1;
                         let display_text = indicator.to_string();
                         if display_text != last_edit_text {
-                            msg_debug(&format!("[botmsg_poll:{}] spinner update spin_idx={}", bmsg_id_for_log, spin_idx));
+                            msg_debug(&format!(
+                                "[botmsg_poll:{}] spinner update spin_idx={}",
+                                bmsg_id_for_log, spin_idx
+                            ));
                             shared_rate_limit_wait(&state_owned, chat_id).await;
                             let html_text = markdown_to_telegram_html(&display_text);
-                            let _ = tg!("edit_message", &state_owned, chat_id, bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
-                                .parse_mode(ParseMode::Html).await);
+                            let _ = tg!(
+                                "edit_message",
+                                &state_owned,
+                                chat_id,
+                                bot_owned
+                                    .edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                                    .parse_mode(ParseMode::Html)
+                                    .await
+                            );
                             last_edit_text = display_text;
                         } else {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("send_chat_action", bot_owned.send_chat_action(chat_id, teloxide::types::ChatAction::Typing).await);
+                            let _ = tg!(
+                                "send_chat_action",
+                                bot_owned
+                                    .send_chat_action(chat_id, teloxide::types::ChatAction::Typing)
+                                    .await
+                            );
                         }
                     }
                 }
@@ -13917,7 +20846,11 @@ async fn process_bot_message(
             // Render final response once when AI completes
             if done && !response_rendered {
                 response_rendered = true;
-                msg_debug(&format!("[botmsg_poll:{}] rendering final response: response_len={}", bmsg_id_for_log, full_response.len()));
+                msg_debug(&format!(
+                    "[botmsg_poll:{}] rendering final response: response_len={}",
+                    bmsg_id_for_log,
+                    full_response.len()
+                ));
 
                 shared_rate_limit_wait(&state_owned, chat_id).await;
 
@@ -13927,60 +20860,151 @@ async fn process_bot_message(
                 // for the same pattern.
                 let was_originally_empty = full_response.is_empty();
                 if was_originally_empty {
-                    msg_debug(&format!("[botmsg_poll:{}] empty response, using placeholder text", bmsg_id_for_log));
+                    msg_debug(&format!(
+                        "[botmsg_poll:{}] empty response, using placeholder text",
+                        bmsg_id_for_log
+                    ));
                     full_response = "(No response)".to_string();
-                    msg_debug(&format!("[fr_trace][{}] =NoResponse: set to '(No response)'", chat_id.0));
+                    msg_debug(&format!(
+                        "[fr_trace][{}] =NoResponse: set to '(No response)'",
+                        chat_id.0
+                    ));
                 }
 
                 let final_response = normalize_empty_lines(&full_response);
-                msg_debug(&format!("[botmsg_poll:{}] final: response_len={}, msg_limit={}",
-                    bmsg_id_for_log, final_response.len(), TELEGRAM_MSG_LIMIT));
+                msg_debug(&format!(
+                    "[botmsg_poll:{}] final: response_len={}, msg_limit={}",
+                    bmsg_id_for_log,
+                    final_response.len(),
+                    TELEGRAM_MSG_LIMIT
+                ));
 
                 // ── Send only remaining delta (unified rolling placeholder) ──
-                if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
+                if full_response.len() < last_confirmed_len
+                    || !full_response.is_char_boundary(last_confirmed_len)
+                {
+                    last_confirmed_len = 0;
+                }
                 let remaining = &full_response[last_confirmed_len..];
                 msg_debug(&format!("[rolling_ph/botmsg] FINAL: placeholder_msg_id={}, confirmed={}, total={}, remaining_len={}",
                     placeholder_msg_id, last_confirmed_len, full_response.len(), remaining.trim().len()));
                 if was_originally_empty || remaining.trim().is_empty() {
-                    msg_debug(&format!("[rolling_ph/botmsg] FINAL DELETE placeholder: msg_id={}", placeholder_msg_id));
+                    msg_debug(&format!(
+                        "[rolling_ph/botmsg] FINAL DELETE placeholder: msg_id={}",
+                        placeholder_msg_id
+                    ));
                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                    let _ = tg!(
+                        "delete_message",
+                        bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                    );
                 } else if should_attach_response_as_file(full_response.len(), provider_str) {
-                    msg_debug(&format!("[rolling_ph/botmsg] FINAL FILE ATTACH: total={}", full_response.len()));
+                    msg_debug(&format!(
+                        "[rolling_ph/botmsg] FINAL FILE ATTACH: total={}",
+                        full_response.len()
+                    ));
                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, "\u{1f4c4} Response attached as file").await);
-                    send_response_as_file(&bot_owned, chat_id, &final_response, &state_owned, "botmsg").await;
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(
+                                chat_id,
+                                placeholder_msg_id,
+                                "\u{1f4c4} Response attached as file"
+                            )
+                            .await
+                    );
+                    send_response_as_file(
+                        &bot_owned,
+                        chat_id,
+                        &final_response,
+                        &state_owned,
+                        "botmsg",
+                    )
+                    .await;
                 } else {
                     let normalized_remaining = normalize_empty_lines(remaining);
                     let html_remaining = markdown_to_telegram_html(&normalized_remaining);
-                    msg_debug(&format!("[botmsg_poll:{}] final delta_len={}, html_len={}",
-                        bmsg_id_for_log, normalized_remaining.len(), html_remaining.len()));
+                    msg_debug(&format!(
+                        "[botmsg_poll:{}] final delta_len={}, html_len={}",
+                        bmsg_id_for_log,
+                        normalized_remaining.len(),
+                        html_remaining.len()
+                    ));
                     if html_remaining.len() <= TELEGRAM_MSG_LIMIT {
-                        if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_remaining)
-                            .parse_mode(ParseMode::Html).await)
-                        {
-                            msg_debug(&format!("[botmsg_poll:{}] HTML edit failed: {}", bmsg_id_for_log, e));
+                        if let Err(e) = tg!(
+                            "edit_message",
+                            bot_owned
+                                .edit_message_text(chat_id, placeholder_msg_id, &html_remaining)
+                                .parse_mode(ParseMode::Html)
+                                .await
+                        ) {
+                            msg_debug(&format!(
+                                "[botmsg_poll:{}] HTML edit failed: {}",
+                                bmsg_id_for_log, e
+                            ));
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &normalized_remaining).await);
+                            let _ = tg!(
+                                "edit_message",
+                                bot_owned
+                                    .edit_message_text(
+                                        chat_id,
+                                        placeholder_msg_id,
+                                        &normalized_remaining
+                                    )
+                                    .await
+                            );
                         }
                     } else {
-                        let send_result = send_long_message(&bot_owned, chat_id, &html_remaining, Some(ParseMode::Html), &state_owned).await;
+                        let send_result = send_long_message(
+                            &bot_owned,
+                            chat_id,
+                            &html_remaining,
+                            Some(ParseMode::Html),
+                            &state_owned,
+                        )
+                        .await;
                         match send_result {
                             Ok(_) => {
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                let _ = tg!(
+                                    "delete_message",
+                                    bot_owned.delete_message(chat_id, placeholder_msg_id).await
+                                );
                             }
                             Err(_) => {
-                                let fallback = send_long_message(&bot_owned, chat_id, &normalized_remaining, None, &state_owned).await;
+                                let fallback = send_long_message(
+                                    &bot_owned,
+                                    chat_id,
+                                    &normalized_remaining,
+                                    None,
+                                    &state_owned,
+                                )
+                                .await;
                                 match fallback {
                                     Ok(_) => {
                                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                        let _ = tg!(
+                                            "delete_message",
+                                            bot_owned
+                                                .delete_message(chat_id, placeholder_msg_id)
+                                                .await
+                                        );
                                     }
                                     Err(_) => {
                                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                                        let truncated = truncate_str(&normalized_remaining, TELEGRAM_MSG_LIMIT);
-                                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated).await);
+                                        let truncated =
+                                            truncate_str(&normalized_remaining, TELEGRAM_MSG_LIMIT);
+                                        let _ = tg!(
+                                            "edit_message",
+                                            bot_owned
+                                                .edit_message_text(
+                                                    chat_id,
+                                                    placeholder_msg_id,
+                                                    &truncated
+                                                )
+                                                .await
+                                        );
                                     }
                                 }
                             }
@@ -13997,8 +21021,14 @@ async fn process_bot_message(
                     // sid + clear_epoch catch /clear and /start same-path swaps.
                     let model_now = data.settings.models.get(&chat_id.0.to_string()).cloned();
                     let provider_now = detect_provider(model_now.as_deref());
-                    let path_now = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
-                    let sid_now = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+                    let path_now = data
+                        .sessions
+                        .get(&chat_id)
+                        .and_then(|s| s.current_path.clone());
+                    let sid_now = data
+                        .sessions
+                        .get(&chat_id)
+                        .and_then(|s| s.session_id.clone());
                     let epoch_now = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
                     let session_changed = provider_now != provider_str
                         || path_now.as_deref() != Some(current_path_owned.as_str())
@@ -14027,36 +21057,54 @@ async fn process_bot_message(
                             });
                         }
                         save_session_to_file(session, &current_path_owned, provider_str);
-                        msg_debug(&format!("[botmsg_poll:{}] session saved: history_len_after={}", bmsg_id_for_log, session.history.len()));
+                        msg_debug(&format!(
+                            "[botmsg_poll:{}] session saved: history_len_after={}",
+                            bmsg_id_for_log,
+                            session.history.len()
+                        ));
                     } else {
                         msg_debug(&format!("[botmsg_poll:{}] no session found for chat_id={}, skipping session update", bmsg_id_for_log, chat_id.0));
                     }
                     // Write to group chat shared log (bot-to-bot messages)
-                    msg_debug(&format!("[botmsg_poll:{}] JSONL check: chat_id={}, raw_entries_count={}",
-                        bmsg_id_for_log, chat_id.0, raw_entries.len()));
+                    msg_debug(&format!(
+                        "[botmsg_poll:{}] JSONL check: chat_id={}, raw_entries_count={}",
+                        bmsg_id_for_log,
+                        chat_id.0,
+                        raw_entries.len()
+                    ));
                     if chat_id.0 < 0 {
                         let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                        let dn = if bot_display_name_for_log.is_empty() { None } else { Some(bot_display_name_for_log.clone()) };
-                        append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                            ts: now_ts.clone(),
-                            bot: bot_username_for_log.clone(),
-                            bot_display_name: dn.clone(),
-                            role: "user".to_string(),
-                            from: Some(format!("bot:{}", from_bot_for_log)),
-                            text: prompt_owned.clone(),
-                            clear: false,
-                        });
+                        let dn = if bot_display_name_for_log.is_empty() {
+                            None
+                        } else {
+                            Some(bot_display_name_for_log.clone())
+                        };
+                        append_group_chat_log(
+                            chat_id.0,
+                            &GroupChatLogEntry {
+                                ts: now_ts.clone(),
+                                bot: bot_username_for_log.clone(),
+                                bot_display_name: dn.clone(),
+                                role: "user".to_string(),
+                                from: Some(format!("bot:{}", from_bot_for_log)),
+                                text: prompt_owned.clone(),
+                                clear: false,
+                            },
+                        );
                         if !raw_entries.is_empty() {
                             msg_debug(&format!("[botmsg_poll:{}] JSONL: writing user+assistant entries, raw_entries_count={}", bmsg_id_for_log, raw_entries.len()));
-                            append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                                ts: now_ts,
-                                bot: bot_username_for_log.clone(),
-                                bot_display_name: dn,
-                                role: "assistant".to_string(),
-                                from: None,
-                                text: serialize_payload(&std::mem::take(&mut raw_entries)),
-                                clear: false,
-                            });
+                            append_group_chat_log(
+                                chat_id.0,
+                                &GroupChatLogEntry {
+                                    ts: now_ts,
+                                    bot: bot_username_for_log.clone(),
+                                    bot_display_name: dn,
+                                    role: "assistant".to_string(),
+                                    from: None,
+                                    text: serialize_payload(&std::mem::take(&mut raw_entries)),
+                                    clear: false,
+                                },
+                            );
                         } else {
                             msg_debug(&format!("[botmsg_poll:{}] JSONL: user entry written, assistant SKIPPED (raw_entries is empty)", bmsg_id_for_log));
                         }
@@ -14065,12 +21113,19 @@ async fn process_bot_message(
 
                 let ts = chrono::Local::now().format("%H:%M:%S");
                 println!("  [{ts}] ▶ [BotMsg] Response sent");
-                msg_debug(&format!("[botmsg_poll:{}] response sent, final_response_len={}", bmsg_id_for_log, final_response.len()));
+                msg_debug(&format!(
+                    "[botmsg_poll:{}] response sent, final_response_len={}",
+                    bmsg_id_for_log,
+                    final_response.len()
+                ));
 
                 // Do NOT auto-create response message file.
                 // The AI can use --message CLI to reply if needed.
                 // Auto-responding causes infinite ping-pong between bots.
-                msg_debug(&format!("[botmsg_poll:{}] skipping auto-response (AI uses --message if needed)", bmsg_id_for_log));
+                msg_debug(&format!(
+                    "[botmsg_poll:{}] skipping auto-response (AI uses --message if needed)",
+                    bmsg_id_for_log
+                ));
 
                 // Send end hook message if configured
                 if !cancelled {
@@ -14080,7 +21135,10 @@ async fn process_bot_message(
                     };
                     if let Some(hook_msg) = end_hook_msg {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("send_message", bot_owned.send_message(chat_id, &hook_msg).await);
+                        let _ = tg!(
+                            "send_message",
+                            bot_owned.send_message(chat_id, &hook_msg).await
+                        );
                     }
                 }
             }
@@ -14089,20 +21147,36 @@ async fn process_bot_message(
             let queued = process_upload_queue(&bot_owned, chat_id, &state_owned).await;
             if done {
                 queue_done = !queued;
-                msg_debug(&format!("[botmsg_poll:{}] queue: queued={}, queue_done={}", bmsg_id_for_log, queued, queue_done));
+                msg_debug(&format!(
+                    "[botmsg_poll:{}] queue: queued={}, queue_done={}",
+                    bmsg_id_for_log, queued, queue_done
+                ));
             }
         }
 
         // Handle cancellation
         if cancelled {
-            msg_debug(&format!("[botmsg_poll:{}] handling cancellation: response_len={}", bmsg_id_for_log, full_response.len()));
+            msg_debug(&format!(
+                "[botmsg_poll:{}] handling cancellation: response_len={}",
+                bmsg_id_for_log,
+                full_response.len()
+            ));
             // Peek the recorded PID for debug logging, then re-send SIGKILL
             // as a safety belt (cancel_now is idempotent).
             {
-                let pid_opt = *cancel_token.child_pid.lock().unwrap_or_else(|e| e.into_inner());
+                let pid_opt = *cancel_token
+                    .child_pid
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 match pid_opt {
-                    Some(pid) => msg_debug(&format!("[botmsg_poll:{}] killing child process: pid={}", bmsg_id_for_log, pid)),
-                    None => msg_debug(&format!("[botmsg_poll:{}] no child pid to kill", bmsg_id_for_log)),
+                    Some(pid) => msg_debug(&format!(
+                        "[botmsg_poll:{}] killing child process: pid={}",
+                        bmsg_id_for_log, pid
+                    )),
+                    None => msg_debug(&format!(
+                        "[botmsg_poll:{}] no child pid to kill",
+                        bmsg_id_for_log
+                    )),
                 }
             }
             cancel_token.cancel_now();
@@ -14114,20 +21188,47 @@ async fn process_bot_message(
                 let normalized = normalize_empty_lines(&full_response);
                 format!("{}\n\n[Stopped]", normalized)
             };
-            msg_debug(&format!("[botmsg_poll:{}] stopped_response_len={}", bmsg_id_for_log, stopped_response.len()));
+            msg_debug(&format!(
+                "[botmsg_poll:{}] stopped_response_len={}",
+                bmsg_id_for_log,
+                stopped_response.len()
+            ));
 
             shared_rate_limit_wait(&state_owned, chat_id).await;
 
             // ── Show remaining delta + [Stopped] (unified rolling placeholder) ──
-            if full_response.len() < last_confirmed_len || !full_response.is_char_boundary(last_confirmed_len) { last_confirmed_len = 0; }
+            if full_response.len() < last_confirmed_len
+                || !full_response.is_char_boundary(last_confirmed_len)
+            {
+                last_confirmed_len = 0;
+            }
             let remaining = &full_response[last_confirmed_len..];
             msg_debug(&format!("[rolling_ph/botmsg] STOPPED: placeholder_msg_id={}, confirmed={}, remaining_len={}",
                 placeholder_msg_id, last_confirmed_len, remaining.trim().len()));
             if should_attach_response_as_file(full_response.len(), provider_str) {
-                msg_debug(&format!("[rolling_ph/botmsg] STOPPED FILE ATTACH: total={}", full_response.len()));
+                msg_debug(&format!(
+                    "[rolling_ph/botmsg] STOPPED FILE ATTACH: total={}",
+                    full_response.len()
+                ));
                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, "\u{1f4c4} Response attached as file [Stopped]").await);
-                send_response_as_file(&bot_owned, chat_id, &stopped_response, &state_owned, "botmsg").await;
+                let _ = tg!(
+                    "edit_message",
+                    bot_owned
+                        .edit_message_text(
+                            chat_id,
+                            placeholder_msg_id,
+                            "\u{1f4c4} Response attached as file [Stopped]"
+                        )
+                        .await
+                );
+                send_response_as_file(
+                    &bot_owned,
+                    chat_id,
+                    &stopped_response,
+                    &state_owned,
+                    "botmsg",
+                )
+                .await;
             } else {
                 let display_stopped = if remaining.trim().is_empty() {
                     "[Stopped]".to_string()
@@ -14137,18 +21238,34 @@ async fn process_bot_message(
                 };
                 let html_stopped = markdown_to_telegram_html(&display_stopped);
                 if html_stopped.len() <= TELEGRAM_MSG_LIMIT {
-                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
-                        .parse_mode(ParseMode::Html).await);
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
+                            .parse_mode(ParseMode::Html)
+                            .await
+                    );
                 } else {
-                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id,
-                        &truncate_str(&display_stopped, TELEGRAM_MSG_LIMIT)).await);
+                    let _ = tg!(
+                        "edit_message",
+                        bot_owned
+                            .edit_message_text(
+                                chat_id,
+                                placeholder_msg_id,
+                                &truncate_str(&display_stopped, TELEGRAM_MSG_LIMIT)
+                            )
+                            .await
+                    );
                 }
             }
 
             // Do NOT create response file on cancel → chain broken
             let ts = chrono::Local::now().format("%H:%M:%S");
             println!("  [{ts}] ■ [BotMsg] Stopped");
-            msg_debug(&format!("[botmsg_poll:{}] stopped message sent, updating session", bmsg_id_for_log));
+            msg_debug(&format!(
+                "[botmsg_poll:{}] stopped message sent, updating session",
+                bmsg_id_for_log
+            ));
 
             let mut data = state_owned.lock().await;
             // Same guard: skip the partial-response writeback if the session was reset
@@ -14158,8 +21275,14 @@ async fn process_bot_message(
             // sid + clear_epoch catch /clear and /start same-path swaps.
             let model_now = data.settings.models.get(&chat_id.0.to_string()).cloned();
             let provider_now = detect_provider(model_now.as_deref());
-            let path_now = data.sessions.get(&chat_id).and_then(|s| s.current_path.clone());
-            let sid_now = data.sessions.get(&chat_id).and_then(|s| s.session_id.clone());
+            let path_now = data
+                .sessions
+                .get(&chat_id)
+                .and_then(|s| s.current_path.clone());
+            let sid_now = data
+                .sessions
+                .get(&chat_id)
+                .and_then(|s| s.session_id.clone());
             let epoch_now = data.clear_epoch.get(&chat_id).copied().unwrap_or(0);
             let session_changed = provider_now != provider_str
                 || path_now.as_deref() != Some(current_path_owned.as_str())
@@ -14169,8 +21292,10 @@ async fn process_bot_message(
                 msg_debug(&format!("[botmsg_poll:{}] cancel: session changed during task — skip session writeback (path: {:?} → {:?}, provider: {} → {}, sid: {:?} → {:?}, epoch: {} → {})",
                     bmsg_id_for_log, current_path_owned, path_now, provider_str, provider_now, captured_sid, sid_now, captured_clear_epoch, epoch_now));
             } else if let Some(session) = data.sessions.get_mut(&chat_id) {
-                msg_debug(&format!("[botmsg_poll:{}] cancel: updating session history, new_session_id={:?}",
-                    bmsg_id_for_log, new_session_id));
+                msg_debug(&format!(
+                    "[botmsg_poll:{}] cancel: updating session history, new_session_id={:?}",
+                    bmsg_id_for_log, new_session_id
+                ));
                 if let Some(sid) = new_session_id {
                     session.session_id = Some(sid);
                 }
@@ -14184,35 +21309,52 @@ async fn process_bot_message(
                 });
                 save_session_to_file(session, &current_path_owned, provider_str);
             } else {
-                msg_debug(&format!("[botmsg_poll:{}] cancel: no session found for chat_id={}", bmsg_id_for_log, chat_id.0));
+                msg_debug(&format!(
+                    "[botmsg_poll:{}] cancel: no session found for chat_id={}",
+                    bmsg_id_for_log, chat_id.0
+                ));
             }
             // Write to group chat shared log (bot-to-bot messages, stopped).
             // Mirrors the normal-completion branch: written regardless of session_changed.
-            msg_debug(&format!("[botmsg_poll:{}] JSONL stopped check: chat_id={}, raw_entries_count={}",
-                bmsg_id_for_log, chat_id.0, raw_entries.len()));
+            msg_debug(&format!(
+                "[botmsg_poll:{}] JSONL stopped check: chat_id={}, raw_entries_count={}",
+                bmsg_id_for_log,
+                chat_id.0,
+                raw_entries.len()
+            ));
             if chat_id.0 < 0 {
                 let now_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-                let dn = if bot_display_name_for_log.is_empty() { None } else { Some(bot_display_name_for_log.clone()) };
-                append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                    ts: now_ts.clone(),
-                    bot: bot_username_for_log.clone(),
-                    bot_display_name: dn.clone(),
-                    role: "user".to_string(),
-                    from: Some(format!("bot:{}", from_bot_for_log)),
-                    text: prompt_owned,
-                    clear: false,
-                });
+                let dn = if bot_display_name_for_log.is_empty() {
+                    None
+                } else {
+                    Some(bot_display_name_for_log.clone())
+                };
+                append_group_chat_log(
+                    chat_id.0,
+                    &GroupChatLogEntry {
+                        ts: now_ts.clone(),
+                        bot: bot_username_for_log.clone(),
+                        bot_display_name: dn.clone(),
+                        role: "user".to_string(),
+                        from: Some(format!("bot:{}", from_bot_for_log)),
+                        text: prompt_owned,
+                        clear: false,
+                    },
+                );
                 if !raw_entries.is_empty() {
                     msg_debug(&format!("[botmsg_poll:{}] JSONL stopped: writing user+assistant entries, raw_entries_count={}", bmsg_id_for_log, raw_entries.len()));
-                    append_group_chat_log(chat_id.0, &GroupChatLogEntry {
-                        ts: now_ts,
-                        bot: bot_username_for_log.clone(),
-                        bot_display_name: dn,
-                        role: "assistant".to_string(),
-                        from: None,
-                        text: serialize_payload(&std::mem::take(&mut raw_entries)),
-                        clear: false,
-                    });
+                    append_group_chat_log(
+                        chat_id.0,
+                        &GroupChatLogEntry {
+                            ts: now_ts,
+                            bot: bot_username_for_log.clone(),
+                            bot_display_name: dn,
+                            role: "assistant".to_string(),
+                            from: None,
+                            text: serialize_payload(&std::mem::take(&mut raw_entries)),
+                            clear: false,
+                        },
+                    );
                 } else {
                     msg_debug(&format!("[botmsg_poll:{}] JSONL stopped: user entry written, assistant SKIPPED (raw_entries is empty)", bmsg_id_for_log));
                 }
@@ -14222,39 +21364,72 @@ async fn process_bot_message(
             drop(data);
             if let Some(msg_id) = stop_msg_id {
                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+                let _ = tg!(
+                    "delete_message",
+                    bot_owned.delete_message(chat_id, msg_id).await
+                );
             }
-            msg_debug(&format!("[botmsg_poll:{}] cancel cleanup done", bmsg_id_for_log));
-            msg_debug(&format!("[queue:trigger] chat_id={}, source=botmsg_poll_cancelled", chat_id.0));
+            msg_debug(&format!(
+                "[botmsg_poll:{}] cancel cleanup done",
+                bmsg_id_for_log
+            ));
+            msg_debug(&format!(
+                "[queue:trigger] chat_id={}, source=botmsg_poll_cancelled",
+                chat_id.0
+            ));
             drop(_group_lock); // release group chat lock before processing queue
             process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
             return;
         }
 
         // Clean up cancel token
-        msg_debug(&format!("[botmsg_poll:{}] normal completion, cleaning up", bmsg_id_for_log));
+        msg_debug(&format!(
+            "[botmsg_poll:{}] normal completion, cleaning up",
+            bmsg_id_for_log
+        ));
         let orphan_stop_msg = {
             let mut data = state_owned.lock().await;
             let msg_id = data.stop_message_ids.remove(&chat_id);
             remove_cancel_token_locked(&mut data, chat_id);
-            msg_debug(&format!("[botmsg_poll:{}] cleaned up: orphan_stop_msg={:?}", bmsg_id_for_log, msg_id));
+            msg_debug(&format!(
+                "[botmsg_poll:{}] cleaned up: orphan_stop_msg={:?}",
+                bmsg_id_for_log, msg_id
+            ));
             msg_id
         };
         if let Some(msg_id) = orphan_stop_msg {
-            msg_debug(&format!("[botmsg_poll:{}] deleting orphan stop message: {}", bmsg_id_for_log, msg_id));
+            msg_debug(&format!(
+                "[botmsg_poll:{}] deleting orphan stop message: {}",
+                bmsg_id_for_log, msg_id
+            ));
             shared_rate_limit_wait(&state_owned, chat_id).await;
-            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
+            let _ = tg!(
+                "delete_message",
+                bot_owned.delete_message(chat_id, msg_id).await
+            );
         }
         msg_debug(&format!("[botmsg_poll:{}] END", bmsg_id_for_log));
-        msg_debug(&format!("[queue:trigger] chat_id={}, source=botmsg_poll_completed", chat_id.0));
+        msg_debug(&format!(
+            "[queue:trigger] chat_id={}, source=botmsg_poll_completed",
+            chat_id.0
+        ));
         drop(_group_lock); // release group chat lock before processing queue
         process_next_queued_message(&bot_owned, chat_id, &state_owned).await;
     });
-    msg_debug(&format!("[process_bot_message] END (tasks spawned) id={}", msg.id));
+    msg_debug(&format!(
+        "[process_bot_message] END (tasks spawned) id={}",
+        msg.id
+    ));
 }
 
 /// Scheduler loop: runs every 60 seconds, checks for due schedules
-async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_username: String, bot_display_name: String) {
+async fn scheduler_loop(
+    bot: Bot,
+    state: SharedState,
+    token: String,
+    bot_username: String,
+    bot_display_name: String,
+) {
     let bot_key = token_hash(&token);
     sched_debug("[scheduler_loop] started");
 
@@ -14275,12 +21450,23 @@ async fn scheduler_loop(bot: Bot, state: SharedState, token: String, bot_usernam
         let bot_username_c = bot_username.clone();
         let bot_display_name_c = bot_display_name.clone();
         let cycle_join = tokio::spawn(async move {
-            scheduler_cycle(bot_c, state_c, token_c, bot_key_c, bot_username_c, bot_display_name_c).await
+            scheduler_cycle(
+                bot_c,
+                state_c,
+                token_c,
+                bot_key_c,
+                bot_username_c,
+                bot_display_name_c,
+            )
+            .await
         });
         if let Err(join_err) = cycle_join.await {
             let panic_str = redact_known_tokens(&join_err.to_string());
             msg_debug(&format!("[scheduler_loop] cycle PANICKED: {}", panic_str));
-            eprintln!("  ⚠ Scheduler cycle panicked: {} — continuing on next tick", panic_str);
+            eprintln!(
+                "  ⚠ Scheduler cycle panicked: {} — continuing on next tick",
+                panic_str
+            );
         }
     }
 }
@@ -14293,62 +21479,91 @@ async fn scheduler_cycle(
     bot_username: String,
     bot_display_name: String,
 ) {
-        // Scan schedule directory
-        let entries = list_schedule_entries(&bot_key, None);
+    // Scan schedule directory
+    let entries = list_schedule_entries(&bot_key, None);
 
-        if !entries.is_empty() {
-        sched_debug(&format!("[scheduler_loop] cycle: {} entries found", entries.len()));
+    if !entries.is_empty() {
+        sched_debug(&format!(
+            "[scheduler_loop] cycle: {} entries found",
+            entries.len()
+        ));
+    }
+
+    for entry in &entries {
+        let chat_id = ChatId(entry.chat_id);
+
+        // Verify current_path exists (before acquiring lock — involves filesystem I/O)
+        if !Path::new(&entry.current_path).is_dir() {
+            let ts = chrono::Local::now().format("%H:%M:%S");
+            println!(
+                "  [{ts}] ⚠ [Scheduler] Path not found: {} (schedule: {})",
+                entry.current_path, entry.id
+            );
+            sched_debug(&format!(
+                "[scheduler_loop] id={}, path not found: {} → skip",
+                entry.id, entry.current_path
+            ));
+            shared_rate_limit_wait(&state, chat_id).await;
+            let msg = format!(
+                "⏰ {}\n\n⚠️ Skipped — path no longer exists\n📂 <code>{}</code>",
+                html_escape(&truncate_str(&entry.prompt, 40)),
+                html_escape(&entry.current_path)
+            );
+            let _ = tg!(
+                "send_message",
+                bot.send_message(chat_id, msg)
+                    .parse_mode(ParseMode::Html)
+                    .await
+            );
+            continue;
         }
 
-        for entry in &entries {
-            let chat_id = ChatId(entry.chat_id);
+        // Single atomic lock: pending check + trigger check + busy check + session backup
+        // All checks in one lock to prevent race between pending cleanup and re-trigger
+        enum SchedAction {
+            Skip,
+            DiscardExpired,
+            Execute(Option<ChatSession>, u64),
+            /// Inline mode: run the scheduled task inside the chat's current
+            /// session (no backup, no isolated workspace). Carries dispatch_id only —
+            /// the existing session is left in place.
+            ExecuteInline(u64),
+        }
+        let inline_env_on = is_schedule_inline_enabled();
 
-            // Verify current_path exists (before acquiring lock — involves filesystem I/O)
-            if !Path::new(&entry.current_path).is_dir() {
-                let ts = chrono::Local::now().format("%H:%M:%S");
-                println!("  [{ts}] ⚠ [Scheduler] Path not found: {} (schedule: {})", entry.current_path, entry.id);
-                sched_debug(&format!("[scheduler_loop] id={}, path not found: {} → skip", entry.id, entry.current_path));
-                shared_rate_limit_wait(&state, chat_id).await;
-                let msg = format!("⏰ {}\n\n⚠️ Skipped — path no longer exists\n📂 <code>{}</code>",
-                    html_escape(&truncate_str(&entry.prompt, 40)), html_escape(&entry.current_path));
-                let _ = tg!("send_message", bot.send_message(chat_id, msg).parse_mode(ParseMode::Html).await);
-                continue;
-            }
+        let action = {
+            let mut data = state.lock().await;
+            let is_already_pending = data
+                .pending_schedules
+                .get(&chat_id)
+                .map_or(false, |set| set.contains(&entry.id));
 
-            // Single atomic lock: pending check + trigger check + busy check + session backup
-            // All checks in one lock to prevent race between pending cleanup and re-trigger
-            enum SchedAction {
-                Skip,
-                DiscardExpired,
-                Execute(Option<ChatSession>, u64),
-                /// Inline mode: run the scheduled task inside the chat's current
-                /// session (no backup, no isolated workspace). Carries dispatch_id only —
-                /// the existing session is left in place.
-                ExecuteInline(u64),
-            }
-            let inline_env_on = is_schedule_inline_enabled();
+            sched_debug(&format!(
+                "[scheduler_loop] id={}, is_already_pending={}",
+                entry.id, is_already_pending
+            ));
 
-            let action = {
-                let mut data = state.lock().await;
-                let is_already_pending = data.pending_schedules.get(&chat_id)
-                    .map_or(false, |set| set.contains(&entry.id));
-
-                sched_debug(&format!("[scheduler_loop] id={}, is_already_pending={}", entry.id, is_already_pending));
-
-                // If not pending and not due to trigger, skip
-                if !is_already_pending && !should_trigger(entry) {
-                    // Check if expired absolute schedule should be discarded
-                    if entry.schedule_type == "absolute" {
-                        if let Ok(schedule_time) = chrono::NaiveDateTime::parse_from_str(&entry.schedule, "%Y-%m-%d %H:%M:%S") {
-                            if let Some(schedule_dt) = schedule_time.and_local_timezone(chrono::Local).single() {
-                                if chrono::Local::now() > schedule_dt {
-                                    sched_debug(&format!("[scheduler_loop] id={}, expired absolute → discard", entry.id));
-                                    SchedAction::DiscardExpired
-                                } else {
-                                    sched_debug(&format!("[scheduler_loop] id={}, not yet due → skip", entry.id));
-                                    SchedAction::Skip
-                                }
+            // If not pending and not due to trigger, skip
+            if !is_already_pending && !should_trigger(entry) {
+                // Check if expired absolute schedule should be discarded
+                if entry.schedule_type == "absolute" {
+                    if let Ok(schedule_time) =
+                        chrono::NaiveDateTime::parse_from_str(&entry.schedule, "%Y-%m-%d %H:%M:%S")
+                    {
+                        if let Some(schedule_dt) =
+                            schedule_time.and_local_timezone(chrono::Local).single()
+                        {
+                            if chrono::Local::now() > schedule_dt {
+                                sched_debug(&format!(
+                                    "[scheduler_loop] id={}, expired absolute → discard",
+                                    entry.id
+                                ));
+                                SchedAction::DiscardExpired
                             } else {
+                                sched_debug(&format!(
+                                    "[scheduler_loop] id={}, not yet due → skip",
+                                    entry.id
+                                ));
                                 SchedAction::Skip
                             }
                         } else {
@@ -14358,203 +21573,278 @@ async fn scheduler_cycle(
                         SchedAction::Skip
                     }
                 } else {
-                    // Entry should execute — check if chat is busy
-                    let is_busy = data.cancel_tokens.contains_key(&chat_id);
-                    sched_debug(&format!("[scheduler_loop] id={}, should execute, is_busy={}", entry.id, is_busy));
+                    SchedAction::Skip
+                }
+            } else {
+                // Entry should execute — check if chat is busy
+                let is_busy = data.cancel_tokens.contains_key(&chat_id);
+                sched_debug(&format!(
+                    "[scheduler_loop] id={}, should execute, is_busy={}",
+                    entry.id, is_busy
+                ));
 
-                    if is_busy {
-                        // Chat is busy — mark as pending if not already, retry next cycle
-                        // Do NOT touch sessions — leave them as-is
-                        if !is_already_pending {
-                            data.pending_schedules.entry(chat_id).or_default().insert(entry.id.clone());
-                            let ts = chrono::Local::now().format("%H:%M:%S");
-                            println!("  [{ts}] ⏰ [Scheduler] Chat busy, pending: {}", entry.id);
-                            sched_debug(&format!("[scheduler_loop] id={}, chat busy → marked pending", entry.id));
-                        } else {
-                            sched_debug(&format!("[scheduler_loop] id={}, chat busy, already pending → skip", entry.id));
-                        }
-                        SchedAction::Skip
+                if is_busy {
+                    // Chat is busy — mark as pending if not already, retry next cycle
+                    // Do NOT touch sessions — leave them as-is
+                    if !is_already_pending {
+                        data.pending_schedules
+                            .entry(chat_id)
+                            .or_default()
+                            .insert(entry.id.clone());
+                        let ts = chrono::Local::now().format("%H:%M:%S");
+                        println!("  [{ts}] ⏰ [Scheduler] Chat busy, pending: {}", entry.id);
+                        sched_debug(&format!(
+                            "[scheduler_loop] id={}, chat busy → marked pending",
+                            entry.id
+                        ));
                     } else {
-                        // Inline mode requires an active chat session with a current_path;
-                        // otherwise fall back to isolated mode so the schedule still runs.
-                        let inline_usable = inline_env_on
-                            && data.sessions.get(&chat_id)
-                                .and_then(|s| s.current_path.as_ref())
-                                .is_some();
-                        let dispatch_id = next_dispatch_id();
-                        if inline_usable {
-                            sched_debug(&format!("[scheduler_loop] id={}, inline mode → execute in current session (dispatch_id={})", entry.id, dispatch_id));
-                            data.pending_schedules.entry(chat_id).or_default().insert(entry.id.clone());
-                            let cancel_token = new_cancel_token_for_owner(dispatch_id);
-                            insert_cancel_token_locked(&mut data, chat_id, cancel_token);
-                            SchedAction::ExecuteInline(dispatch_id)
-                        } else {
-                            // Not busy — backup session, replace with schedule-specific session, and execute
-                            let prev = data.sessions.get(&chat_id).cloned();
-                            sched_debug(&format!("[scheduler_loop] id={}, not busy → execute (has_prev_session={}, dispatch_id={})", entry.id, prev.is_some(), dispatch_id));
-                            data.sessions.insert(chat_id, ChatSession {
+                        sched_debug(&format!(
+                            "[scheduler_loop] id={}, chat busy, already pending → skip",
+                            entry.id
+                        ));
+                    }
+                    SchedAction::Skip
+                } else {
+                    // Inline mode requires an active chat session with a current_path;
+                    // otherwise fall back to isolated mode so the schedule still runs.
+                    let inline_usable = inline_env_on
+                        && data
+                            .sessions
+                            .get(&chat_id)
+                            .and_then(|s| s.current_path.as_ref())
+                            .is_some();
+                    let dispatch_id = next_dispatch_id();
+                    if inline_usable {
+                        sched_debug(&format!("[scheduler_loop] id={}, inline mode → execute in current session (dispatch_id={})", entry.id, dispatch_id));
+                        data.pending_schedules
+                            .entry(chat_id)
+                            .or_default()
+                            .insert(entry.id.clone());
+                        let cancel_token = new_cancel_token_for_owner(dispatch_id);
+                        insert_cancel_token_locked(&mut data, chat_id, cancel_token);
+                        SchedAction::ExecuteInline(dispatch_id)
+                    } else {
+                        // Not busy — backup session, replace with schedule-specific session, and execute
+                        let prev = data.sessions.get(&chat_id).cloned();
+                        sched_debug(&format!("[scheduler_loop] id={}, not busy → execute (has_prev_session={}, dispatch_id={})", entry.id, prev.is_some(), dispatch_id));
+                        data.sessions.insert(
+                            chat_id,
+                            ChatSession {
                                 session_id: None,
                                 current_path: Some(entry.current_path.clone()),
                                 history: Vec::new(),
                                 pending_uploads: Vec::new(),
                                 pending_uploads_added_at: None,
-                            });
-                            data.pending_schedules.entry(chat_id).or_default().insert(entry.id.clone());
-                            // Pre-insert cancel_token tagged with this dispatch_id so a panic
-                            // inside execute_schedule can be safely reclaimed by the owner
-                            // check in reclaim_panicked_dispatch_token.
-                            let cancel_token = new_cancel_token_for_owner(dispatch_id);
-                            insert_cancel_token_locked(&mut data, chat_id, cancel_token);
-                            SchedAction::Execute(prev, dispatch_id)
-                        }
+                            },
+                        );
+                        data.pending_schedules
+                            .entry(chat_id)
+                            .or_default()
+                            .insert(entry.id.clone());
+                        // Pre-insert cancel_token tagged with this dispatch_id so a panic
+                        // inside execute_schedule can be safely reclaimed by the owner
+                        // check in reclaim_panicked_dispatch_token.
+                        let cancel_token = new_cancel_token_for_owner(dispatch_id);
+                        insert_cancel_token_locked(&mut data, chat_id, cancel_token);
+                        SchedAction::Execute(prev, dispatch_id)
                     }
                 }
-            };
+            }
+        };
 
-            let (inline_mode, dispatch_id, prev_session) = match action {
-                SchedAction::Skip => continue,
-                SchedAction::DiscardExpired => {
-                    delete_schedule_entry(&entry.id);
-                    let ts = chrono::Local::now().format("%H:%M:%S");
-                    println!("  [{ts}] ⏰ [Scheduler] Discarded expired once-schedule: {}", entry.id);
-                    sched_debug(&format!("[scheduler_loop] id={}, discarded expired", entry.id));
-                    // Trailing `continue` (no semicolon) makes this block's type `!`,
-                    // which coerces cleanly to the tuple type of the Execute arms in
-                    // match-arm type unification. With a semicolon the block would be
-                    // syntactically `()` and the arms would fail to unify.
-                    continue
+        let (inline_mode, dispatch_id, prev_session) = match action {
+            SchedAction::Skip => continue,
+            SchedAction::DiscardExpired => {
+                delete_schedule_entry(&entry.id);
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!(
+                    "  [{ts}] ⏰ [Scheduler] Discarded expired once-schedule: {}",
+                    entry.id
+                );
+                sched_debug(&format!(
+                    "[scheduler_loop] id={}, discarded expired",
+                    entry.id
+                ));
+                // Trailing `continue` (no semicolon) makes this block's type `!`,
+                // which coerces cleanly to the tuple type of the Execute arms in
+                // match-arm type unification. With a semicolon the block would be
+                // syntactically `()` and the arms would fail to unify.
+                continue;
+            }
+            SchedAction::Execute(prev, did) => (false, did, prev),
+            SchedAction::ExecuteInline(did) => (true, did, None),
+        };
+        sched_debug(&format!(
+            "[scheduler_loop] id={}, calling execute_schedule (dispatch_id={}, inline={})",
+            entry.id, dispatch_id, inline_mode
+        ));
+        // Run inside CURRENT_DISPATCH_ID scope and inside a child spawn so
+        // a panic inside execute_schedule kills only that one task — the
+        // scheduler keeps running and the busy slot is reclaimed via the
+        // owner_id check. Session and pending_schedules state inserted
+        // by the pre-execute lock above are also restored on panic so
+        // the chat does not see an empty session or a stuck pending id.
+        let bot_c = bot.clone();
+        let state_c = state.clone();
+        let token_c = token.clone();
+        let entry_c = entry.clone();
+        let entry_id_for_log = entry.id.clone();
+        let prev_for_recover = prev_session.clone();
+        let join = tokio::spawn(async move {
+            CURRENT_DISPATCH_ID
+                .scope(dispatch_id, async move {
+                    execute_schedule(
+                        &bot_c,
+                        chat_id,
+                        &entry_c,
+                        &state_c,
+                        &token_c,
+                        prev_session,
+                        inline_mode,
+                    )
+                    .await
+                })
+                .await
+        });
+        if let Err(join_err) = join.await {
+            let panic_str = redact_known_tokens(&join_err.to_string());
+            msg_debug(&format!(
+                "[scheduler_loop] id={}, execute_schedule PANICKED: {}",
+                entry_id_for_log, panic_str
+            ));
+            eprintln!(
+                "  ⚠ Chat {} schedule {} panicked: {} — recovering",
+                chat_id.0, entry_id_for_log, panic_str
+            );
+            reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:execute")
+                .await;
+            // Restore session/pending state that the pre-execute lock
+            // had mutated on this dispatch's behalf. If the panic
+            // happened after execute_schedule already restored these
+            // (e.g. very late in cleanup), the writes here are
+            // overwriting equivalent state — safe and idempotent.
+            // Inline mode never mutated `sessions` upfront, so we only
+            // touch sessions on the isolated path.
+            let mut data = state.lock().await;
+            if !inline_mode {
+                match prev_for_recover {
+                    Some(prev) => {
+                        data.sessions.insert(chat_id, prev);
+                    }
+                    None => {
+                        data.sessions.remove(&chat_id);
+                    }
                 }
-                SchedAction::Execute(prev, did) => (false, did, prev),
-                SchedAction::ExecuteInline(did) => (true, did, None),
+            }
+            if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
+                set.remove(&entry_id_for_log);
+                if set.is_empty() {
+                    data.pending_schedules.remove(&chat_id);
+                }
+            }
+        }
+    }
+
+    // === Bot-to-bot message polling ===
+    if !bot_username.is_empty() {
+        let messages = scan_messages(&bot_username);
+        if !messages.is_empty() {
+            msg_debug(&format!(
+                "[scheduler_loop] bot messages found: {} for @{}",
+                messages.len(),
+                bot_username
+            ));
+        }
+        for msg in &messages {
+            msg_debug(&format!("[scheduler_loop] bot message: id={}, from={}, to={}, chat_id={}, content_len={}, created_at={}",
+                    msg.id, msg.from, msg.to, msg.chat_id, msg.content.len(), msg.created_at));
+            let chat_id_num: i64 = match msg.chat_id.parse() {
+                Ok(n) => n,
+                Err(e) => {
+                    msg_debug(&format!("[scheduler_loop] invalid chat_id in message: id={}, chat_id={:?}, error={}", msg.id, msg.chat_id, e));
+                    let remove_result = fs::remove_file(&msg.file_path);
+                    msg_debug(&format!(
+                        "[scheduler_loop] removed invalid message file: ok={}",
+                        remove_result.is_ok()
+                    ));
+                    continue;
+                }
             };
-            sched_debug(&format!("[scheduler_loop] id={}, calling execute_schedule (dispatch_id={}, inline={})", entry.id, dispatch_id, inline_mode));
-            // Run inside CURRENT_DISPATCH_ID scope and inside a child spawn so
-            // a panic inside execute_schedule kills only that one task — the
-            // scheduler keeps running and the busy slot is reclaimed via the
-            // owner_id check. Session and pending_schedules state inserted
-            // by the pre-execute lock above are also restored on panic so
-            // the chat does not see an empty session or a stuck pending id.
+            let chat_id = ChatId(chat_id_num);
+
+            // Busy check: skip if cancel_token exists for this chat
+            {
+                let data = state.lock().await;
+                let is_busy = data.cancel_tokens.contains_key(&chat_id);
+                msg_debug(&format!(
+                    "[scheduler_loop] busy check for chat {}: is_busy={}",
+                    chat_id_num, is_busy
+                ));
+                if is_busy {
+                    msg_debug(&format!("[scheduler_loop] chat {} busy, skipping message: {} (will retry next cycle)", chat_id_num, msg.id));
+                    continue;
+                }
+            }
+
+            // Note: file deletion happens inside `process_bot_message` only
+            // after the placeholder send succeeds. Deleting here (or at claim
+            // time) lost the message on every interim failure path
+            // (cancel-during-lock-wait, no-session, placeholder send error)
+            // because none of those branches re-queue the file.
+            msg_debug(&format!(
+                "[scheduler_loop] processing bot message: {} (from={}, to={}, chat_id={})",
+                msg.id, msg.from, msg.to, chat_id_num
+            ));
+
+            // Process the message (will delete the file iff its claim succeeds).
+            // Run inside CURRENT_DISPATCH_ID scope and a child spawn so a panic
+            // inside process_bot_message does not take down the scheduler — the
+            // owner_id check then reclaims the busy slot inserted by this dispatch.
+            let dispatch_id = next_dispatch_id();
             let bot_c = bot.clone();
             let state_c = state.clone();
             let token_c = token.clone();
-            let entry_c = entry.clone();
-            let entry_id_for_log = entry.id.clone();
-            let prev_for_recover = prev_session.clone();
+            let bot_username_c = bot_username.clone();
+            let bot_display_name_c = bot_display_name.clone();
+            let msg_c = msg.clone();
+            let msg_id_for_log = msg.id.clone();
             let join = tokio::spawn(async move {
                 CURRENT_DISPATCH_ID
                     .scope(dispatch_id, async move {
-                        execute_schedule(&bot_c, chat_id, &entry_c, &state_c, &token_c, prev_session, inline_mode).await
+                        process_bot_message(
+                            &bot_c,
+                            chat_id,
+                            &msg_c,
+                            &state_c,
+                            &token_c,
+                            &bot_username_c,
+                            &bot_display_name_c,
+                        )
+                        .await
                     })
                     .await
             });
             if let Err(join_err) = join.await {
                 let panic_str = redact_known_tokens(&join_err.to_string());
                 msg_debug(&format!(
-                    "[scheduler_loop] id={}, execute_schedule PANICKED: {}",
-                    entry_id_for_log, panic_str
+                    "[scheduler_loop] process_bot_message id={} PANICKED: {}",
+                    msg_id_for_log, panic_str
                 ));
                 eprintln!(
-                    "  ⚠ Chat {} schedule {} panicked: {} — recovering",
-                    chat_id.0, entry_id_for_log, panic_str
+                    "  ⚠ Chat {} bot-message {} panicked: {} — recovering",
+                    chat_id.0, msg_id_for_log, panic_str
                 );
-                reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:execute").await;
-                // Restore session/pending state that the pre-execute lock
-                // had mutated on this dispatch's behalf. If the panic
-                // happened after execute_schedule already restored these
-                // (e.g. very late in cleanup), the writes here are
-                // overwriting equivalent state — safe and idempotent.
-                // Inline mode never mutated `sessions` upfront, so we only
-                // touch sessions on the isolated path.
-                let mut data = state.lock().await;
-                if !inline_mode {
-                    match prev_for_recover {
-                        Some(prev) => { data.sessions.insert(chat_id, prev); }
-                        None => { data.sessions.remove(&chat_id); }
-                    }
-                }
-                if let Some(set) = data.pending_schedules.get_mut(&chat_id) {
-                    set.remove(&entry_id_for_log);
-                    if set.is_empty() {
-                        data.pending_schedules.remove(&chat_id);
-                    }
-                }
+                reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:botmsg")
+                    .await;
             }
+            msg_debug(&format!(
+                "[scheduler_loop] process_bot_message returned for msg: {}",
+                msg_id_for_log
+            ));
         }
 
-        // === Bot-to-bot message polling ===
-        if !bot_username.is_empty() {
-            let messages = scan_messages(&bot_username);
-            if !messages.is_empty() {
-                msg_debug(&format!("[scheduler_loop] bot messages found: {} for @{}", messages.len(), bot_username));
-            }
-            for msg in &messages {
-                msg_debug(&format!("[scheduler_loop] bot message: id={}, from={}, to={}, chat_id={}, content_len={}, created_at={}",
-                    msg.id, msg.from, msg.to, msg.chat_id, msg.content.len(), msg.created_at));
-                let chat_id_num: i64 = match msg.chat_id.parse() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        msg_debug(&format!("[scheduler_loop] invalid chat_id in message: id={}, chat_id={:?}, error={}", msg.id, msg.chat_id, e));
-                        let remove_result = fs::remove_file(&msg.file_path);
-                        msg_debug(&format!("[scheduler_loop] removed invalid message file: ok={}", remove_result.is_ok()));
-                        continue;
-                    }
-                };
-                let chat_id = ChatId(chat_id_num);
-
-                // Busy check: skip if cancel_token exists for this chat
-                {
-                    let data = state.lock().await;
-                    let is_busy = data.cancel_tokens.contains_key(&chat_id);
-                    msg_debug(&format!("[scheduler_loop] busy check for chat {}: is_busy={}", chat_id_num, is_busy));
-                    if is_busy {
-                        msg_debug(&format!("[scheduler_loop] chat {} busy, skipping message: {} (will retry next cycle)", chat_id_num, msg.id));
-                        continue;
-                    }
-                }
-
-                // Note: file deletion happens inside `process_bot_message` only
-                // after the placeholder send succeeds. Deleting here (or at claim
-                // time) lost the message on every interim failure path
-                // (cancel-during-lock-wait, no-session, placeholder send error)
-                // because none of those branches re-queue the file.
-                msg_debug(&format!("[scheduler_loop] processing bot message: {} (from={}, to={}, chat_id={})", msg.id, msg.from, msg.to, chat_id_num));
-
-                // Process the message (will delete the file iff its claim succeeds).
-                // Run inside CURRENT_DISPATCH_ID scope and a child spawn so a panic
-                // inside process_bot_message does not take down the scheduler — the
-                // owner_id check then reclaims the busy slot inserted by this dispatch.
-                let dispatch_id = next_dispatch_id();
-                let bot_c = bot.clone();
-                let state_c = state.clone();
-                let token_c = token.clone();
-                let bot_username_c = bot_username.clone();
-                let bot_display_name_c = bot_display_name.clone();
-                let msg_c = msg.clone();
-                let msg_id_for_log = msg.id.clone();
-                let join = tokio::spawn(async move {
-                    CURRENT_DISPATCH_ID
-                        .scope(dispatch_id, async move {
-                            process_bot_message(&bot_c, chat_id, &msg_c, &state_c, &token_c, &bot_username_c, &bot_display_name_c).await
-                        })
-                        .await
-                });
-                if let Err(join_err) = join.await {
-                    let panic_str = redact_known_tokens(&join_err.to_string());
-                    msg_debug(&format!(
-                        "[scheduler_loop] process_bot_message id={} PANICKED: {}",
-                        msg_id_for_log, panic_str
-                    ));
-                    eprintln!(
-                        "  ⚠ Chat {} bot-message {} panicked: {} — recovering",
-                        chat_id.0, msg_id_for_log, panic_str
-                    );
-                    reclaim_panicked_dispatch_token(&state, chat_id, dispatch_id, "scheduler:botmsg").await;
-                }
-                msg_debug(&format!("[scheduler_loop] process_bot_message returned for msg: {}", msg_id_for_log));
-            }
-
-            // Check for timed-out sent messages
-            msg_debug("[scheduler_loop] checking message timeouts");
-            check_message_timeouts(&bot, &bot_username, &state).await;
-        }
+        // Check for timed-out sent messages
+        msg_debug("[scheduler_loop] checking message timeouts");
+        check_message_timeouts(&bot, &bot_username, &state).await;
+    }
 }
