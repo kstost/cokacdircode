@@ -81,7 +81,15 @@ cokacdir reads environment variables at startup to override binary paths (`COKAC
 
 ## License
 
-MIT License
+`cokacdir` is distributed under the MIT License. See [LICENSE](LICENSE).
+
+Copyright (c) 2026 cokac.
+
+Telegram STT support downloads and spawns the MIT-licensed `transcriptor`
+binary, which uses OpenAI Whisper model artifacts converted for whisper.cpp.
+Runtime STT dependencies, upstream notices, model limitations, and audio consent
+considerations are summarized in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Author
 

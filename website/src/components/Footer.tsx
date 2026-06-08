@@ -26,7 +26,24 @@ export default function Footer() {
           </div>
         </div>
         <div className="mt-8 pt-6 border-t border-zinc-800/50 text-center text-zinc-600 text-xs">
-          &copy; {new Date().getFullYear()} cokacdir. All rights reserved.
+          &copy; {new Date().getFullYear()} cokacdir.{' '}
+          <a
+            href="https://github.com/kstost/cokacdir/blob/main/LICENSE"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:text-zinc-300 transition-colors"
+          >
+            {t('MIT License', 'MIT 라이선스')}
+          </a>
+          {' · '}
+          <a
+            href="https://github.com/kstost/cokacdir/blob/main/THIRD_PARTY_NOTICES.md"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="hover:text-zinc-300 transition-colors"
+          >
+            {t('Third-party notices', '서드파티 고지')}
+          </a>
         </div>
       </div>
     </footer>

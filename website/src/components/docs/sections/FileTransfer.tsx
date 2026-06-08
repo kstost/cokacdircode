@@ -53,6 +53,35 @@ export default function FileTransfer() {
 /stt_model large-v3-turbo
 /stt_model path:/absolute/model.bin
 /stt_model reset`} />
+        <InfoBox type="info">
+          {t(
+            <>
+              STT uses the MIT-licensed transcriptor binary and Whisper/whisper.cpp model artifacts. See the{' '}
+              <a
+                href="https://github.com/kstost/cokacdir/blob/main/THIRD_PARTY_NOTICES.md"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-primary-light hover:text-white underline underline-offset-2"
+              >
+                third-party notices
+              </a>{' '}
+              for copyright, license, model, and audio-consent details.
+            </>,
+            <>
+              STT는 MIT 라이선스의 transcriptor 바이너리와 Whisper/whisper.cpp 모델 아티팩트를 사용합니다. 저작권,
+              라이선스, 모델, 오디오 동의 관련 내용은{' '}
+              <a
+                href="https://github.com/kstost/cokacdir/blob/main/THIRD_PARTY_NOTICES.md"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-primary-light hover:text-white underline underline-offset-2"
+              >
+                서드파티 고지
+              </a>
+              를 확인하세요.
+            </>
+          )}
+        </InfoBox>
       </SubSection>
 
       <SubSection title={String(t('Multiple Attachments at Once', '여러 첨부를 한 번에 전송'))}>

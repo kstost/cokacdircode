@@ -32,6 +32,10 @@ Use `/stt_model` to view the current STT model for the chat:
 
 Bare model names are passed to transcriptor as `--model-name` and override an inherited `TRANSCRIPTOR_MODEL` value for that run; `path:<model_path>` is passed as `--model`. Resetting removes the chat override and lets transcriptor use its environment, saved config, or default model.
 
+STT uses the MIT-licensed `transcriptor` binary and Whisper/whisper.cpp model
+artifacts. See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) for
+copyright, license, model, and audio-consent notices.
+
 ### Limits
 
 - Maximum file size: **20MB** (Telegram Bot API limit)

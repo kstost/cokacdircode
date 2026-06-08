@@ -83,6 +83,10 @@ Sets the transcriptor speech recognition model for the current chat.
 
 If the selected model is not cached yet, transcriptor may download it on first use. Telegram STT progress messages show that download before recognition continues.
 
+STT uses the MIT-licensed `transcriptor` binary and Whisper/whisper.cpp model
+artifacts. See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) for
+copyright, license, model, and audio-consent notices.
+
 ---
 
 ## /setpollingtime \<ms\>

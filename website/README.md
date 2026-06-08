@@ -174,4 +174,6 @@ The `CNAME` file in the parent directory configures the custom domain `cokacdir.
 
 ## License
 
-MIT License - see the main repository for details.
+MIT License - see the main repository [LICENSE](../LICENSE) and
+[THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) for STT/transcriptor and
+Whisper-related notices.
