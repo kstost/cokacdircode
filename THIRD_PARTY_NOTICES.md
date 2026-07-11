@@ -1,9 +1,9 @@
 # Third-Party Notices
 
-`cokacdir` uses third-party open-source software. This file focuses on the
-runtime STT integration because `cokacdir` may download and spawn the
-`transcriptor` binary and because `transcriptor` may download Whisper model
-artifacts at runtime.
+`cokacdir` uses third-party open-source software. This file records the
+statically bundled OpenSSL dependency as well as the runtime STT integration,
+where `cokacdir` may download and spawn the `transcriptor` binary and
+`transcriptor` may download Whisper model artifacts.
 
 This notice file is informational and is not a substitute for the license files
 distributed by each upstream project.
@@ -16,6 +16,26 @@ distributed by each upstream project.
 
 - Copyright: Copyright (c) 2026 cokac
 - License: MIT License
+
+---
+
+## OpenSSL
+
+Linux release binaries use the vendored native-TLS feature and include OpenSSL
+compiled from the source resolved by `Cargo.lock`. The current lockfile resolves
+`openssl-src` 300.6.1+3.6.3, which bundles OpenSSL 3.6.3.
+
+- Project: OpenSSL
+- Version: 3.6.3
+- Copyright: OpenSSL Project Authors
+- License: Apache License 2.0
+- Project site: https://openssl-library.org/
+- Source: https://github.com/openssl/openssl/tree/openssl-3.6.3
+- License text: [LICENSES/OpenSSL-3.6.3.txt](LICENSES/OpenSSL-3.6.3.txt)
+
+The complete upstream license text is distributed with the source tree and is
+copied into binary distribution directories by the release builder. Executables
+built from this source also embed it and expose it with `cokacdir --licenses`.
 
 ---
 
@@ -99,8 +119,9 @@ C/C++ implementation for running Whisper models and includes ggml components.
 integration, networking, cryptography, storage, and filesystem operations. The
 complete resolved dependency set is recorded in [Cargo.lock](Cargo.lock).
 
-Release packaging should preserve required notices for bundled third-party
-software and artifacts.
+Release packaging must preserve required notices for bundled third-party
+software and artifacts. The release builder enforces the inclusion of the
+project license, this notice file, and the OpenSSL license text.
 
 ---
 
